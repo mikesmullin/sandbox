@@ -34,6 +34,8 @@ export listDesktops = ->
     '-o', 'json'
   ]
   items = data.items or []
+  live = (pod.metadata.name for pod in items)
+  pruneForwards live
   items.map (pod) ->
     conds = pod.status?.conditions or []
     readyCond = conds.find (c) -> c.type is 'Ready'
@@ -159,3 +161,10 @@ export dropForward = (name) ->
   return unless existing?
   try existing.proc.kill()
   forwards.delete name
+
+export pruneForwards = (liveNames) ->
+  live = new Set liveNames or []
+  for name from [...forwards.keys()]
+    continue if live.has name
+    dropForward name
+    console.log "[kind] dropped stale port-forward #{name}"

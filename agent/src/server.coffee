@@ -22,6 +22,7 @@ DAD_URL = process.env.DAD_PROXY_URL or process.env.LLAMA_SERVER_BASE_URL or 'htt
 DAD_KEY = process.env.DAD_PROXY_API_KEY or process.env.LLM_PROXY_API_KEY or process.env.LLAMA_SERVER_API_KEY or ''
 DAD_CA = process.env.DAD_PROXY_CA_FILE or process.env.LLAMA_SERVER_CA_FILE or '/opt/certs/ca.pem'
 CDP_PORT = String process.env.CDP_PORT or '9222'
+CDP_TARGET = String(process.env.AGENT_BROWSER_CDP or CDP_PORT)
 DISPLAY = process.env.DISPLAY or ':99'
 
 clients = new Set()
@@ -39,7 +40,7 @@ allowlistText = """
 file_io__write_file
 file_io__write_file:.*
 
-# headed Chromium (agent-browser MCP)
+# headed browser-use Chromium (agent-browser MCP)
 browser__.*
 """.trim()
 knownModels = [MODEL]
@@ -86,13 +87,13 @@ fetchModels = ->
 
 SYSTEM = '''
 You own this Linux desktop. You are a coding agent with a real XFCE session,
-Thunar, a terminal, and a headed Chromium already open (CDP on localhost).
+Thunar, a terminal, and a headed browser-use Chromium already open (CDP on localhost).
 
 Use file-io tools to read and write files under /workspace.
 Use term-local exec for shell commands (argv spawn, no shell metacharacters —
 pass the binary in `command` and arguments in `args`).
-Use browser MCP tools to drive the visible Chromium: navigate, snapshot, click,
-fill, screenshot. Prefer the already-running browser; do not launch a second one.
+Use browser MCP tools to drive the visible browser: navigate, snapshot, click,
+fill, screenshot. Prefer the already-running browser-use window; do not launch a second one.
 
 Prefer tools over guessing. Keep answers concise. Durable work lives in /workspace.
 '''
@@ -126,12 +127,12 @@ connectHarnessOnce = ->
   browserMcp =
     name: 'browser'
     command: 'agent-browser'
-    args: ['--cdp', CDP_PORT, '--headed', 'mcp', '--tools', 'core']
+    args: ['--cdp', CDP_TARGET, '--headed', 'mcp', '--tools', 'core']
     env:
       DISPLAY: DISPLAY
       HOME: process.env.HOME or '/home/agent'
-      AGENT_BROWSER_EXECUTABLE_PATH: process.env.AGENT_BROWSER_EXECUTABLE_PATH or '/usr/local/bin/chromium'
       AGENT_BROWSER_HEADED: '1'
+      AGENT_BROWSER_CDP: CDP_TARGET
     onStderr: (chunk) ->
       process.stderr.write "[mcp:browser] #{chunk}"
   mcp = resolveMcpList ['file-io', termLocal, browserMcp], presets
@@ -327,7 +328,9 @@ Bun.serve
       msg = try JSON.parse text catch then null
       return unless msg and typeof msg is 'object'
       switch msg.type
-        when 'chat', 'prompt' then enqueue -> handleChat ws, msg
+        when 'chat', 'prompt'
+          handleAbort()
+          enqueue -> handleChat ws, msg
         when 'abort', 'stop' then handleAbort()
         when 'allowlist' then handleAllowlist msg
         when 'model' then enqueue -> handleModel msg
@@ -344,7 +347,7 @@ try
 catch
   aglHref = 'unresolved'
 console.log "[agent] ws://0.0.0.0:#{PORT}/ws  model=#{MODEL} agl=#{aglHref} providers=#{Object.keys(aglProviders or {}).join ','} key=#{if DAD_KEY then 'yes' else 'no'}"
-# Warm MCP + Angela after Chromium has had a moment.
+# Warm MCP + Angela after the headed browser has had a moment.
 setTimeout ->
   connectHarness().catch (err) ->
     console.error '[agent] warmup failed', err.message or err

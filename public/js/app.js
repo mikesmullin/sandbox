@@ -113,7 +113,12 @@ const refresh = async () => {
     const data = await api('/api/desktops')
     const next = data.desktops || []
     if (desktopSnap(ui.items) !== desktopSnap(next)) ui.items = next
-    ui.scale = data.scale || ui.scale
+    const sc = data.scale || ui.scale
+    const prev = ui.scale || {}
+    if (prev.replicas !== sc.replicas || prev.ready !== sc.ready || prev.current !== sc.current) {
+      ui.scale = sc
+    }
+    if (ui.selected && !next.some((d) => d.name === ui.selected)) leaveFuller()
     ui.error = ''
     ui.loading = false
     queueMicrotask(syncScreens)
@@ -175,10 +180,10 @@ const App = () => ({
   get captured() { return ui.captured },
   open(d) {
     if (!d.ready) return
-    if (ui.selected === d.name) return
+    const same = ui.selected === d.name
     ui.selected = d.name
     ui.captured = false
-    chat.attach(d.name)
+    if (!same || !chat.connected) chat.attach(d.name)
     queueMicrotask(syncScreens)
   },
   grab(ev, d) {
@@ -226,7 +231,7 @@ const App = () => ({
           <i class="ph ph-monitor"></i>
           <div>
             <h1>Agent desktops</h1>
-            <small>Alpine · XFCE · Chromium · agent-browser</small>
+            <small>Debian · XFCE · browser-use · agent-browser</small>
           </div>
         </div>
         <div class="stats">
@@ -357,7 +362,26 @@ const App = () => ({
           </article>
         </section>
         <div class="chat-rail" x-show="selected" @pointerdown="release()" @mousedown="release()">
-          <div x-component="chat-sidebar"></div>
+          <div
+            x-component="mjs-chat"
+            mode="sidebar"
+            store="chat"
+            id-prefix="desktop"
+            title="desktop agent"
+            :show-tabs="false"
+            :show-history="false"
+            :show-agent="false"
+            :show-goto="false"
+            :show-visibility="false"
+            :show-starters="false"
+            :show-status="true"
+          >
+            <h1>Session</h1>
+            <p class="text-xs">
+              This agent runs <strong>inside</strong> the container. File, shell,
+              and Chromium tools execute on the desktop you are watching.
+            </p>
+          </div>
         </div>
       </main>
     </div>
@@ -365,8 +389,8 @@ const App = () => ({
 })
 
 const boot = async (bust = Date.now()) => {
-  const { default: ChatSidebar } = await import(`./components/ChatSidebar.js?t=${bust}`)
-  M.component('chat-sidebar', ChatSidebar)
+  const { registerChat: register } = await import(`/vendor/m-js-cmp-chat/src/index.js?t=${bust}`)
+  register(M)
   for (const name of [...connections.keys()]) disconnect(name)
   resetLogClients()
   M.mount('#app', App)
@@ -383,7 +407,7 @@ if (!window.__DESKTOP_ONCE__) {
   setInterval(() => window.__desktopRefresh?.(), 3000)
   window.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape' || !ui.selected) return
-    if (ev.target && ev.target.closest && ev.target.closest('textarea, input, .sheet-chat')) {
+    if (ev.target && ev.target.closest && ev.target.closest('textarea, input, .sheet-chat, .mjs-chat')) {
       if (ui.captured) window.__desktopUngrab?.()
       return
     }

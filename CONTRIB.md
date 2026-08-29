@@ -16,9 +16,9 @@ Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (noVN
 | Path | What |
 |---|---|
 | `src/` | Control-room server: Express REST + static (`server.coffee`), kubectl helpers (`k8s.coffee`). Bun.serve on the public port message-pipes WebSockets — `http-proxy` does not complete WS upgrades through Bun's `node:http`. |
-| `public/` | SPA: m-js + Phosphor + vendored noVNC. `js/app.js` tiles RFB; `js/chat.js` + `js/components/ChatSidebar.js` is the isolate-mode chat. |
+| `public/` | SPA: m-js + Phosphor + vendored noVNC. `js/app.js` tiles RFB; isolate-mode chat is `x-component="mjs-chat"` from `public/vendor/m-js-cmp-chat` (`js/chat.js` is the WS store). |
 | `agent/` | In-pod Angela harness (`src/server.coffee`). `agl-ai` / `angela` are `link:` deps. |
-| `Dockerfile` | Alpine 3.22 desktop: Xvfb, XFCE, Chromium, x11vnc, noVNC, bun, agent-browser 0.35.1 (`mcp` subcommand). |
+| `Dockerfile` | Debian bookworm desktop: Xvfb, XFCE, headed browser-use Chromium, x11vnc, noVNC, bun, agent-browser 0.35.1 (`mcp` subcommand). |
 | `Dockerfile.dashboard` | Bun Alpine + kubectl; copies `src/` + `public/`. |
 | `k8s/` | Namespace, RBAC (dashboard may list pods and scale the StatefulSet), desktop StatefulSet, dashboard Deployment. |
 | `kind/cluster.yaml` | Extra port map 30080→8090, kubelet `podPidsLimit: 8192`. |
@@ -26,8 +26,9 @@ Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (noVN
 | `scripts/dev-ui.sh` | Host control room on `:8080` with m-js HMR; scales in-cluster dashboard to 0. |
 | `scripts/kind.sh` | Kind under `systemd-run --user --scope --property=Delegate=yes`; image load via `ctr import`. |
 | `scripts/vendor.sh` | noVNC core + Phosphor into `public/vendor/` (offline dashboard). |
+| `scripts/vendor-chat.sh` | Copy `/workspace/m-js-cmp-chat` into `public/vendor/m-js-cmp-chat` (chat UI plugin). Re-run after plugin edits, then HMR/rebuild dashboard. |
 | `scripts/vendor-agent.sh` | rsync `/workspace/agl`, `/workspace/angela`, mcp `file-io` / `term-local` into `vendor/` (strips `.env`, tokens, tests, plugins). Host `bun link` of both packages. Copies dad-proxy CA if present. |
-| `scripts/entrypoint.sh` | Xvfb → XFCE → x11vnc → websockify → headed Chromium → `bun /opt/agent/src/server.coffee`. Rewires `/workspace/node_modules` after the emptyDir hides the image copy. |
+| `scripts/entrypoint.sh` | Xvfb → XFCE → x11vnc → websockify → headed browser-use → `bun /opt/agent/src/server.coffee`. Rewires `/workspace/node_modules` after the emptyDir hides the image copy. |
 
 Images: `agent-desktop:latest` (pods), `agent-desktop-ui:latest` (dashboard). Both use `imagePullPolicy: Never`.
 
@@ -36,6 +37,8 @@ Images: `agent-desktop:latest` (pods), `agent-desktop-ui:latest` (dashboard). Bo
 The control-room SPA is **[m-js](/workspace/m-js/docs/index.html)** (v3: Alpine-style `x-*` on a keyed virtual DOM). Those HTML pages are the **official docs**. New contributors should read them before changing `public/` — how `M.mount` / `M.store` / `M.component` work, which directives have full parity vs trade-offs (`x-ignore`, `x-model` caret, `x-for` keys), and how HMR is supposed to be wired (`/__m_hmr`, `data-hmr-entry`, `window.__M_BOOT__`).
 
 This repo vendors `public/vendor/m.min.js` and, on the host dashboard, injects `public/js/hot-client.js` (same protocol as the docs). Do not treat m-js like Alpine’s in-place effects: a redraw with unchanged state must write nothing; named stores survive hot reload; noVNC canvases live under `x-ignore` so the reconciler does not own those nodes.
+
+Chat UI is **[m-js-cmp-chat](/workspace/m-js-cmp-chat)** (`M.component('mjs-chat')`, sidebar + fullscreen). Edit that repo, then `./scripts/vendor-chat.sh`. Do not fork the markup back into `public/js/components/`. Cowork mounts the same widget against `M.store('cowork')`.
 
 ## Linked dependencies
 
@@ -52,7 +55,7 @@ plus a tiny `package.json` so `bun` from cwd does not fall through to the npm ca
 
 Edit agl/angela, re-run `vendor-agent.sh`, rebuild the **desktop** image, and roll the StatefulSet. Dashboard code does not import agl.
 
-MCP servers are vendored at `/opt/mcp` (file-io, term-local). Headed Chromium is driven by `agent-browser --cdp 9222 --headed mcp --tools core` (needs **0.28+**; 0.27 has no `mcp` command).
+MCP servers are vendored at `/opt/mcp` (file-io, term-local). Headed browser-use Chromium is driven by `agent-browser --cdp <url> --headed mcp --tools core` (needs **0.28+**; 0.27 has no `mcp` command). Do not point `AGENT_BROWSER_EXECUTABLE_PATH` at a second Chrome.
 
 ## Start / stop the cluster
 
@@ -63,7 +66,7 @@ cd /workspace/factory/container
 ./scripts/down.sh        # kind delete cluster --name agent-desktop
 ```
 
-`up.sh` is idempotent: existing cluster is started, images are re-imported, manifests re-applied. It leaves `deploy/dashboard` at **0 replicas**. First XFCE/Chromium boot can take several minutes (`rollout status` timeout 420s).
+`up.sh` is idempotent: existing cluster is started, images are re-imported, manifests re-applied. It leaves `deploy/dashboard` at **0 replicas**. First XFCE + browser boot can take several minutes (`rollout status` timeout 420s).
 
 If `down.sh` reports the cluster missing, Podman 6's label JSON breaks `kind get clusters`. List/delete via the helper:
 

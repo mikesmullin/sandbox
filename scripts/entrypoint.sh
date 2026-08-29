@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the virtual XFCE desktop: Xvfb → session → x11vnc → noVNC → Chromium + agent-browser.
+# Start the virtual XFCE desktop: Xvfb → session → x11vnc → noVNC → headed browser-use + agent-browser.
 set -u
 
 DISPLAY="${DISPLAY:-:99}"
@@ -16,8 +16,11 @@ export XDG_CACHE_HOME="${HOME}/.cache"
 export XDG_DATA_HOME="${HOME}/.local/share"
 export XDG_CURRENT_DESKTOP=XFCE
 export XFCE_PANEL_MIGRATE_DEFAULT=true
-export AGENT_BROWSER_EXECUTABLE_PATH="${AGENT_BROWSER_EXECUTABLE_PATH:-/usr/local/bin/chromium}"
 export AGENT_BROWSER_HEADED=1
+export IN_DOCKER="${IN_DOCKER:-1}"
+export BROWSER_USE_CHROME_NO_SANDBOX="${BROWSER_USE_CHROME_NO_SANDBOX:-1}"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}"
+unset AGENT_BROWSER_EXECUTABLE_PATH
 
 mkdir -p \
   "$XDG_RUNTIME_DIR" \
@@ -25,7 +28,7 @@ mkdir -p \
   "$XDG_CACHE_HOME" \
   "$XDG_DATA_HOME" \
   "$HOME/.vnc" \
-  "$HOME/.config/chromium" \
+  "$HOME/.config/browser-use" \
   /workspace
 
 # emptyDir hides the image /workspace. Point the jail at the bun-linked
@@ -94,7 +97,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Session D-Bus for XFCE / Thunar / Chromium.
+# Session D-Bus for XFCE / Thunar / the headed browser.
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
   # shellcheck disable=SC2046
   eval $(dbus-launch --sh-syntax)
@@ -138,20 +141,62 @@ log novnc "http://0.0.0.0:${NOVNC_PORT}/vnc.html  (web root ${NOVNC_WEB})"
 websockify --heartbeat 30 --web "$NOVNC_WEB" 0.0.0.0:"$NOVNC_PORT" 127.0.0.1:"$VNC_PORT" \
   2>&1 | sed 's/^/[novnc] /' &
 
-# Visible Chromium on the XFCE desktop, CDP on :9222 for agent-browser.
+# Headed browser-use Chromium on XFCE. Writes CDP URL to /tmp/browser-use.cdp.
 sleep 2
-log chromium "launching headed chrome with CDP :${CDP_PORT}"
-/usr/local/bin/chromium --start-maximized "about:blank" \
-  2>&1 | sed 's/^/[chromium] /' &
+log browser-use "launching headed stealth chromium"
+BROWSER_USE_PY="${BROWSER_USE_PY:-/opt/browser-use/venv/bin/python}"
+if [ -x "$BROWSER_USE_PY" ] && [ -f /usr/local/bin/browser-use-headed.py ]; then
+  "$BROWSER_USE_PY" /usr/local/bin/browser-use-headed.py \
+    2>&1 | sed 's/^/[browser-use] /' &
+else
+  log browser-use "launcher missing ($BROWSER_USE_PY)"
+fi
 
-wait_for_port 127.0.0.1 "$CDP_PORT" chromium || true
+cdp_ready=0
+for i in $(seq 1 80); do
+  if [ -s /tmp/browser-use.cdp.port ]; then
+    CDP_PORT="$(tr -d '[:space:]' < /tmp/browser-use.cdp.port)"
+    export CDP_PORT
+  fi
+  if [ -s /tmp/browser-use.cdp ] && python3 - "$CDP_PORT" <<'PY' >/dev/null 2>&1
+import socket, sys
+s = socket.socket()
+s.settimeout(0.2)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+  then
+    cdp_ready=1
+    break
+  fi
+  sleep 0.25
+done
+if [ "$cdp_ready" != 1 ]; then
+  log browser-use "CDP not ready on :${CDP_PORT}"
+fi
 
-# Attach agent-browser to the same Chromium (does not launch a second browser).
+# Publish the well-known :9222 if browser-use picked another port.
+if [ -n "${CDP_PORT}" ] && [ "${CDP_PORT}" != "9222" ] && command -v socat >/dev/null 2>&1; then
+  socat TCP-LISTEN:9222,bind=127.0.0.1,fork,reuseaddr TCP:127.0.0.1:"${CDP_PORT}" \
+    2>&1 | sed 's/^/[cdp-proxy] /' &
+fi
+
+CDP_TARGET="${CDP_PORT}"
+if [ -s /tmp/browser-use.cdp ]; then
+  CDP_TARGET="$(tr -d '[:space:]' < /tmp/browser-use.cdp)"
+fi
+export AGENT_BROWSER_CDP="$CDP_TARGET"
+
+# Attach agent-browser to the browser-use instance (does not launch a second browser).
 if command -v agent-browser >/dev/null 2>&1; then
-  log agent-browser "connecting via CDP :${CDP_PORT}"
-  agent-browser --cdp "$CDP_PORT" --session desktop snapshot >/tmp/agent-browser-snapshot.txt 2>&1 || \
+  log agent-browser "connecting via CDP ${CDP_TARGET}"
+  agent-browser --cdp "$CDP_TARGET" --session desktop snapshot >/tmp/agent-browser-snapshot.txt 2>&1 || \
     log agent-browser "initial snapshot skipped (browser still starting)"
-  log agent-browser "ready — run: agent-browser --cdp ${CDP_PORT} --session desktop <cmd>"
+  log agent-browser "ready — run: agent-browser --cdp ${CDP_TARGET} --session desktop <cmd>"
 else
   log agent-browser "binary not on PATH"
 fi
@@ -163,7 +208,7 @@ if [ -f /opt/agent/src/server.coffee ] && command -v bun >/dev/null 2>&1; then
     export HOME="${HOME:-/home/agent}"
     export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
     export NODE_PATH="/opt/agent/node_modules${NODE_PATH:+:$NODE_PATH}"
-    export AGENT_PORT DISPLAY CDP_PORT
+    export AGENT_PORT DISPLAY CDP_PORT AGENT_BROWSER_CDP
     export ANGELA_MCP_ROOT="${ANGELA_MCP_ROOT:-/opt/mcp}"
     export ANGELA_PROJECT_ROOT="${ANGELA_PROJECT_ROOT:-/workspace}"
     bun src/server.coffee

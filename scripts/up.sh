@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the Alpine desktop + control-room images and run them on a Podman Kind cluster.
+# Build the desktop + control-room images and run them on a Podman Kind cluster.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -23,7 +23,7 @@ fi
 "$ROOT/scripts/vendor-agent.sh"
 bun install
 
-echo "[up] building agent-desktop (Alpine XFCE)"
+echo "[up] building agent-desktop (Debian XFCE + browser-use)"
 podman build -t agent-desktop:latest -f Dockerfile .
 podman tag agent-desktop:latest localhost/agent-desktop:latest || true
 
@@ -87,7 +87,7 @@ kubectl apply -f "$ROOT/k8s/dashboard.yaml"
 # until you scale it up for a prod-like check.
 kubectl -n "$NS" scale deploy/dashboard --replicas=0 >/dev/null 2>&1 || true
 
-echo "[up] waiting for desktops (first boot of XFCE/Chromium is slow)"
+echo "[up] waiting for desktops (first boot of XFCE + browser is slow)"
 kubectl -n "$NS" rollout status statefulset/desktop --timeout=420s || true
 
 echo

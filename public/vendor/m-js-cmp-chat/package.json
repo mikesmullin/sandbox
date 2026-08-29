@@ -1,0 +1,35 @@
+{
+  "name": "m-js-cmp-chat",
+  "version": "0.1.0",
+  "description": "Reusable cowork-style chat UI for m.js v3 — sidebar and fullscreen.",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./register": "./src/register.js",
+    "./store": "./src/store.js",
+    "./helpers": "./src/helpers.js",
+    "./css/chat.css": "./css/chat.css"
+  },
+  "files": [
+    "src",
+    "css",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "demo": "bun demo/server.js"
+  },
+  "keywords": [
+    "m-js",
+    "chat",
+    "cowork",
+    "ui"
+  ],
+  "author": "Mike Smullin",
+  "license": "MIT",
+  "peerDependencies": {
+    "m-js": ">=3.0.0"
+  }
+}

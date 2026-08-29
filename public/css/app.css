@@ -116,15 +116,21 @@ body {
 .stage {
   position: relative;
   min-height: 0;
+  height: 100%;
   padding: 14px;
-  overflow: auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .wall {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 300px));
   gap: 14px;
-  min-height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 100%;
+  overflow: auto;
   align-content: start;
 }
 .wall.solo {
@@ -138,6 +144,7 @@ body {
 .wall.solo .tile.is-open {
   display: flex;
   flex-direction: column;
+  max-width: none;
 }
 
 .tile {
@@ -148,7 +155,13 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 280px;
+  max-width: 300px;
   cursor: pointer;
+}
+.tile.show-log:not(.show-desktop) {
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
 }
 .tile:hover { border-color: #3a4660; }
 .tile.is-open { cursor: default; }
@@ -259,16 +272,20 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   background: #07090d;
   border-top: 1px solid var(--line);
   flex: 0 0 auto;
 }
 .log-shell.is-fill {
   flex: 1 1 auto;
-  min-height: 140px;
+  min-height: 0;
+  overflow: hidden;
 }
 .log-pane {
   margin: 0;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
   overflow-anchor: none;
   padding: 6px 10px;
@@ -279,8 +296,6 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   outline: none;
-  height: 100%;
-  min-height: 0;
 }
 .log-shell.is-compact .log-pane {
   height: 4.6em;
@@ -354,6 +369,8 @@ body {
 }
 
 .empty {
+  flex: 1 1 auto;
+  min-height: 0;
   height: 100%;
   display: grid;
   place-content: center;
@@ -390,6 +407,39 @@ body {
   padding: 0 5px;
   border-radius: 4px;
   color: var(--ink);
+}
+
+/* Isolate-mode chat rail (widget lives in vendor/m-js-cmp-chat). */
+.stage.has-chat {
+  display: grid;
+  grid-template-columns: 1fr min(380px, 42vw);
+  padding: 0;
+  overflow: hidden;
+}
+.stage.has-chat .wall.solo {
+  position: relative;
+  inset: auto;
+  height: 100%;
+  min-height: 0;
+}
+.chat-rail {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.chat-rail > * {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+@media (max-width: 960px) {
+  .stage.has-chat {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr 40vh;
+  }
 }
 
 @media (max-width: 720px) {

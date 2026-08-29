@@ -1,5 +1,5 @@
 # Lightweight /proc snapshot so the control room can draw mycloud-style gauges
-# without the glibc mycloud-probe (Alpine is musl).
+# without the glibc mycloud-probe.
 
 prev = null
 

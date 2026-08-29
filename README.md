@@ -1,10 +1,10 @@
 # Agent desktop
 
-A local **computer-use sandbox**: Alpine XFCE desktops on Kind over rootless Podman, each with headed Chromium and an in-pod coding agent. A control-room SPA tiles the screens and talks to the agent over a cowork-style chat.
+A local **computer-use sandbox**: Debian XFCE desktops on Kind over rootless Podman, each with headed browser-use Chromium and an in-pod coding agent. A control-room SPA tiles the screens and talks to the agent over a cowork-style chat.
 
 ## Problem
 
-Cloud agent products give the model a real Linux PC — XFCE, Thunar, a terminal, a browser — and a remote viewer so you can watch and take over. Local coding agents usually get the opposite: a process sandbox with files and a shell, no headed desktop, no clickable Chromium.
+Cloud agent products give the model a real Linux PC — XFCE, Thunar, a terminal, a browser — and a remote viewer so you can watch and take over. Local coding agents usually get the opposite: a process sandbox with files and a shell, no headed desktop, no clickable browser.
 
 Recreating the cloud stack on a laptop is fiddly. Chromium wants thousands of PIDs. Kind on Podman does not import images the same way Docker does. Inference has to leave the cluster without hairpinning through the LAN. The agent needs the *current* `agl-ai` providers (`llama-server`), not the stale npm package. And the human still needs a tiled VNC wall plus a chat that can approve tools.
 
@@ -22,9 +22,9 @@ dashboard  (Bun / CoffeeScript Express)
     │  WS pipe  /desktops/:name/websockify  →  pod :6080
     │  WS pipe  /desktops/:name/agent       →  pod :8091/ws
     ▼
-desktop-N  (Alpine 3.22)
+desktop-N  (Debian bookworm)
   Xvfb → XFCE → x11vnc → websockify/noVNC
-  headed Chromium  (--no-sandbox, CDP :9222)
+  headed browser-use Chromium  (stealth launch, CDP)
   Angela owner     (file-io, term-local, agent-browser MCP)
        │
        ▼
@@ -44,7 +44,7 @@ cd /workspace/factory/container
 ./scripts/dev-ui.sh      # control room on the host (m-js HMR)
 ```
 
-First boot of XFCE + Chromium is slow. Open the host control room in a desktop-width browser:
+First boot of XFCE + the headed browser is slow. Open the host control room in a desktop-width browser:
 
 ```text
 http://127.0.0.1:8080

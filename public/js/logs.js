@@ -80,6 +80,12 @@ const appendLine = (name, row, el = logEl(name)) => {
   while (el.childElementCount > MAX_LINES) el.firstElementChild.remove()
 }
 
+const nameOfPane = (el) => {
+  const shell = el?.closest?.('.log-shell') || el
+  const m = [...(shell?.classList || [])].find((c) => String(c).startsWith('log-for-'))
+  return m ? m.slice('log-for-'.length) : el?.getAttribute?.('data-log')
+}
+
 const hookScroll = (name, el) => {
   if (!el || el.dataset.stickHooked) return
   el.dataset.stickHooked = '1'
@@ -89,11 +95,23 @@ const hookScroll = (name, el) => {
 const paintPane = (name) => {
   const el = logEl(name)
   if (!el) return
-  hookScroll(name, el)
+  const first = !el.dataset.stickHooked
+  if (first) logPinned.set(name, true)
   const rows = logBuf.get(name) || []
-  if (el.childElementCount === rows.length && rows.length) return
-  el.replaceChildren()
-  for (const row of rows) appendLine(name, row, el)
+  logStickLock = true
+  try {
+    if (!(el.childElementCount === rows.length && rows.length)) {
+      el.replaceChildren()
+      for (const row of rows) appendLine(name, row, el)
+    }
+    if (logPinned.get(name) !== false) {
+      el.scrollTop = el.scrollHeight
+      logScroll.set(name, el.scrollTop)
+    }
+  } finally {
+    logStickLock = false
+  }
+  hookScroll(name, el)
   stickLogs(name)
 }
 
@@ -113,7 +131,7 @@ export const stickLogs = (name) => {
       if (name) apply(logEl(name), name)
       else {
         for (const el of document.querySelectorAll('.log-pane')) {
-          apply(el, el.getAttribute('data-log'))
+          apply(el, nameOfPane(el))
         }
       }
     } finally {
@@ -138,6 +156,7 @@ const connectLogs = (name) => {
   const ws = new WebSocket(`${proto()}//${location.host}/desktops/${encodeURIComponent(name)}/logs`)
   logSocks.set(name, ws)
   logPinned.set(name, true)
+  logScroll.delete(name)
   ws.addEventListener('message', (ev) => {
     let msg
     try { msg = JSON.parse(ev.data) } catch { return }
@@ -220,9 +239,14 @@ const pollTelem = async (name) => {
     const sample = await res.json()
     if (!res.ok) throw new Error(sample.error || res.statusText)
     const prev = telem.byName[name] || { series: emptySeries() }
-    telem.byName = {
-      ...telem.byName,
-      [name]: { sample, series: pushSeries(prev.series, sample), error: '' },
+    const series = pushSeries(prev.series, sample)
+    const snap = `${Math.round(sample.cpu_pct)}:${Math.round(sample.ram_pct)}:${Math.round(sample.disk_pct)}`
+    const prevSnap = prev._snap
+    if (snap !== prevSnap) {
+      telem.byName = { ...telem.byName, [name]: { sample, series, error: '', _snap: snap } }
+    } else {
+      prev.sample = sample
+      prev.series = series
     }
     queueMicrotask(() => paintGauges(name))
   } catch (err) {
