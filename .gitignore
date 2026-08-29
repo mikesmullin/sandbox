@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+agent/node_modules/
+
+# generated / local
+tmp/
+*.log
+.DS_Store
+
+# secrets — vendor-agent.sh copies CA locally; never commit keys
+.env
+.env.*
+**/.env
+**/.copilot_tokens.json
+**/.angela/
+vendor/certs/
+*.pem
+*.key

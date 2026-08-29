@@ -1,0 +1,47 @@
+{
+  "name": "agl-ai",
+  "version": "0.1.6",
+  "description": "Minimalist Pydantic AI clone in Bun JavaScript.",
+  "type": "module",
+  "main": "src/agent.mjs",
+  "exports": {
+    ".": "./src/agent.mjs",
+    "./providers/xai": "./src/providers/xai.mjs",
+    "./providers/copilot": "./src/providers/copilot.mjs",
+    "./providers/runpod": "./src/providers/runpod.mjs",
+    "./providers/ollama": "./src/providers/ollama.mjs",
+    "./providers/lm-studio": "./src/providers/lm-studio.mjs",
+    "./providers/muse": "./src/providers/muse.mjs",
+    "./providers/mycloud": "./src/providers/mycloud.mjs",
+    "./providers/llama-server": "./src/providers/mycloud.mjs",
+    "./providers/openai": "./src/providers/openai.mjs",
+    "./providers/anthropic": "./src/providers/anthropic.mjs"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "files": [
+    "src/agent.mjs",
+    "src/lib/config.mjs",
+    "src/lib/debug.mjs",
+    "src/lib/mini-handlebars.mjs",
+    "src/providers/",
+    "docs/"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "tool-calling",
+    "bun",
+    "xai",
+    "grok",
+    "copilot"
+  ],
+  "author": "Mike Smullin <mike@smullindesign.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikesmullin/agl"
+  }
+}

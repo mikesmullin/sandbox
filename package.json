@@ -1,0 +1,18 @@
+{
+  "name": "agent-desktop-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Control room for Alpine XFCE agent desktops running on a local KIND cluster.",
+  "scripts": {
+    "start": "bun src/server.coffee",
+    "dev": "bun --watch src/server.coffee",
+    "dev-ui": "bash scripts/dev-ui.sh"
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "^1.3.0",
+    "bun-coffeescript": "^1.0.3",
+    "express": "^5.1.0",
+    "http-proxy": "^1.18.1"
+  }
+}

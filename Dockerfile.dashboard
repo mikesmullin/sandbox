@@ -1,0 +1,19 @@
+FROM docker.io/oven/bun:1.2-alpine
+
+RUN apk add --no-cache curl ca-certificates \
+    && KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)" \
+    && curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" \
+    && chmod +x /usr/local/bin/kubectl
+
+WORKDIR /app
+COPY package.json bunfig.toml ./
+RUN bun install --production
+COPY src ./src
+COPY public ./public
+
+ENV PORT=8080 \
+    NAMESPACE=agent-desktop \
+    DESKTOP_APP=desktop
+EXPOSE 8080
+USER bun
+CMD ["bun", "src/server.coffee"]

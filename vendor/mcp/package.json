@@ -1,0 +1,16 @@
+{
+  "name": "@mikesmullin/mcp",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "MCP tool servers: local filesystem and process execution (stdio JSON-RPC)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikesmullin/mcp.git"
+  },
+  "dependencies": {
+    "bun-coffeescript": "^1.0.3",
+    "just-bash": "3.2.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "desktop-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Angela harness that owns an Alpine XFCE desktop (tools run in-container).",
+  "scripts": {
+    "start": "bun src/server.coffee"
+  },
+  "dependencies": {
+    "agl-ai": "link:agl-ai",
+    "angela": "link:angela",
+    "bun-coffeescript": "^1.0.3"
+  }
+}

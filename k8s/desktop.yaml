@@ -1,0 +1,127 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: desktop
+  namespace: agent-desktop
+  labels:
+    app: desktop
+spec:
+  clusterIP: None
+  selector:
+    app: desktop
+  ports:
+    - name: novnc
+      port: 6080
+      targetPort: novnc
+    - name: agent
+      port: 8091
+      targetPort: agent
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: desktop
+  namespace: agent-desktop
+  labels:
+    app: desktop
+spec:
+  serviceName: desktop
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: desktop
+  template:
+    metadata:
+      labels:
+        app: desktop
+    spec:
+      automountServiceAccountToken: false
+      hostAliases:
+        - ip: "169.254.1.2"
+          hostnames:
+            - "host.containers.internal"
+            - "uber.home"
+      containers:
+        - name: desktop
+          image: agent-desktop:latest
+          imagePullPolicy: Never
+          ports:
+            - name: novnc
+              containerPort: 6080
+            - name: vnc
+              containerPort: 5900
+            - name: cdp
+              containerPort: 9222
+            - name: agent
+              containerPort: 8091
+          env:
+            - name: GEOMETRY
+              value: "1280x800x24"
+            - name: DISPLAY
+              value: ":99"
+            - name: AGENT_PORT
+              value: "8091"
+            - name: AGENT_MODEL
+              value: "llama-server:default"
+            - name: DAD_PROXY_URL
+              value: "https://host.containers.internal:1234"
+            - name: LLAMA_SERVER_BASE_URL
+              value: "https://host.containers.internal:1234"
+            - name: DAD_PROXY_CA_FILE
+              value: "/opt/certs/ca.pem"
+            - name: DAD_PROXY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dad-proxy
+                  key: api-key
+                  optional: true
+            - name: LLAMA_SERVER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dad-proxy
+                  key: api-key
+                  optional: true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          readinessProbe:
+            httpGet:
+              path: /vnc.html
+              port: novnc
+            initialDelaySeconds: 8
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 18
+          livenessProbe:
+            httpGet:
+              path: /vnc.html
+              port: novnc
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: Unconfined
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: workspace
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,6 @@
+.vscode/
+node_modules/
+.env
+.copilot_tokens.json
+src/agents/*
+/tmp/

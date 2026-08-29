@@ -1,0 +1,11 @@
+node_modules
+tmp
+.git
+**/*.log
+vendor/agl/tmp
+vendor/agl/.env
+vendor/agl/.copilot_tokens.json
+vendor/angela/test
+vendor/angela/plugins
+vendor/**/.env
+agent/node_modules
