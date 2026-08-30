@@ -1,0 +1,14 @@
+{
+  "name": "@mikesmullin/mcp-todo",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "MCP session checklist tools (todo_read / todo_write)",
+  "bin": {
+    "mcp-todo": "./server.mjs"
+  },
+  "exports": {
+    ".": "./server.mjs",
+    "./store": "./lib/store.mjs"
+  }
+}

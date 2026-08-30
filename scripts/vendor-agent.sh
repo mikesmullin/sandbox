@@ -46,17 +46,24 @@ echo "[vendor-agent] bun link agl-ai + angela (host)"
 ( cd /workspace/agl && bun link )
 ( cd /workspace/angela && bun link )
 
-echo "[vendor-agent] mcp (file-io + term-local + shared)"
+echo "[vendor-agent] mcp (file-io + term-local + todo + shared)"
 mkdir -p "$VENDOR/mcp"
 rsync -a --delete \
   --exclude node_modules \
   --exclude .git \
   --exclude bun.lock \
+  --exclude test \
   /workspace/mcp/file-io "$VENDOR/mcp/"
 rsync -a --delete \
   --exclude node_modules \
   --exclude .git \
+  --exclude test \
   /workspace/mcp/term-local "$VENDOR/mcp/"
+rsync -a --delete \
+  --exclude node_modules \
+  --exclude .git \
+  --exclude test \
+  /workspace/mcp/todo "$VENDOR/mcp/"
 rsync -a --delete \
   --exclude node_modules \
   /workspace/mcp/shared "$VENDOR/mcp/" 2>/dev/null || true

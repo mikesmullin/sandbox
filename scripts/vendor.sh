@@ -1,19 +1,10 @@
 #!/usr/bin/env bash
-# Pull noVNC core + Phosphor icons into public/vendor (offline-friendly dashboard).
+# Pull Phosphor icons into public/vendor (offline-friendly dashboard). The
+# desktop stream is Selkies (served from the pod), so no VNC client is vendored.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENDOR="$ROOT/public/vendor"
 mkdir -p "$VENDOR"
-
-if [[ ! -f "$VENDOR/novnc/core/rfb.js" ]]; then
-  echo "[vendor] noVNC core"
-  tmp="$(mktemp -d)"
-  curl -fsSL https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.tar.gz | tar -xz -C "$tmp"
-  mkdir -p "$VENDOR/novnc/vendor"
-  cp -a "$tmp"/noVNC-1.5.0/core "$VENDOR/novnc/core"
-  cp -a "$tmp"/noVNC-1.5.0/vendor/pako "$VENDOR/novnc/vendor/pako"
-  rm -rf "$tmp"
-fi
 
 if [[ ! -f "$VENDOR/phosphor/style.css" ]]; then
   echo "[vendor] Phosphor icons (regular)"

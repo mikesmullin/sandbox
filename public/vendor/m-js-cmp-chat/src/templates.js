@@ -166,7 +166,7 @@ export const messageBlockTpl = `
 
     <div
       class="msg-gutter"
-      x-show="want('showVisibility') || want('showGoto') || msg.kind === 'user' || (msg.telemetry && msg.kind !== 'reasoning')"
+      x-show="want('showVisibility') || want('showGoto') || msg.kind === 'user' || msg.full_chars || (msg.telemetry && msg.kind !== 'reasoning')"
     >
       <div class="msg-gutter-actions">
         <button
@@ -212,7 +212,7 @@ export const messageBlockTpl = `
       </div>
       <div
         class="msg-gutter-metrics"
-        x-show="msg.kind === 'user' || (msg.telemetry && msg.kind !== 'reasoning')"
+        x-show="msg.kind === 'user' || msg.full_chars || (msg.telemetry && msg.kind !== 'reasoning')"
         x-html="formatTelemetryHtml(msg.telemetry, msg)"
       ></div>
     </div>
@@ -222,6 +222,34 @@ export const messageBlockTpl = `
 export const composerTpl = `
   <footer class="composer" :class="{ 'sheet-composer': isSidebar }">
     <div class="composer-inner">
+      <div class="todo-panel" x-show="todoItems.length">
+        <button
+          type="button"
+          class="todo-header"
+          @click="toggleTodos()"
+          :title="todosOpen ? 'Collapse tasks' : 'Expand tasks'"
+          :aria-expanded="todosOpen ? 'true' : 'false'"
+        >
+          <i
+            class="ph"
+            :class="todosOpen ? 'ph-caret-down' : 'ph-caret-right'"
+            aria-hidden="true"
+          ></i>
+          <span class="todo-progress" x-text="todoProgress"></span>
+          <span class="todo-current" x-show="!todosOpen" x-text="todoCurrentLabel"></span>
+          <span class="todo-title" x-show="todosOpen">Tasks</span>
+        </button>
+        <ul class="todo-list" x-show="todosOpen">
+          <li
+            x-for="t in todoItems"
+            :key="t.id"
+            :class="'is-' + (t.status || 'pending')"
+          >
+            <i class="ph" :class="todoIcon(t)" aria-hidden="true"></i>
+            <span class="todo-text" x-text="t.content"></span>
+          </li>
+        </ul>
+      </div>
       <div class="allowlist-panel" x-show="want('showAllowlist') && allowlistOpen" x-cloak>
         <label class="allowlist-label">
           allowed commands (one rule per line)

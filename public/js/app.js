@@ -1,6 +1,4 @@
 import M from '/vendor/m.min.js'
-import RFB from '/vendor/novnc/core/rfb.js'
-import KeyTable from '/vendor/novnc/core/input/keysym.js'
 import { chat } from './chat.js'
 import {
   telem,
@@ -9,8 +7,6 @@ import {
   syncLogStreams, syncGauges, onLogScroll, stickLogs, resetLogClients,
   cpuLabel, ramLabel, diskLabel, netLabel, diskIoLabel,
 } from './logs.js'
-
-const connections = (window.__rfb ??= new Map())
 
 const CHAT_OPEN_KEY = 'agent-desktop.chatOpen'
 const CHAT_WIDTH_KEY = 'agent-desktop.chatWidth'
@@ -38,6 +34,13 @@ const readChatWidth = () => {
 const writeChatWidth = (n) => {
   try { localStorage.setItem(CHAT_WIDTH_KEY, String(Math.round(n))) } catch {}
 }
+const MUTE_KEY = 'agent-desktop.muted'
+const readMuted = () => {
+  try { return localStorage.getItem(MUTE_KEY) === '1' } catch { return false }
+}
+const writeMuted = (m) => {
+  try { localStorage.setItem(MUTE_KEY, m ? '1' : '0') } catch {}
+}
 
 const ui = M.store('ui', {
   items: [],
@@ -47,363 +50,24 @@ const ui = M.store('ui', {
   fullView: false,
   chatOpen: readChatOpen(),
   chatWidth: readChatWidth(),
-  captured: false,
   error: '',
   loading: true,
   busy: false,
   snapshot: { present: false },
   thumbGen: 0,
-  vncLive: {},
   thumbOk: {},
   thumbRetry: {},
+  wsRenameOpen: false,
+  wsRenameDraft: '',
+  wsPathCopied: false,
+  muted: readMuted(),
+  captured: false,
 })
 ui.chatOpen = readChatOpen()
 
-const wsUrl = (name) => {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}/desktops/${encodeURIComponent(name)}/websockify`
-}
-
-const FLY_MS = 380
-
-const isShown = (el) => {
-  if (!el) return false
-  const cs = getComputedStyle(el)
-  if (cs.display === 'none' || cs.visibility === 'hidden') return false
-  return true
-}
-
-const destHost = (name) => {
-  if (fullPod() === name) {
-    const wall = document.querySelector('.wall.solo')
-    if (!isShown(wall)) return null
-    const host = wall.querySelector(`[data-screen="${CSS.escape(`full:${name}`)}"]`)
-    return isShown(host) ? host : null
-  }
-  const wall = document.querySelector('.wall.grid')
-  if (!isShown(wall)) return null
-  const d = ui.items.find((x) => x.name === name)
-  const list = d?.workspaces || []
-  const current = list.find((w) => w.current) || list[0]
-  if (!current) return null
-  const key = `${name}:${current.id}`
-  const hosts = wall.querySelectorAll(`[data-screen="${CSS.escape(key)}"]`)
-  for (const h of hosts) {
-    if (!isShown(h)) continue
-    const r = h.getBoundingClientRect()
-    if (r.width > 2 && r.height > 2) return h
-  }
-  return null
-}
-
-const destRect = (name) => {
-  const host = destHost(name)
-  if (!host) return null
-  const r = host.getBoundingClientRect()
-  if (r.width < 2 || r.height < 2) return null
-  return r
-}
-
-const destReady = (name, r) => {
-  if (!r) return false
-  if (fullPod() === name) {
-    const stage = document.querySelector('.stage')
-    const sr = stage?.getBoundingClientRect()
-    if (!sr || sr.height < 40) return r.width > 120 && r.height > 80
-    return r.width >= sr.width * 0.4 && r.height >= sr.height * 0.55
-  }
-  return r.width > 48 && r.height > 48
-}
-
-const flyEl = (name) => {
-  const layer = document.querySelector('.rfb-layer')
-  if (!layer) return null
-  let el = layer.querySelector(`[data-rfb="${CSS.escape(name)}"]`)
-  if (!el) {
-    el = document.createElement('div')
-    el.className = 'rfb-fly'
-    el.dataset.rfb = name
-    el.addEventListener('contextmenu', (ev) => ev.preventDefault())
-    layer.appendChild(el)
-  }
-  return el
-}
-
-const hostWatch = new Map()
-const destObs = new ResizeObserver(() => {
-  for (const name of connections.keys()) {
-    const fly = flyEl(name)
-    if (fly?.dataset.anim === '1') continue
-    placeFly(name)
-  }
-})
-
-const watchDest = (name) => {
-  const host = destHost(name)
-  const prev = hostWatch.get(name)
-  if (prev === host) return
-  if (prev) destObs.unobserve(prev)
-  if (host) {
-    destObs.observe(host)
-    hostWatch.set(name, host)
-  } else {
-    hostWatch.delete(name)
-  }
-}
-
-const fitRfb = (name) => {
-  const rfb = connections.get(name)
-  if (!rfb) return
-  try { if (rfb._screen) rfb._screen.style.overflow = 'hidden' } catch {}
-  try { rfb._updateScale?.() } catch {}
-}
-
-const placeFly = (name, { fromRect } = {}) => {
-  const fly = flyEl(name)
-  if (!fly) return
-  const to = destRect(name)
-  if (!to) {
-    if (fromRect || fly.dataset.anim === '1' || connections.get(name)) return
-    fly.classList.add('is-hidden')
-    return
-  }
-  fly.classList.remove('is-hidden')
-  fly.classList.toggle('is-full', fullPod() === name)
-  fly.classList.toggle('is-capturing', fullPod() === name && ui.captured)
-  fly.style.left = `${to.left}px`
-  fly.style.top = `${to.top}px`
-  fly.style.width = `${to.width}px`
-  fly.style.height = `${to.height}px`
-  fitRfb(name)
-  const live = Boolean(ui.vncLive?.[name] || connections.get(name))
-  const from = fromRect && fromRect.width > 2 && fromRect.height > 2 ? fromRect : null
-  if (from && live && fly.dataset.anim !== '1') {
-    const sx = from.width / to.width
-    const sy = from.height / to.height
-    const dx = from.left - to.left
-    const dy = from.top - to.top
-    fly.style.transition = 'none'
-    fly.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`
-    fly.dataset.anim = '1'
-    fly.offsetWidth
-    fly.style.transition = `transform ${FLY_MS}ms cubic-bezier(.22,.75,.2,1)`
-    fly.style.transform = 'translate(0, 0) scale(1)'
-    const done = (ev) => {
-      if (ev && ev.target !== fly) return
-      if (fly.dataset.anim !== '1') return
-      fly.dataset.anim = ''
-      fly.style.transition = ''
-      fly.style.transform = ''
-      placeFly(name)
-      applyMode(name)
-      fitRfb(name)
-    }
-    fly.addEventListener('transitionend', done)
-    setTimeout(() => done(), FLY_MS + 80)
-  } else if (fly.dataset.anim !== '1') {
-    fly.style.transition = ''
-    fly.style.transform = ''
-  }
-}
-
-const placeFlyWhenReady = (name, opts = {}) => {
-  let n = 0
-  const tick = () => {
-    watchDest(name)
-    const r = destRect(name)
-    if (destReady(name, r) || n >= 12) {
-      placeFly(name, opts)
-      watchDest(name)
-      return
-    }
-    n += 1
-    requestAnimationFrame(tick)
-  }
-  requestAnimationFrame(tick)
-}
-
-const placeAllFlies = () => {
-  for (const name of connections.keys()) {
-    const fly = flyEl(name)
-    if (fly?.dataset.anim === '1') continue
-    watchDest(name)
-    placeFly(name)
-  }
-}
-
-const fullPod = () => (ui.fullView && ui.selectedDesktop?.name) || null
-
-const applyMode = (name) => {
-  const rfb = connections.get(name)
-  if (!rfb) return
-  const solo = fullPod() === name
-  const grabbed = solo && ui.captured
-  rfb.viewOnly = !grabbed
-  rfb.focusOnClick = grabbed
-  rfb.qualityLevel = solo ? 8 : 4
-  rfb.compressionLevel = solo ? 2 : 4
-  flyEl(name)?.classList.toggle('is-capturing', grabbed)
-  try {
-    if (grabbed) rfb.focus()
-    else rfb.blur()
-  } catch {}
-}
-
-const setVncLive = (name, live) => {
-  const cur = Boolean(ui.vncLive?.[name])
-  if (cur === live) return
-  ui.vncLive = { ...ui.vncLive, [name]: live }
-}
-
-const CLIP_SKIP = 'textarea, input, select, [contenteditable], .mjs-chat, .sheet-chat'
-const inClipSkip = (el) => Boolean(el?.closest?.(CLIP_SKIP))
-
-const capturedRfb = () => {
-  if (!ui.captured) return null
-  const name = fullPod()
-  if (!name) return null
-  const rfb = connections.get(name)
-  if (!rfb || rfb._rfbConnectionState !== 'connected') return null
-  return rfb
-}
-
-const sendGuestClipboard = (rfb, text) => {
-  if (!rfb || text == null || text === '') return false
-  try {
-    rfb.clipboardPasteFrom(text)
-    return true
-  } catch {
-    return false
-  }
-}
-
-const writeHostClipboard = (text) => {
-  if (typeof text !== 'string' || !navigator.clipboard?.writeText) return
-  navigator.clipboard.writeText(text).catch(() => {})
-}
-
-const pushHostClipboard = (rfb) => {
-  if (!rfb || !navigator.clipboard?.readText) return
-  navigator.clipboard.readText()
-    .then((t) => {
-      if (!t) return
-      if (rfb._rfbConnectionState !== 'connected' || rfb.viewOnly) return
-      sendGuestClipboard(rfb, t)
-    })
-    .catch(() => {})
-}
-
-const sendGuestPaste = (rfb, ctrlHeld) => {
-  try {
-    if (!ctrlHeld) rfb.sendKey(KeyTable.XK_Control_L, 'ControlLeft', true)
-    rfb.sendKey(KeyTable.XK_v, 'KeyV', true)
-    rfb.sendKey(KeyTable.XK_v, 'KeyV', false)
-    if (!ctrlHeld) rfb.sendKey(KeyTable.XK_Control_L, 'ControlLeft', false)
-  } catch {}
-}
-
-const fireGuestPaste = (rfb, text, ctrlHeld) => {
-  const stuffed = sendGuestClipboard(rfb, text)
-  const go = () => {
-    if (rfb._rfbConnectionState !== 'connected' || rfb.viewOnly) return
-    sendGuestPaste(rfb, ctrlHeld)
-  }
-  if (stuffed) setTimeout(go, 30)
-  else go()
-}
-
-const connect = (name) => {
-  const el = flyEl(name)
-  if (!el) return
-  const existing = connections.get(name)
-  if (existing && existing.__el === el) return
-  if (existing) disconnect(name)
-  setVncLive(name, false)
-  const rfb = new RFB(el, wsUrl(name), { shared: true })
-  rfb.__el = el
-  rfb.scaleViewport = true
-  rfb.clipViewport = false
-  rfb.background = '#07090d'
-  try { if (rfb._screen) rfb._screen.style.overflow = 'hidden' } catch {}
-  rfb.showDotCursor = true
-  rfb.addEventListener('clipboard', (ev) => {
-    if (fullPod() !== name) return
-    writeHostClipboard(ev.detail?.text)
-  })
-  rfb.addEventListener('connect', () => {
-    applyMode(name)
-    setVncLive(name, true)
-    placeFly(name)
-    if (ui.captured && fullPod() === name) pushHostClipboard(rfb)
-  })
-  rfb.addEventListener('disconnect', (ev) => {
-    connections.delete(name)
-    setVncLive(name, false)
-    flyEl(name)?.classList.add('is-hidden')
-    if (ev.detail && ev.detail.clean === false) {
-      setTimeout(() => {
-        if (ui.items.some((d) => d.name === name && d.ready)) syncScreens()
-      }, 800)
-    }
-  })
-  connections.set(name, rfb)
-  applyMode(name)
-}
-
-const disconnect = (name) => {
-  const rfb = connections.get(name)
-  if (!rfb) return
-  try { rfb.disconnect() } catch {}
-  connections.delete(name)
-  setVncLive(name, false)
-  const fly = flyEl(name)
-  if (fly) {
-    fly.dataset.anim = ''
-    fly.classList.add('is-hidden')
-  }
-}
-
-const syncScreens = (opts = {}) => {
-  const live = new Set()
-  const full = fullPod()
-  if (full) {
-    const c = ui.items.find((d) => d.name === full)
-    if (c?.ready) live.add(c.name)
-  } else {
-    for (const d of ui.items) {
-      if (!(d.ready && wantDesktop(d))) continue
-      const list = d.workspaces || []
-      if (list.length !== 1) continue
-      if (!list[0]) continue
-      live.add(d.name)
-    }
-  }
-  for (const name of live) connect(name)
-  for (const name of live) {
-    const fly = flyEl(name)
-    if (opts.flyName === name && opts.fromRect) placeFlyWhenReady(name, { fromRect: opts.fromRect })
-    else if (fly?.dataset.anim !== '1') {
-      watchDest(name)
-      placeFly(name)
-    }
-  }
-  for (const name of [...connections.keys()]) {
-    if (live.has(name)) continue
-    const fly = flyEl(name)
-    if (opts.flyName === name && opts.fromRect && fly) {
-      placeFlyWhenReady(name, { fromRect: opts.fromRect })
-      const hold = name
-      setTimeout(() => {
-        if (fullPod() === hold) return
-        const d = ui.items.find((x) => x.name === hold)
-        if (d?.ready && wantDesktop(d) && (d.workspaces || []).length === 1) return
-        disconnect(hold)
-      }, FLY_MS + 120)
-    } else {
-      disconnect(name)
-    }
-  }
-  for (const name of connections.keys()) applyMode(name)
+// The isolated desktop is a Selkies HTML5 client iframe served through the
+// dashboard proxy at /desktops/<pod>/. The wall shows static /thumb images.
+const syncScreens = () => {
   syncLogStreams(ui.items)
   syncGauges(ui.items)
   queueMicrotask(() => stickLogs())
@@ -421,9 +85,18 @@ const api = async (path, opts) => {
 
 const desktopSnap = (list) =>
   (list || []).map((d) => {
-    const ws = (d.workspaces || []).map((w) => `${w.id}${w.current ? '*' : ''}`).join(',')
+    const ws = (d.workspaces || []).map((w) => {
+      const label = String(w.label || '').trim()
+      return `${w.id}${w.current ? '*' : ''}:${label}`
+    }).join(',')
     return `${d.name}:${d.ready}:${d.phase}:${d.restarts || 0}:${ws}`
   }).join('|')
+
+const closeWsRename = () => {
+  if (!ui.wsRenameOpen && !ui.wsRenameDraft) return
+  ui.wsRenameOpen = false
+  ui.wsRenameDraft = ''
+}
 
 const refresh = async () => {
   try {
@@ -447,7 +120,7 @@ const refresh = async () => {
       const wasFull = ui.fullView
       ui.selectedDesktop = null
       ui.fullView = false
-      ui.captured = false
+      closeWsRename()
       chat.attach(null)
       if (wasFull && readFullRoute()) goWall()
     }
@@ -462,14 +135,7 @@ const refresh = async () => {
 }
 
 const paint = () => {
-  for (const name of connections.keys()) applyMode(name)
   try { M.redraw() } catch {}
-}
-
-const ungrab = () => {
-  if (!ui.captured) return
-  ui.captured = false
-  paint()
 }
 
 const Router = M.Router
@@ -487,42 +153,33 @@ const readFullRoute = () => {
   }
 }
 
-let pendingFly = null
-
 const applyRouteFromHash = () => {
   const full = readFullRoute()
   if (full) {
     const same = ui.fullView
       && ui.selectedDesktop?.name === full.name
       && String(ui.selectedDesktop?.ws) === String(full.ws)
-    const fly = pendingFly
-    pendingFly = null
     ui.selectedContainer = null
     ui.selectedDesktop = { name: full.name, ws: full.ws }
     ui.fullView = true
-    if (!same) ui.captured = false
+    if (!same) closeWsRename()
     chat.attach(`${full.name}::${full.ws}`)
     paint()
-    queueMicrotask(() => syncScreens({
-      fromRect: fly?.name === full.name ? fly.fromRect : null,
-      flyName: full.name,
-    }))
-    if (fly || !same) {
-      api(`/api/desktops/${encodeURIComponent(full.name)}/workspaces/${encodeURIComponent(full.ws)}/focus`, {
-        method: 'POST',
-      }).catch((err) => console.warn('workspace focus', err))
-    }
+    queueMicrotask(syncScreens)
+    // Flip the pod's X display to this workspace so the (per-container) Selkies
+    // stream shows it. Same stream when only the workspace changes.
+    api(`/api/desktops/${encodeURIComponent(full.name)}/workspaces/${encodeURIComponent(full.ws)}/focus`, {
+      method: 'POST',
+    }).catch((err) => console.warn('workspace focus', err))
     return
   }
-  pendingFly = null
   if (!ui.fullView) return
   const name = ui.selectedDesktop?.name
-  const fromRect = name ? flyEl(name)?.getBoundingClientRect() : null
-  ui.captured = false
   ui.fullView = false
+  closeWsRename()
   chat.attach(null)
   paint()
-  queueMicrotask(() => syncScreens({ fromRect, flyName: name }))
+  queueMicrotask(syncScreens)
   if (name) {
     api(`/api/desktops/${encodeURIComponent(name)}/workspaces/scan`, { method: 'POST' })
       .catch((err) => console.warn('workspace scan', err))
@@ -551,10 +208,85 @@ const ensureRoutes = () => {
 
 const leaveFuller = () => goWall()
 
-const onOutsideDesktop = (ev) => {
-  if (!ui.captured) return
-  if (ev.target && ev.target.closest && ev.target.closest('.screen, .rfb-fly')) return
-  window.__desktopUngrab?.()
+// Selkies gaming mode (Ctrl+Shift+X) owns pointer lock and eats Esc; the first
+// Esc exits pointer lock, the second reaches here and returns to the wall. When
+// not locked, a single Esc in the same-origin iframe returns to the wall. The
+// always-visible toolbar "wall" button is the reliable fallback.
+const onFrameEsc = (win) => (ev) => {
+  if (ev.key !== 'Escape') return
+  if (document.pointerLockElement || win.document?.pointerLockElement) return
+  goWall()
+}
+
+// The Selkies client (in the iframe) accepts same-origin control messages; mute
+// maps to setMute. The core recreates its audio gain node unmuted when the stream
+// reconnects, so re-apply the muted state on its pipeline/status pings.
+const setFrameMute = (win, muted) => {
+  try { win?.postMessage({ type: 'setMute', value: !!muted }, window.location.origin) } catch {}
+}
+const reapplyMuteToFrame = (win) => {
+  if (win && ui.muted) setFrameMute(win, true)
+}
+
+// In-place mouse capture: pointer-lock the Selkies input surface so the OS cursor
+// is confined to the stream (deltas keep flowing) while the tiled DESKTOP_FULL
+// layout — chat rail included — stays on screen. Esc releases. Pointer lock needs
+// a real user gesture, so the lock is requested from a click *inside* the iframe
+// (same-origin); the toolbar toggle relies on same-origin activation propagation.
+const selkiesLock = (win) => {
+  if (!win || win.document.pointerLockElement) return
+  const inp = win.webrtcInput
+  const el = inp?.element || win.document.getElementById('overlayInput') || win.document.querySelector('canvas')
+  if (!el) return
+  try {
+    if (inp && typeof inp._requestPointerLock === 'function') {
+      inp._requestPointerLock(el, () => selkiesLock(win), (e) => console.warn('pointer lock failed', e))
+    } else {
+      el.requestPointerLock?.()
+    }
+    if (inp?.cursorDiv) inp.cursorDiv.style.visibility = 'hidden'
+  } catch (e) { console.warn('capture', e) }
+}
+const selkiesUnlock = (win) => {
+  try { win?.document.exitPointerLock?.() } catch {}
+}
+// A WebGL/FPS page in the guest holds its OWN pointer lock. Our Esc is consumed by
+// the outer browser to exit our lock, so it never reaches the guest — leaving the
+// guest game still locked (absolute cursor warps read as exaggerated mouselook).
+// When our capture ends, inject an Escape into the guest (XTEST) so its page exits
+// pointer lock too, making one Esc fully stop mouselook.
+const XK_ESCAPE = 0xff1b
+const releaseGuestPointerLock = (win) => {
+  const inp = win?.webrtcInput
+  if (!inp || typeof inp._sendKeyEvent !== 'function') return
+  try {
+    inp._sendKeyEvent(XK_ESCAPE, 'Escape', true)
+    inp._sendKeyEvent(XK_ESCAPE, 'Escape', false)
+  } catch (e) { console.warn('guest escape', e) }
+}
+const wireCapture = (win) => {
+  if (!win || win.__captureWired) return
+  win.__captureWired = true
+  try {
+    // A plain left click on the stream captures (matches the old click-to-control
+    // flow). Modified clicks are left to Selkies' own chords (Ctrl+Shift+Click,
+    // gaming mode). Capture-phase, no preventDefault, so Selkies still gets it.
+    win.document.addEventListener('mousedown', (ev) => {
+      if (win.document.pointerLockElement) return
+      if (ev.button !== 0 || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return
+      selkiesLock(win)
+    }, true)
+    win.document.addEventListener('pointerlockchange', () => {
+      const locked = Boolean(win.document.pointerLockElement)
+      if (!locked) {
+        if (win.webrtcInput?.cursorDiv) win.webrtcInput.cursorDiv.style.visibility = ''
+        // Also release the guest page's own pointer lock so mouselook stops on
+        // the first Esc, not the second.
+        releaseGuestPointerLock(win)
+      }
+      if (ui.captured !== locked) { ui.captured = locked; try { M.redraw() } catch {} }
+    })
+  } catch (e) { console.warn('wireCapture', e) }
 }
 
 const workspacesOf = (c) =>
@@ -563,6 +295,7 @@ const workspacesOf = (c) =>
     : [{ id: 'workspace', name: 'workspace', current: true }]
 
 let burstTimer = 0
+let copyFlashTimer = 0
 const burstPoll = (ms = 8000) => {
   const until = Date.now() + ms
   const tick = () => {
@@ -592,9 +325,7 @@ const App = () => ({
   get workspaceCount() {
     return ui.items.reduce((n, d) => n + workspacesOf(d).length, 0)
   },
-  get captured() { return ui.captured },
   get thumbGen() { return ui.thumbGen },
-  get vncLiveMap() { return ui.vncLive },
   get thumbOkMap() { return ui.thumbOk },
   get nonePicked() { return !ui.selectedContainer && !ui.selectedDesktop },
   get wallPicked() { return !ui.fullView && Boolean(ui.selectedContainer || ui.selectedDesktop) },
@@ -607,16 +338,168 @@ const App = () => ({
   },
   fullContainer() { return ui.items.find((d) => d.name === ui.selectedDesktop?.name) },
   wsCount(c) { return workspacesOf(c).length },
-  liveWall(c, ws) {
-    return Boolean(c?.ready && this.wsCount(c) === 1 && ws?.current)
+  wsTitle(ws) {
+    const label = String(ws?.label || '').trim()
+    if (label) return label
+    return ws?.name || ws?.id || ''
+  },
+  wsTitleHint(ws) {
+    const label = String(ws?.label || '').trim()
+    const id = ws?.name || ws?.id || ''
+    return label ? id : ''
   },
   fullTitle() {
+    return this.fullPath()
+  },
+  fullContainerId() {
+    return this.full?.name || ''
+  },
+  fullWorkspace() {
+    const f = this.full
+    if (!f) return null
+    const c = this.fullContainer()
+    return workspacesOf(c).find((w) => String(w.id) === String(f.ws)) || null
+  },
+  fullWorkspaceId() {
     const f = this.full
     if (!f) return ''
-    const c = this.fullContainer()
-    const ws = workspacesOf(c).find((w) => String(w.id) === String(f.ws))
-    const right = ws?.name || (f.ws != null ? String(f.ws) : '')
-    return right ? `${f.name} > ${right}` : f.name
+    const ws = this.fullWorkspace()
+    return ws?.name || (f.ws != null ? String(f.ws) : '')
+  },
+  fullPath() {
+    const left = this.fullContainerId()
+    const right = this.fullWorkspaceId()
+    if (left && right) return `${left} > ${right}`
+    return left || right
+  },
+  fullLabel() {
+    return String(this.fullWorkspace()?.label || '').trim()
+  },
+  get pathCopied() { return Boolean(ui.wsPathCopied) },
+  copyFullPath(ev) {
+    ev?.preventDefault?.()
+    ev?.stopPropagation?.()
+    const text = this.fullPath()
+    if (!text) return
+    const flash = () => {
+      ui.wsPathCopied = true
+      paint()
+      clearTimeout(copyFlashTimer)
+      copyFlashTimer = setTimeout(() => {
+        ui.wsPathCopied = false
+        try { M.redraw() } catch {}
+      }, 1200)
+    }
+    const fallback = () => {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.setAttribute('readonly', '')
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0'
+      document.body.appendChild(ta)
+      ta.focus()
+      ta.select()
+      let ok = false
+      try { ok = document.execCommand('copy') } catch {}
+      ta.remove()
+      return ok
+    }
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(flash).catch(() => {
+        if (fallback()) flash()
+      })
+      return
+    }
+    if (fallback()) flash()
+  },
+  fullFrameSrc() {
+    // Per-container Selkies stream. Empty when not in full view so leaving the
+    // wall tears the stream (and its audio) down.
+    const name = this.full?.name
+    return name ? `/desktops/${encodeURIComponent(name)}/` : ''
+  },
+  onFrameLoad(ev) {
+    const win = ev?.target?.contentWindow
+    if (!win) return
+    try { win.addEventListener('keydown', onFrameEsc(win)) } catch {}
+    // Focus the stream so its own capture chords (Ctrl+Shift+Click / Ctrl+Shift+X)
+    // reach Selkies, and wire plain-click-to-capture (in-place pointer lock).
+    try { ev.target.focus?.(); win.focus?.() } catch {}
+    wireCapture(win)
+    // Keep audio muted across reconnects: the core resets its gain node on each
+    // audio (re)init and announces it via pipeline/status messages.
+    try {
+      win.addEventListener('message', (e) => {
+        if (e.origin !== window.location.origin) return
+        const t = e?.data?.type
+        if (t === 'pipelineStatusUpdate' || t === 'sidebarButtonStatusUpdate') reapplyMuteToFrame(win)
+      })
+    } catch {}
+    setTimeout(() => reapplyMuteToFrame(win), 800)
+  },
+  get renaming() { return Boolean(ui.wsRenameOpen) },
+  startRename(ev) {
+    ev?.preventDefault?.()
+    ev?.stopPropagation?.()
+    if (!this.full) return
+    ui.wsRenameDraft = this.fullLabel()
+    ui.wsRenameOpen = true
+    paint()
+    queueMicrotask(() => {
+      const el = document.querySelector('.ws-rename-input')
+      if (!el) return
+      el.focus()
+      el.select()
+    })
+  },
+  cancelRename(ev) {
+    ev?.preventDefault?.()
+    ev?.stopPropagation?.()
+    closeWsRename()
+    paint()
+  },
+  applyListed(name, listed) {
+    const workspaces = listed?.workspaces
+    if (!name || !Array.isArray(workspaces)) return
+    ui.items = ui.items.map((d) => (d.name === name ? { ...d, workspaces } : d))
+  },
+  setLocalLabel(name, wsId, label) {
+    const next = String(label || '').trim() || null
+    ui.items = ui.items.map((d) => {
+      if (d.name !== name) return d
+      const workspaces = workspacesOf(d).map((w) =>
+        String(w.id) === String(wsId) ? { ...w, label: next } : w,
+      )
+      return { ...d, workspaces }
+    })
+  },
+  async commitRename(ev) {
+    ev?.preventDefault?.()
+    ev?.stopPropagation?.()
+    if (!ui.wsRenameOpen) return
+    const f = this.full
+    const draft = String(ui.wsRenameDraft || '').replace(/\s+/g, ' ').trim()
+    closeWsRename()
+    if (!f) {
+      paint()
+      return
+    }
+    const prev = String(this.fullWorkspace()?.label || '').trim()
+    if (draft === prev) {
+      paint()
+      return
+    }
+    this.setLocalLabel(f.name, f.ws, draft)
+    paint()
+    try {
+      const listed = await api(
+        `/api/desktops/${encodeURIComponent(f.name)}/workspaces/${encodeURIComponent(f.ws)}`,
+        { method: 'PATCH', body: JSON.stringify({ label: draft }) },
+      )
+      this.applyListed(f.name, listed)
+    } catch (err) {
+      this.setLocalLabel(f.name, f.ws, prev)
+      ui.error = err.message
+    }
   },
   onContainerBlank(c, ev) {
     if (ui.fullView) return
@@ -637,7 +520,6 @@ const App = () => ({
   pickContainer(c, ev) {
     ev?.stopPropagation?.()
     ui.fullView = false
-    ui.captured = false
     ui.selectedDesktop = null
     ui.selectedContainer = ui.selectedContainer === c.name ? null : c.name
     chat.attach(null)
@@ -647,7 +529,6 @@ const App = () => ({
     ev?.stopPropagation?.()
     const same = ui.selectedDesktop?.name === c.name && String(ui.selectedDesktop?.ws) === String(ws.id) && !ui.fullView
     ui.fullView = false
-    ui.captured = false
     ui.selectedContainer = null
     ui.selectedDesktop = same ? null : { name: c.name, ws: ws.id }
     chat.attach(null)
@@ -656,31 +537,33 @@ const App = () => ({
   async openDesktop(c, ws, ev) {
     ev?.stopPropagation?.()
     if (!c.ready) return
-    pendingFly = { name: c.name, fromRect: ev.currentTarget?.getBoundingClientRect?.() }
     goFull(c.name, ws.id)
   },
-  grab(ev, c) {
-    if (!c?.ready) return
-    if (fullPod() !== c.name) return
-    ev.stopPropagation()
-    if (ui.captured) return
-    ui.captured = true
-    paint()
-    const rfb = connections.get(c.name)
-    if (rfb) pushHostClipboard(rfb)
-  },
-  release() { ungrab() },
   back() { goWall() },
+  get captured() { return Boolean(ui.captured) },
+  toggleCapture() {
+    const f = document.querySelector('iframe.selkies-frame')
+    const win = f?.contentWindow
+    if (!win) return
+    if (win.document.pointerLockElement) selkiesUnlock(win)
+    else { try { f.focus?.(); win.focus?.() } catch {}; selkiesLock(win) }
+  },
+  get muted() { return Boolean(ui.muted) },
+  toggleMute() {
+    ui.muted = !ui.muted
+    writeMuted(ui.muted)
+    const f = document.querySelector('iframe.selkies-frame')
+    setFrameMute(f?.contentWindow, ui.muted)
+    paint()
+  },
   toggleChat() {
     ui.chatOpen = !ui.chatOpen
     writeChatOpen(ui.chatOpen)
     paint()
-    queueMicrotask(placeAllFlies)
   },
   startChatResize(ev) {
     ev.preventDefault()
     ev.stopPropagation()
-    this.release()
     const handle = ev.currentTarget
     const stage = handle?.closest?.('.stage') || document.querySelector('.stage')
     const startX = ev.clientX
@@ -693,7 +576,6 @@ const App = () => ({
         Math.floor((stage?.clientWidth || window.innerWidth) * 0.72),
       )
       ui.chatWidth = Math.min(max, Math.max(CHAT_WIDTH_MIN, startW + (startX - e.clientX)))
-      window.__desktopPlaceFlies?.()
     }
     const onUp = () => {
       handle?.classList?.remove('is-drag')
@@ -701,7 +583,6 @@ const App = () => ({
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
       writeChatWidth(ui.chatWidth)
-      window.__desktopPlaceFlies?.()
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
@@ -738,7 +619,7 @@ const App = () => ({
         const wasFull = ui.fullView
         ui.selectedDesktop = null
         ui.fullView = false
-        ui.captured = false
+        closeWsRename()
         chat.attach(null)
         if (wasFull) goWall()
       }
@@ -813,7 +694,7 @@ const App = () => ({
         const wasFull = ui.fullView
         ui.selectedDesktop = null
         ui.fullView = false
-        ui.captured = false
+        closeWsRename()
         ui.selectedContainer = name
         chat.attach(null)
         if (wasFull) goWall()
@@ -845,7 +726,6 @@ const App = () => ({
   thumbUrl(c, ws) {
     return `/api/desktops/${encodeURIComponent(c.name)}/workspaces/${encodeURIComponent(ws.id)}/thumb?g=${this.thumbGen}`
   },
-  vncLive(name) { return Boolean(this.vncLiveMap?.[name]) },
   thumbOk(c, ws) { return Boolean(this.thumbOkMap?.[`${c.name}:${ws.id}`]) },
   onThumbLoad(c, ws) {
     const key = `${c.name}:${ws.id}`
@@ -862,12 +742,6 @@ const App = () => ({
     setTimeout(() => {
       ui.thumbGen = (ui.thumbGen || 0) + 1
     }, delay)
-  },
-  screenClass(c, ws) {
-    const bits = ['screen']
-    if (this.vncLiveMap?.[c.name]) bits.push('is-live')
-    else bits.push('is-wait')
-    return bits.join(' ')
   },
   thumbClass(c, ws) {
     const bits = ['screen', 'thumb-screen']
@@ -966,6 +840,22 @@ const App = () => ({
             <i class="ph ph-arrow-left"></i> wall
           </button>
           <button class="btn toggle" type="button" x-show="inFull"
+                  :class="captured ? 'on' : 'off'"
+                  :aria-pressed="captured ? 'true' : 'false'"
+                  :title="captured ? 'Release mouse (Esc)' : 'Capture mouse — lock the cursor to the stream'"
+                  @click="toggleCapture()">
+            <i class="ph" :class="captured ? 'ph-mouse' : 'ph-cursor-click'"></i>
+            <span x-text="captured ? 'captured' : 'capture'"></span>
+          </button>
+          <button class="btn toggle" type="button" x-show="inFull"
+                  :class="muted ? 'on' : 'off'"
+                  :aria-pressed="muted ? 'true' : 'false'"
+                  :title="muted ? 'Unmute desktop audio' : 'Mute desktop audio'"
+                  @click="toggleMute()">
+            <i class="ph" :class="muted ? 'ph-speaker-slash' : 'ph-speaker-high'"></i>
+            <span x-text="muted ? 'muted' : 'audio'"></span>
+          </button>
+          <button class="btn toggle" type="button" x-show="inFull"
                   :class="chatOpen ? 'on' : 'off'"
                   :aria-pressed="chatOpen ? 'true' : 'false'"
                   title="Toggle chat sidebar"
@@ -1057,19 +947,10 @@ const App = () => ({
                        :class="desktopClass(d, ws)">
                 <div class="tile-head" @click="pickDesktop(d, ws, $event)">
                   <i class="ph ph-browser"></i>
-                  <span class="name" x-text="ws.name"></span>
+                  <span class="name" x-text="wsTitle(ws)" :title="wsTitleHint(ws)"></span>
                   <span class="rec-dot" x-show="ws.current" title="capturing"></span>
                 </div>
-                <div class="screen" x-show="liveWall(d, ws)"
-                     :class="screenClass(d, ws)"
-                     :data-screen="screenKey(d, ws)"
-                     @click="openDesktop(d, ws, $event)">
-                  <div class="screen-wait">
-                    <i class="ph ph-circle-notch ph-spinner"></i>
-                    <span>waiting for workspace</span>
-                  </div>
-                </div>
-                <div class="screen thumb-screen" x-show="!liveWall(d, ws)"
+                <div class="screen thumb-screen"
                      :class="thumbClass(d, ws)"
                      :data-screen="screenKey(d, ws)"
                      @click="openDesktop(d, ws, $event)">
@@ -1091,31 +972,58 @@ const App = () => ({
         </section>
 
         <section class="wall solo" x-show="full">
-          <article class="tile is-open" :class="captured ? 'is-capturing show-desktop' : 'show-desktop'">
+          <article class="tile is-open show-desktop">
             <div class="tile-head">
               <i class="ph ph-browser"></i>
-              <span class="name" x-text="fullTitle()"></span>
+              <span class="name" x-text="fullContainerId()"></span>
+              <span class="crumb-sep" x-show="fullWorkspaceId()">></span>
+              <span class="name" x-text="fullWorkspaceId()"></span>
+              <button class="head-icon" type="button"
+                      :class="pathCopied ? 'is-ok' : ''"
+                      :title="pathCopied ? 'Copied' : 'Copy ' + fullPath()"
+                      :aria-label="pathCopied ? 'Copied' : 'Copy container and workspace id'"
+                      @click.stop="copyFullPath($event)">
+                <i class="ph ph-copy-simple" x-show="!pathCopied"></i>
+                <i class="ph ph-check" x-show="pathCopied"></i>
+              </button>
+              <span class="ws-alias" x-show="!renaming && fullLabel()"
+                    :title="fullLabel()" x-text="fullLabel()"></span>
+              <button class="head-icon" type="button" x-show="!renaming"
+                      title="Name this workspace"
+                      aria-label="Name this workspace"
+                      @click.stop="startRename($event)">
+                <i class="ph ph-pencil-simple"></i>
+              </button>
+              <form class="ws-rename" x-show="renaming"
+                    @submit.prevent="commitRename($event)"
+                    @click.stop>
+                <input class="ws-rename-input"
+                       type="text"
+                       maxlength="80"
+                       spellcheck="false"
+                       autocomplete="off"
+                       placeholder="what is this workspace for?"
+                       aria-label="Workspace name"
+                       x-model="$store.ui.wsRenameDraft"
+                       @keydown.escape.prevent="cancelRename($event)"
+                       @blur="commitRename($event)" />
+              </form>
               <span class="meta">
-                <span class="capture-status hint"
-                      x-show="full && !captured && fullContainer() && fullContainer().ready">
+                <span class="capture-status hint" x-show="!captured">
                   <i class="ph ph-cursor-click"></i>
-                  click workspace to control
+                  click stream to capture · <span class="kbd">Ctrl+Shift+X</span> fullscreen · <span class="kbd">Esc</span> wall
                 </span>
                 <span class="capture-status" x-show="captured">
                   <i class="ph ph-mouse"></i>
-                  mouse + keyboard + clipboard
-                  <span><span class="kbd">Esc</span> releases</span>
+                  mouse captured · <span class="kbd">Esc</span> releases
                 </span>
               </span>
             </div>
-            <div class="screen" :class="full && vncLiveMap[full.name] ? 'is-live' : 'is-wait'"
-                 :data-screen="full ? ('full:' + full.name) : ''"
-                 @click="grab($event, fullContainer())">
-              <div class="screen-wait">
-                <i class="ph ph-circle-notch ph-spinner"></i>
-                <span>waiting for workspace</span>
-              </div>
-            </div>
+            <iframe class="selkies-frame" x-show="full"
+                    :src="fullFrameSrc()"
+                    allow="pointer-lock; fullscreen; clipboard-read; clipboard-write; gamepad; autoplay"
+                    title="workspace"
+                    @load="onFrameLoad($event)"></iframe>
           </article>
         </section>
 
@@ -1125,7 +1033,7 @@ const App = () => ({
           title="Resize chat"
           @pointerdown="startChatResize($event)"
         ></div>
-        <div class="chat-rail" x-show="full && chatOpen" @pointerdown="release()" @mousedown="release()">
+        <div class="chat-rail" x-show="full && chatOpen">
           <div
             x-component="mjs-chat"
             mode="sidebar"
@@ -1148,7 +1056,6 @@ const App = () => ({
           </div>
         </div>
       </main>
-      <div class="rfb-layer" x-ignore></div>
     </div>
   `,
 })
@@ -1156,13 +1063,11 @@ const App = () => ({
 const boot = async (bust = Date.now()) => {
   const { registerChat: register } = await import(`/vendor/m-js-cmp-chat/src/index.js?t=${bust}`)
   register(M)
-  for (const name of [...connections.keys()]) disconnect(name)
-  document.querySelector('.rfb-layer')?.replaceChildren()
   resetLogClients()
   try { Router.stop() } catch {}
   ensureRoutes()
   M.mount('#app', App)
-  // Keep the App shell across hash changes so noVNC canvases are not rebuilt.
+  // Keep the App shell across hash changes so the iframe is not rebuilt.
   Router.onChange(() => applyRouteFromHash())
   await refresh()
   applyRouteFromHash()
@@ -1170,67 +1075,27 @@ const boot = async (bust = Date.now()) => {
 
 window.__M_BOOT__ = boot
 window.__desktopRefresh = refresh
-window.__desktopUngrab = ungrab
 window.__desktopLeave = leaveFuller
-window.__desktopPlaceFlies = placeAllFlies
-
-const isPasteChord = (ev) => {
-  if (ev.altKey) return false
-  if (ev.code !== 'KeyV' && ev.key !== 'v' && ev.key !== 'V') return false
-  return Boolean(ev.ctrlKey || ev.metaKey)
-}
-
-window.__desktopOnPasteKey = (ev) => {
-  if (!isPasteChord(ev) || !ui.captured || inClipSkip(ev.target)) return
-  const rfb = capturedRfb()
-  if (!rfb) return
-  ev.stopImmediatePropagation()
-  if (ev.repeat || rfb.__awaitPaste || rfb.__pasteDone) return
-  rfb.__awaitPaste = true
-  const ctrlHeld = Boolean(ev.ctrlKey)
-  const finish = (text) => {
-    if (rfb.__pasteDone) return
-    rfb.__pasteDone = true
-    rfb.__awaitPaste = false
-    clearTimeout(rfb.__pasteTimer)
-    rfb.__pasteFinish = null
-    fireGuestPaste(rfb, text, ctrlHeld)
-    setTimeout(() => { rfb.__pasteDone = false }, 400)
-  }
-  rfb.__pasteFinish = finish
-  rfb.__pasteTimer = setTimeout(() => finish(''), 150)
-  navigator.clipboard?.readText?.().then((t) => finish(t)).catch(() => {})
-}
-
-window.__desktopOnPaste = (ev) => {
-  if (!ui.captured || inClipSkip(ev.target)) return
-  const rfb = capturedRfb()
-  if (!rfb) return
-  ev.preventDefault()
-  if (rfb.__pasteDone) return
-  const text = ev.clipboardData?.getData('text/plain') ?? ''
-  if (typeof rfb.__pasteFinish === 'function') rfb.__pasteFinish(text)
-  else fireGuestPaste(rfb, text, false)
-}
-
-window.__desktopOnClipChange = () => {
-  const rfb = capturedRfb()
-  if (rfb) pushHostClipboard(rfb)
-}
 
 if (!window.__DESKTOP_ONCE__) {
   window.__DESKTOP_ONCE__ = true
   setInterval(() => window.__desktopRefresh?.(), 1000)
   window.addEventListener('keydown', (ev) => {
-    if (ev.key !== 'Escape' || !(ui.selectedDesktop || ui.selectedContainer || ui.captured)) return
+    if (ev.key !== 'Escape') return
+    if (ui.wsRenameOpen) {
+      ev.preventDefault()
+      ev.stopPropagation()
+      closeWsRename()
+      try { M.redraw() } catch {}
+      return
+    }
+    if (!(ui.selectedDesktop || ui.selectedContainer)) return
     if (ev.target && ev.target.closest && ev.target.closest('textarea, input, .sheet-chat, .mjs-chat')) {
-      if (ui.captured) window.__desktopUngrab?.()
       return
     }
     ev.preventDefault()
     ev.stopPropagation()
-    if (ui.captured) window.__desktopUngrab?.()
-    else if (ui.fullView) window.__desktopLeave?.()
+    if (ui.fullView) window.__desktopLeave?.()
     else if (ui.selectedDesktop) {
       ui.selectedDesktop = null
       try { M.redraw() } catch {}
@@ -1240,22 +1105,10 @@ if (!window.__DESKTOP_ONCE__) {
     }
   }, true)
   window.addEventListener('contextmenu', (ev) => {
-    if (ev.target?.closest?.('.rfb-fly, .screen, .ws-thumb, .desktop-nest')) {
+    if (ev.target?.closest?.('.ws-thumb, .desktop-nest')) {
       ev.preventDefault()
     }
   }, true)
-  window.addEventListener('pointerdown', onOutsideDesktop, true)
-  window.addEventListener('mousedown', onOutsideDesktop, true)
-  window.addEventListener('resize', () => window.__desktopPlaceFlies?.())
-  window.addEventListener('scroll', () => window.__desktopPlaceFlies?.(), true)
-}
-
-if (!window.__DESKTOP_CLIP_ONCE__) {
-  window.__DESKTOP_CLIP_ONCE__ = true
-  window.addEventListener('keydown', (ev) => window.__desktopOnPasteKey?.(ev), true)
-  window.addEventListener('paste', (ev) => window.__desktopOnPaste?.(ev), true)
-  try { navigator.clipboard?.addEventListener?.('clipboardchange', () => window.__desktopOnClipChange?.()) } catch {}
-  document.addEventListener('clipboardchange', () => window.__desktopOnClipChange?.())
 }
 
 await boot()

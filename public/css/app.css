@@ -290,6 +290,63 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.ws-alias {
+  color: var(--dim);
+  font-weight: 500;
+  min-width: 0;
+  max-width: 42ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.head-icon {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dimmer);
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  flex: 0 0 auto;
+}
+.head-icon:hover {
+  color: var(--accent-2);
+  border-color: var(--accent);
+}
+.head-icon.is-ok {
+  color: var(--live);
+  border-color: rgba(62, 224, 160, .45);
+}
+.head-icon i { font-size: 13px; }
+.crumb-sep {
+  color: var(--dimmer);
+  flex: 0 0 auto;
+  user-select: none;
+}
+.ws-rename {
+  display: flex;
+  align-items: center;
+  min-width: 140px;
+  max-width: 280px;
+  flex: 1 1 180px;
+}
+.ws-rename-input {
+  width: 100%;
+  height: 22px;
+  border: 1px solid var(--line-2);
+  background: var(--bg);
+  color: var(--ink);
+  border-radius: 5px;
+  padding: 0 8px;
+  font: 500 12px/1 var(--sans);
+  outline: none;
+}
+.ws-rename-input:focus { border-color: var(--accent); }
 .tile-head .meta {
   margin-left: auto;
   display: flex;
@@ -356,18 +413,16 @@ body {
   background: #07090d;
 }
 .wall.solo .screen { min-height: 0; height: 100%; }
-.screen-inner {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  /* Wall + uncaptured fuller: clicks pass through to the tile / grab handler.
-     noVNC always stopPropagation even in viewOnly, which blocked opening. */
-  pointer-events: none;
-}
-.tile.is-capturing .screen-inner { pointer-events: auto; }
 .tile.is-open .screen { cursor: pointer; }
-.tile.is-capturing .screen { cursor: default; }
-/* noVNC scales via CSS transform — do not force canvas width/height. */
+/* Selkies HTML5 client fills the isolated tile below its header. */
+.selkies-frame {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  display: block;
+  border: 0;
+  background: #07090d;
+}
 .placeholder {
   position: absolute;
   inset: 0;
@@ -401,7 +456,6 @@ body {
   color: var(--accent);
   justify-self: center;
 }
-.screen.is-live > .screen-wait,
 .thumb-screen.is-ready > .screen-wait { display: none; }
 .thumb-screen.is-ready .ws-thumb { opacity: 1; }
 
@@ -527,27 +581,6 @@ body {
   border-radius: 4px;
   color: var(--ink);
 }
-
-.rfb-layer {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 8;
-}
-.rfb-fly {
-  position: fixed;
-  overflow: hidden;
-  background: #07090d;
-  pointer-events: none;
-  transform-origin: 0 0;
-  will-change: transform;
-}
-.rfb-fly,
-.rfb-fly > * {
-  overflow: hidden !important;
-}
-.rfb-fly.is-hidden { visibility: hidden; }
-.rfb-fly.is-capturing { pointer-events: auto; z-index: 12; }
 
 /* Isolate-mode chat rail (widget lives in vendor/m-js-cmp-chat). */
 .stage.has-chat {

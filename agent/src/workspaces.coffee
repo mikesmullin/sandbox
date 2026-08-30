@@ -239,6 +239,20 @@ waitForCount = (want, ms = 1500) ->
     waitMs 50
   listWorkspaces().workspaces
 
+export LABEL_MAX = 80
+
+export normalizeLabel = (v) ->
+  s = String(if v? then v else '').replace(/\s+/g, ' ').trim()
+  if s.length > LABEL_MAX
+    s = s.slice(0, LABEL_MAX).trimEnd()
+  s
+
+roomLabel = (meta) ->
+  s = meta?.label
+  return null unless typeof s is 'string'
+  t = s.trim()
+  if t then t else null
+
 pack = (count, current, slots) ->
   state = loadState()
   {
@@ -250,8 +264,29 @@ pack = (count, current, slots) ->
         name: wsName hex
         current: id is current
         sessionId: meta.sessionId or null
+        label: roomLabel meta
       }
   }
+
+# Persist a user-facing alias for this workspace. Empty/whitespace clears it.
+# Identity stays workspace-<hex>; the label is display-only.
+export writeWorkspaceLabel = (id, label) ->
+  hex = hexOf id
+  unless hex
+    throw Object.assign new Error("workspace #{id} not found"), { status: 404 }
+  state = loadState()
+  unless (state.slots or []).includes hex
+    throw Object.assign new Error("workspace #{id} not found"), { status: 404 }
+  text = normalizeLabel label
+  if text
+    setRoomMeta hex, { label: text }
+  else
+    setRoomMeta hex, { label: undefined }
+  { id: wsName(hex), label: if text then text else null }
+
+export setWorkspaceLabel = (id, label) ->
+  writeWorkspaceLabel id, label
+  listWorkspaces()
 
 export resolveIndex = (id, workspaces, slots) ->
   s = String(id ? '')
@@ -438,8 +473,8 @@ export ensureBrowserWindow = (id) ->
   tid
 
 # Multi-workspace capture scan. XFCE only composites the current slot, so we
-# rotate current (REC) and snap thumbs. A single workspace stays put so the
-# wall can stream live noVNC. Isolate/focus pins until resumeScan().
+# rotate current (REC) and snap thumbs for the wall. Isolate/focus pins the
+# slot (so the Selkies stream shows it) until resumeScan().
 SCAN_MS = Number(process.env.WS_SCAN_MS or 5000)
 SCAN_MIN_MS = 500
 scanning = true

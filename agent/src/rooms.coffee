@@ -55,6 +55,16 @@ browser__.*
 
 # real host git/shell (not just-bash overlay)
 term_local__exec:.*
+
+# session checklist (mcp-todo) — no approval
+todo_read
+todo_write
+todo_read:.*
+todo_write:.*
+todo__todo_read
+todo__todo_write
+todo__todo_read:.*
+todo__todo_write:.*
 """.trim()
 
 export knownModels = [DEFAULT_MODEL]
@@ -82,6 +92,9 @@ Do not use term_local__bash — that overlay cannot write the jail (EROFS).
 Example: command=git args=["-C","#{jail}","status"].
 Use browser MCP tools to drive your window: navigate, snapshot, click,
 fill, screenshot. Prefer the already-running window; do not launch a second Chrome.
+
+When the work has several distinct steps, keep a session checklist with
+todo_write / todo_read (no approval). Mark exactly one item in_progress.
 
 GitLab is in this cluster at #{GITLAB_URL} (k8s DNS). git clone / push / pull
 already authenticate via the credential helper — do not type a password in
@@ -126,6 +139,8 @@ sh = (args, extraEnv = {}) ->
 
 export broadcastRoom = (room, obj) ->
   return unless room?
+  unless obj.sessionId?
+    obj = Object.assign {}, obj, { sessionId: room.session?.id or null }
   json = JSON.stringify obj
   room.clients.forEach (ws) ->
     try
@@ -133,6 +148,8 @@ export broadcastRoom = (room, obj) ->
 
 export broadcastRoomExcept = (room, obj, exceptWs) ->
   return unless room?
+  unless obj.sessionId?
+    obj = Object.assign {}, obj, { sessionId: room.session?.id or null }
   json = JSON.stringify obj
   room.clients.forEach (ws) ->
     return if exceptWs? and ws is exceptWs
@@ -316,6 +333,7 @@ export helloPayload = (room) ->
     workspace: room?.name or null
     allowlist: room?.allowlistText or allowlistText
     contextWindow: cwOf room
+    todos: room?.todos or []
   }
 
 export statePayload = (room) ->
@@ -328,6 +346,7 @@ export statePayload = (room) ->
     workspace: room?.name or null
     allowlist: room?.allowlistText or allowlistText
     contextWindow: cwOf room
+    todos: room?.todos or []
     tokensUsed: tokensOf room
     waiting: waiting
     phase: if waiting then 'running' else 'ready'
@@ -343,6 +362,7 @@ seedUi = (room) ->
   room.error ?= ''
   room.liveAssistant ?= ''
   room.liveReasoning ?= ''
+  room.todos ?= []
   room
 
 markRunning = (room) ->
@@ -404,6 +424,15 @@ makeOnEvent = (room) ->
   (ev) ->
     type = ev?.type
     return unless type
+    if type is 'context_event'
+      broadcastRoom room,
+        type: 'context_event'
+        event_id: ev.event_id
+        role: ev.role
+        content: ev.content
+        visible: ev.visible isnt false
+        telemetry: cloneTelemetry(ev.telemetry)
+      return
     if type is 'assistant_delta'
       chunk = ev.text or ''
       room.liveAssistant = (room.liveAssistant or '') + chunk if chunk
@@ -451,6 +480,7 @@ makeOnEvent = (room) ->
     if type is 'tool_call'
       room.liveAssistant = ''
       room.liveReasoning = ''
+      applyTodoWrite room, ev.args if isTodoWrite(ev.name or ev.tool)
       broadcastRoom room,
         type: 'card'
         card:
@@ -541,10 +571,102 @@ termLocalMcp = (jail) ->
       MCP_TERM_ALLOW: process.env.MCP_TERM_ALLOW or '.*'
   }
 
+todoMcp = (jail) ->
+  bun = process.execPath
+  {
+    name: 'todo'
+    command: bun
+    args: ["#{MCP_ROOT}/todo/server.mjs"]
+    env: {}
+    prefix: false
+  }
+
+isTodoWrite = (name) ->
+  n = String(name or '').toLowerCase()
+  n is 'todo_write' or n is 'write_todos' or /(?:^|__)(todo_write|write_todos)$/.test n
+
+todoStatus = (raw) ->
+  s = String(raw or 'pending').toLowerCase().replace /[\s-]+/g, '_'
+  return 'pending' if s in ['todo']
+  return 'in_progress' if s in ['inprogress']
+  return 'completed' if s in ['done', 'complete']
+  if s in ['pending', 'in_progress', 'completed'] then s else 'pending'
+
+normalizeTodo = (raw, i) ->
+  return null unless raw and typeof raw is 'object' and not Array.isArray raw
+  content = String(raw.content or raw.description or raw.step or raw.subject or raw.title or '').trim()
+  id = String(raw.id or raw.taskId or raw.task_id or '').trim()
+  id = "item-#{i + 1}" unless id
+  return null unless content or String(raw.id or '').trim()
+  out =
+    id: id
+    content: content or id
+    status: todoStatus raw.status
+  form = String(raw.activeForm or raw.active_form or '').trim()
+  out.activeForm = form if form
+  out
+
+todoListFromArgs = (args) ->
+  return null unless args and typeof args is 'object'
+  if Array.isArray args.todos then args.todos
+  else if Array.isArray args.plan then args.plan
+  else if Array.isArray args.task_list then args.task_list
+  else null
+
+todoContentKey = (s) -> String(s or '').toLowerCase().replace(/\s+/g, ' ').trim()
+
+findTodoMatch = (items, incoming) ->
+  if incoming.id
+    for t in items
+      return t if t.id is incoming.id
+  c = todoContentKey incoming.content
+  return null unless c
+  for t in items
+    return t if todoContentKey(t.content) is c
+  return null if c.length < 32
+  needle = c.slice 0, 48
+  for t in items
+    e = todoContentKey t.content
+    if e.indexOf(needle) is 0
+      return t
+    if c.indexOf(e.slice(0, 48)) is 0
+      return t
+  null
+
+applyTodoWrite = (room, args, opts = {}) ->
+  list = todoListFromArgs args
+  return unless Array.isArray list
+  items = (normalizeTodo t, i for t, i in list).filter Boolean
+  room.todos ?= []
+  if args?.merge and room.todos.length
+    cur = room.todos
+    for t in items
+      prev = findTodoMatch cur, t
+      if prev
+        prev.content = t.content if t.content
+        prev.status = t.status if t.status
+        prev.activeForm = t.activeForm if t.activeForm?
+        prev.id = t.id if t.id
+      else
+        cur.push t
+    room.todos = cur
+  else
+    room.todos = items
+  unless opts.silent
+    broadcastRoom room, { type: 'todos', todos: room.todos }
+  room.todos
+
+hydrateTodosFromLog = (room) ->
+  room.todos = []
+  for m in messagesFromLog room
+    continue unless m.kind is 'tool_call' and isTodoWrite m.name
+    applyTodoWrite room, m.args or {}, silent: true
+  room.todos
+
 createHarness = (room) ->
   jail = room.jail
   presets = buildMcpPresets MCP_ROOT, { projectRoot: jail }
-  mcp = resolveMcpList ['file-io', termLocalMcp(jail), browserMcp room.name], presets
+  mcp = resolveMcpList ['file-io', termLocalMcp(jail), todoMcp(jail), browserMcp room.name], presets
   createOpts = room.createOpts
   createOpts.mcp = mcp
   createOpts.onEvent = makeOnEvent room
@@ -638,7 +760,8 @@ doEnsure = (name) ->
     unless resumed
       session = await room.harness.session.create { title: name }
     bindSession room, session
-    console.log "[agent] room=#{name} session=#{room.session.id}#{if resumed then ' (resumed)' else ''}"
+    hydrateTodosFromLog room
+    console.log "[agent] room=#{name} session=#{room.session.id}#{if resumed then ' (resumed)' else ''} todos=#{(room.todos or []).length}"
 
   room
 
@@ -714,6 +837,7 @@ export handleChat = (room, ws, data) ->
     result = await room.session.run prompt: content
     if result?.command is 'new' and result.session?
       bindSession room, result.session
+      room.todos = []
       markIdle room
       broadcastRoom room,
         type: 'session'
@@ -729,13 +853,15 @@ export handleChat = (room, ws, data) ->
     unless err?.aborted
       markIdle room, err.message or String(err)
       broadcastRoom room, { type: 'error', error: err.message or String(err) }
+      broadcastRoom room, statePayload room
       broadcastRoom room, { type: 'done' }
       return
   markIdle room
+  broadcastRoom room, statePayload room
   broadcastRoom room, { type: 'done' }
 
 export handleAbort = (room) ->
-  return unless room?.session?
+  return unless room?.session?.running
   try
     await room.session.abort 'user stop'
   markIdle room

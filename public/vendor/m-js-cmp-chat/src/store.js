@@ -27,6 +27,139 @@ const looksLikeProviderDump = (text) => {
   return t.startsWith('{') && /"choices"\s*:/.test(t) && /"usage"\s*:/.test(t)
 }
 
+const DEFAULT_MODEL = 'llama-server:default'
+const DEFAULT_MODEL_KEY = 'mjs-chat.model'
+
+const readSavedModel = (key) => {
+  if (!key) return ''
+  try {
+    const v = String(localStorage.getItem(key) || '').trim()
+    return v
+  } catch {
+    return ''
+  }
+}
+
+const writeSavedModel = (key, model) => {
+  if (!key) return
+  const v = String(model || '').trim()
+  if (!v) return
+  try {
+    localStorage.setItem(key, v)
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+const isUserPrompt = (m) =>
+  m && m.kind === 'user' && !/^\/new$/i.test(String(m.text || '').trim())
+
+const TRANSCRIPT_TYPES = new Set([
+  'user',
+  'assistant_delta',
+  'reasoning_delta',
+  'tool_delta',
+  'card',
+  'context_event',
+  'approval_needed',
+  'state',
+  'done',
+  'aborted',
+  'status',
+  'usage',
+  'gen_info',
+])
+
+const isStaleSession = (store, msg) => {
+  const sid = msg?.sessionId
+  if (!sid || !store.sessionId) return false
+  return String(sid) !== String(store.sessionId)
+}
+
+const TODO_WRITE = /(^|__)(todo_write|write_todos)$/i
+const TODO_STATUSES = new Set(['pending', 'in_progress', 'completed'])
+
+const todoStatus = (raw) => {
+  let s = String(raw || 'pending').toLowerCase().replace(/[\s-]+/g, '_')
+  if (s === 'todo') s = 'pending'
+  if (s === 'inprogress') s = 'in_progress'
+  if (s === 'done' || s === 'complete') s = 'completed'
+  return TODO_STATUSES.has(s) ? s : 'pending'
+}
+
+const normalizeTodo = (raw, i) => {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const content = String(raw.content || raw.description || raw.step || raw.subject || raw.title || '').trim()
+  let id = String(raw.id || raw.taskId || raw.task_id || '').trim()
+  if (!id) id = `item-${i + 1}`
+  if (!content && !String(raw.id || '').trim()) return null
+  const out = { id, content: content || id, status: todoStatus(raw.status) }
+  const form = String(raw.activeForm || raw.active_form || '').trim()
+  if (form) out.activeForm = form
+  return out
+}
+
+const todoListFromArgs = (args) => {
+  if (!args || typeof args !== 'object') return null
+  if (Array.isArray(args.todos)) return args.todos
+  if (Array.isArray(args.plan)) return args.plan
+  if (Array.isArray(args.task_list)) return args.task_list
+  return null
+}
+
+const todoContentKey = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim()
+
+const findTodoMatch = (items, incoming) => {
+  if (incoming.id) {
+    const byId = items.find((t) => t.id === incoming.id)
+    if (byId) return byId
+  }
+  const c = todoContentKey(incoming.content)
+  if (!c) return null
+  const exact = items.find((t) => todoContentKey(t.content) === c)
+  if (exact) return exact
+  if (c.length < 32) return null
+  const needle = c.slice(0, 48)
+  return items.find((t) => {
+    const e = todoContentKey(t.content)
+    return e.startsWith(needle) || c.startsWith(e.slice(0, 48))
+  }) || null
+}
+
+const applyTodoWrite = (store, args) => {
+  const list = todoListFromArgs(args)
+  if (!Array.isArray(list)) return
+  const items = list.map((t, i) => normalizeTodo(t, i)).filter(Boolean)
+  const cur = Array.isArray(store.todos) ? store.todos.map((t) => ({ ...t })) : []
+  if (args?.merge && cur.length) {
+    for (const t of items) {
+      const prev = findTodoMatch(cur, t)
+      if (prev) {
+        const oldId = prev.id
+        if (t.content) prev.content = t.content
+        if (t.status) prev.status = t.status
+        if (t.activeForm != null) prev.activeForm = t.activeForm
+        if (t.id && t.id !== oldId) prev.id = t.id
+      } else {
+        cur.push(t)
+      }
+    }
+    store.todos = cur
+  } else {
+    store.todos = items
+  }
+}
+
+const hydrateTodosFromMessages = (store, messages) => {
+  const tmp = { todos: [] }
+  for (const m of messages || []) {
+    if (m && m.kind === 'tool_call' && TODO_WRITE.test(String(m.name || ''))) {
+      applyTodoWrite(tmp, m.args || {})
+    }
+  }
+  store.todos = tmp.todos || []
+}
+
 /** tool_call ↔ tool_result FIFO pair (providers need both sides). */
 const visibilityGroup = (messages, msg) => {
   if (!msg) return []
@@ -158,7 +291,14 @@ const cloneTelemetry = (t) => {
  */
 export function applyIncoming(store, msg) {
   if (msg.type === 'session' && msg.command === 'new') {
+    store._awaitingNewSession = false
     store.applyNewSession?.(msg.sessionId)
+    return
+  }
+  if (store._awaitingNewSession && (TRANSCRIPT_TYPES.has(msg.type) || msg.type === 'hello')) {
+    return
+  }
+  if (isStaleSession(store, msg) && (TRANSCRIPT_TYPES.has(msg.type) || msg.type === 'hello')) {
     return
   }
   if (msg.type === 'state') {
@@ -176,21 +316,39 @@ export function applyIncoming(store, msg) {
       }
     }
     if (msg.contextWindow) store.contextWindow = Number(msg.contextWindow) || store.contextWindow
+    if (Array.isArray(msg.messages) && msg.messages.some((m) => m && m.kind === 'tool_call' && TODO_WRITE.test(String(m.name || '')))) {
+      hydrateTodosFromMessages(store, msg.messages)
+    } else if (Array.isArray(msg.todos)) {
+      store.todos = msg.todos
+    }
     if (msg.tokensUsed != null && msg.tokensUsed !== '') {
       const n = Number(msg.tokensUsed)
       if (Number.isFinite(n) && n >= 0) store.tokensUsed = n
     }
     store.error = msg.error || ''
+    let keepLocal = false
     if (Array.isArray(msg.messages)) {
-      store.messages = msg.messages.map((m) => (m && typeof m === 'object' ? { ...m } : m))
+      const incoming = msg.messages.map((m) => (m && typeof m === 'object' ? { ...m } : m))
+      // Empty post-/new snapshot: keep only a prompt typed after /new, not the
+      // previous session's transcript.
+      const keepAfterNew = Boolean(store._keepAfterNew)
+      const localUser = (store.messages || []).some(isUserPrompt)
+      if (incoming.length === 0 && keepAfterNew && localUser) {
+        keepLocal = true
+      } else {
+        store.messages = incoming
+        store._keepAfterNew = false
+      }
     }
     const running = Boolean(msg.waiting || msg.phase === 'running')
-    store.waiting = running
-    if (running && msg.runStartedAt) {
-      store.startStopwatch?.(msg.runStartedAt)
-    } else if (!running) {
-      store.stopStopwatch?.({ freeze: false })
-      store._runStartedAt = 0
+    if (!keepLocal) {
+      store.waiting = running
+      if (running && msg.runStartedAt) {
+        store.startStopwatch?.(msg.runStartedAt)
+      } else if (!running) {
+        store.stopStopwatch?.({ freeze: false })
+        store._runStartedAt = 0
+      }
     }
     store.scrollBottom?.(true)
     return
@@ -205,6 +363,7 @@ export function applyIncoming(store, msg) {
       store.allowlistInited = true
     }
     if (msg.contextWindow) store.contextWindow = Number(msg.contextWindow) || store.contextWindow
+    if (Array.isArray(msg.todos)) store.todos = msg.todos
     return
   }
   if (msg.type === 'models' && Array.isArray(msg.models) && msg.models.length) {
@@ -230,6 +389,53 @@ export function applyIncoming(store, msg) {
       telemetry: null,
     })
     store.scrollBottom?.()
+    return
+  }
+  if (msg.type === 'context_event') {
+    if (msg.role === 'user') {
+      const text = String(msg.content || '')
+      let row = null
+      for (let i = store.messages.length - 1; i >= 0; i--) {
+        if (store.messages[i].kind === 'user' && !store.messages[i].eventId) {
+          row = store.messages[i]
+          break
+        }
+      }
+      if (row) {
+        if (msg.event_id) row.eventId = msg.event_id
+        row.visible = msg.visible !== false
+      } else if (text) {
+        const last = store.messages[store.messages.length - 1]
+        if (!(last && last.kind === 'user' && last.text === text)) {
+          store.messages.push({
+            id: msg.event_id || crypto.randomUUID(),
+            kind: 'user',
+            text,
+            visible: msg.visible !== false,
+            eventId: msg.event_id || null,
+            telemetry: null,
+          })
+          store.scrollBottom?.()
+        }
+      }
+      return
+    }
+    if (msg.role === 'assistant') {
+      for (let i = store.messages.length - 1; i >= 0; i--) {
+        if (store.messages[i].kind === 'assistant') {
+          if (!store.messages[i].eventId && msg.event_id) {
+            store.messages[i].eventId = msg.event_id
+          }
+          store.messages[i].visible = msg.visible !== false
+          break
+        }
+      }
+      return
+    }
+    return
+  }
+  if (msg.type === 'todos') {
+    if (Array.isArray(msg.todos)) store.todos = msg.todos
     return
   }
   if (msg.type === 'allowlist') {
@@ -371,6 +577,9 @@ export function applyIncoming(store, msg) {
   }
   if (msg.type === 'card' && msg.card) {
     const c = msg.card
+    if (c.kind === 'tool_call' && TODO_WRITE.test(String(c.name || ''))) {
+      applyTodoWrite(store, c.args || {})
+    }
     if (c.kind === 'tool_call' || c.kind === 'tool_result') {
       for (const m of store.messages) {
         if ((m.kind === 'assistant' || m.kind === 'reasoning') && m.streaming) m.streaming = false
@@ -539,6 +748,8 @@ export function applyIncoming(store, msg) {
  * @param {object} [opts.transport]
  * @param {string} [opts.idPrefix='desktop']
  * @param {string} [opts.model]
+ * @param {boolean} [opts.persistModel=true]
+ * @param {string} [opts.modelKey='mjs-chat.model']
  * @param {boolean} [opts.reconnect=true]
  */
 export function createChatStore(M, opts = {}) {
@@ -546,6 +757,10 @@ export function createChatStore(M, opts = {}) {
   const idPrefix = opts.idPrefix || 'desktop'
   const transport = opts.transport || wsTransport(opts)
   const onDraftFocus = opts.onDraftFocus
+  const persistModel = opts.persistModel !== false
+  const modelKey = persistModel ? (opts.modelKey || DEFAULT_MODEL_KEY) : ''
+  const fallbackModel = opts.model || DEFAULT_MODEL
+  const initialModel = readSavedModel(modelKey) || fallbackModel
 
   return M.store(name, {
     desktop: null,
@@ -555,14 +770,16 @@ export function createChatStore(M, opts = {}) {
     draft: '',
     messages: [],
     error: '',
-    model: opts.model || 'llama-server:default',
-    models: opts.models || [opts.model || 'llama-server:default'],
+    model: initialModel,
+    models: opts.models || [initialModel],
     sessionId: null,
     allowlist: '',
     allowlistBaseline: '',
     allowlistOverridden: false,
     allowlistOpen: false,
     allowlistInited: false,
+    todos: [],
+    todosOpen: false,
     contextWindow: 32768,
     tokensUsed: 0,
     elapsed: '',
@@ -575,6 +792,8 @@ export function createChatStore(M, opts = {}) {
     _elapsedGen: 0,
     _runStartedAt: 0,
     _allowTimer: 0,
+    _keepAfterNew: false,
+    _awaitingNewSession: false,
     _reconnect: opts.reconnect !== false,
     idPrefix,
 
@@ -582,7 +801,12 @@ export function createChatStore(M, opts = {}) {
     set draftInput(v) { this.draft = v },
     get allowlistText() { return this.allowlist },
     set allowlistText(v) { this.allowlist = v },
-    get activeMessages() { return this.messages },
+    get activeMessages() {
+      return (this.messages || []).filter((m) => {
+        if (m.kind !== 'tool_call' && m.kind !== 'tool_result') return true
+        return !TODO_WRITE.test(String(m.name || '')) && !/(^|__)todo_read$/.test(String(m.name || ''))
+      })
+    },
     get activeWaiting() { return this.waiting },
     get showWelcome() { return !this.messages.length },
     get modelOptions() {
@@ -592,14 +816,26 @@ export function createChatStore(M, opts = {}) {
     },
 
     applyNewSession(id) {
+      this._awaitingNewSession = false
       this.sessionId = id || this.sessionId
+      const msgs = this.messages || []
+      let lastNew = -1
+      for (let i = 0; i < msgs.length; i++) {
+        if (msgs[i].kind === 'user' && /^\/new$/i.test(String(msgs[i].text || '').trim())) {
+          lastNew = i
+        }
+      }
+      const keep = lastNew >= 0 ? msgs.slice(lastNew + 1).filter(isUserPrompt) : []
       this.messages = []
-      this.waiting = false
+      this._keepAfterNew = keep.length > 0
+      this.waiting = keep.length > 0
       this.error = ''
       this.tokensUsed = 0
+      this.todos = []
+      this.todosOpen = false
       this._lastGenInfo = null
       this._runStartedAt = 0
-      this.stopStopwatch({ freeze: false })
+      this.stopStopwatch({ freeze: keep.length > 0 })
       this.messages.push({
         id: crypto.randomUUID(),
         kind: 'assistant',
@@ -607,6 +843,7 @@ export function createChatStore(M, opts = {}) {
         visible: true,
         telemetry: null,
       })
+      for (const m of keep) this.messages.push({ ...m })
       this.scrollBottom(true)
     },
 
@@ -622,9 +859,15 @@ export function createChatStore(M, opts = {}) {
       this.allowlistOverridden = false
       this.allowlist = ''
       this.allowlistBaseline = ''
+      this.todos = []
+      this.todosOpen = false
       this.tokensUsed = 0
       this._lastGenInfo = null
+      this._keepAfterNew = false
+      this._awaitingNewSession = false
       this.stopStopwatch({ freeze: false })
+      const preferred = readSavedModel(modelKey)
+      if (preferred) this.model = preferred
     },
 
     attach(key) {
@@ -659,6 +902,12 @@ export function createChatStore(M, opts = {}) {
       })
       this.draft = ''
       const isNew = /^\/new$/i.test(content)
+      if (isNew) {
+        const row = this.messages[this.messages.length - 1]
+        this.messages = row ? [row] : []
+        this._keepAfterNew = false
+        this._awaitingNewSession = true
+      }
       this.waiting = !isNew
       this._stick = true
       this._turnStartedAt = Date.now()
@@ -730,14 +979,33 @@ export function createChatStore(M, opts = {}) {
     },
 
     onModelChange(ev) {
-      const sel = ev?.target?.value
+      const sel = String(ev?.target?.value || '').trim()
       if (!sel || sel === this.model) return
       this.model = sel
+      writeSavedModel(modelKey, sel)
       if (this.connected) transport.setModel(this, sel)
+    },
+
+    applyPreferredModel(msg) {
+      if (!modelKey || !msg || msg.type !== 'state') return
+      const preferred = readSavedModel(modelKey)
+      if (!preferred) return
+      if (this.waiting) return
+      const incoming = Array.isArray(msg.messages) ? msg.messages : []
+      if (incoming.some(isUserPrompt)) return
+      if ((this.messages || []).some(isUserPrompt)) return
+      this.model = preferred
+      if (this.connected && preferred !== (msg.model || '')) {
+        transport.setModel(this, preferred)
+      }
     },
 
     toggleAllowlist() {
       this.allowlistOpen = !this.allowlistOpen
+    },
+
+    toggleTodos() {
+      this.todosOpen = !this.todosOpen
     },
 
     onAllowlistInput(ev) {
@@ -833,6 +1101,7 @@ export function createChatStore(M, opts = {}) {
 
     handle(msg) {
       applyIncoming(this, msg)
+      this.applyPreferredModel?.(msg)
     },
 
     toolCallExplanation,

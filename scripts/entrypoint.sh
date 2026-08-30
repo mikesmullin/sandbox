@@ -1,11 +1,12 @@
 #!/bin/bash
-# Start the virtual XFCE desktop: Xvfb → session → x11vnc → noVNC → headed browser-use + agent-browser.
+# Start the virtual XFCE desktop: Xvfb → session → PulseAudio → Selkies (H.264/WS)
+# → headed browser-use + agent-browser.
 set -u
 
 DISPLAY="${DISPLAY:-:99}"
 GEOMETRY="${GEOMETRY:-1280x800x24}"
-VNC_PORT="${VNC_PORT:-5900}"
-NOVNC_PORT="${NOVNC_PORT:-6080}"
+SELKIES_PORT="${SELKIES_PORT:-6080}"
+SELKIES_BIN="${SELKIES_BIN:-/opt/selkies/bin/selkies}"
 CDP_PORT="${CDP_PORT:-9222}"
 AGENT_PORT="${AGENT_PORT:-8091}"
 HOME="${HOME:-/home/agent}"
@@ -132,18 +133,6 @@ unset GITLAB_ROOT_PASSWORD
 
 chmod 700 "$XDG_RUNTIME_DIR" || true
 
-NOVNC_WEB=""
-for candidate in /usr/share/novnc /usr/share/web/novnc /usr/share/novnc/www; do
-  if [ -f "$candidate/vnc.html" ]; then
-    NOVNC_WEB="$candidate"
-    break
-  fi
-done
-if [ -z "$NOVNC_WEB" ]; then
-  echo "[entrypoint] noVNC web root not found" >&2
-  exit 1
-fi
-
 if [ -e /dev/nvidia0 ]; then
   log gpu "host NVIDIA device /dev/nvidia0"
 else
@@ -215,30 +204,63 @@ log xfce "starting session"
 
 sleep 1
 
-# x11vnc talks only to localhost; noVNC/websockify is the published surface.
-log x11vnc "listening on 127.0.0.1:${VNC_PORT}"
-# XFIXES watches CLIPBOARD so guest copy reaches VNC ServerCutText.
-# -noprimary: selecting text must not clobber the host clipboard.
-x11vnc \
-  -display "$DISPLAY" \
-  -rfbport "$VNC_PORT" \
-  -localhost \
-  -shared \
-  -forever \
-  -nopw \
-  -xkb \
-  -noxdamage \
-  -noprimary \
-  -repeat \
-  -wait 10 \
-  -defer 10 \
-  2>&1 | sed 's/^/[x11vnc] /' &
+# PulseAudio: headless daemon + a null sink so pcmflux has a monitor source to
+# capture. Selkies streams that as Opus. No physical audio device in the pod.
+# -n skips the default config so no hardware/systemd/dbus modules load (which
+# would spam "Failed to connect to system bus"); we load only the unix socket and
+# the null sink. auth-anonymous avoids the cookie warnings.
+export PULSE_RUNTIME_PATH="${PULSE_RUNTIME_PATH:-$XDG_RUNTIME_DIR/pulse}"
+export PULSE_SERVER="${PULSE_SERVER:-unix:${PULSE_RUNTIME_PATH}/native}"
+mkdir -p "$PULSE_RUNTIME_PATH"
+if command -v pulseaudio >/dev/null 2>&1; then
+  log pulseaudio "starting headless daemon"
+  pulseaudio \
+    --daemonize=no --exit-idle-time=-1 --disallow-exit -n \
+    --log-target=stderr \
+    --load="module-native-protocol-unix auth-anonymous=1 socket=${PULSE_RUNTIME_PATH}/native" \
+    --load="module-null-sink sink_name=stream sink_properties=device.description=stream" \
+    --load="module-always-sink" \
+    2>&1 | sed 's/^/[pulseaudio] /' &
+  for i in $(seq 1 40); do
+    if pactl info >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.25
+  done
+  if pactl info >/dev/null 2>&1; then
+    pactl set-default-sink stream >/dev/null 2>&1 || true
+    log pulseaudio "null sink 'stream' ready ($PULSE_SERVER)"
+  else
+    log pulseaudio "did not come up — audio disabled"
+  fi
+else
+  log pulseaudio "binary missing — audio disabled"
+fi
 
-wait_for_port 127.0.0.1 "$VNC_PORT" x11vnc || true
-
-log novnc "http://0.0.0.0:${NOVNC_PORT}/vnc.html  (web root ${NOVNC_WEB})"
-websockify --heartbeat 30 --web "$NOVNC_WEB" 0.0.0.0:"$NOVNC_PORT" 127.0.0.1:"$VNC_PORT" \
-  2>&1 | sed 's/^/[novnc] /' &
+# Selkies attaches to the existing X display and serves the HTML5 client + WS
+# signaling + H.264 video + Opus audio on ONE port. --subfolder makes every route
+# match the dashboard reverse proxy at /desktops/<pod>/. Basic-auth off (the
+# dashboard is the gate); https off (dashboard/127.0.0.1 is already a secure
+# context, so pointer lock works). Fixed geometry: no dynamic resize.
+POD="${HOSTNAME:-$(hostname 2>/dev/null || true)}"
+POD="${POD%%.*}"
+[ -z "$POD" ] && POD=container
+log selkies "listening on 0.0.0.0:${SELKIES_PORT}  subfolder=/desktops/${POD}"
+if [ -x "$SELKIES_BIN" ]; then
+  SELKIES_SUBFOLDER="/desktops/${POD}" "$SELKIES_BIN" \
+    --addr=0.0.0.0 \
+    --port="${SELKIES_PORT}" \
+    --mode=websockets \
+    --enable-basic-auth=false \
+    --enable-https=false \
+    --encoder=h264enc \
+    --enable-resize=false \
+    --web-root="${SELKIES_WEB_ROOT:-/opt/selkies-web}" \
+    2>&1 | sed 's/^/[selkies] /' &
+  wait_for_port 127.0.0.1 "$SELKIES_PORT" selkies || true
+else
+  log selkies "binary missing ($SELKIES_BIN)"
+fi
 
 # Optional control-room snapshot of the headed Chromium profile (cookies/logins).
 # Path must include browser-use-user-data-dir- so browser-use will not copy it
@@ -347,7 +369,7 @@ else
   log agent "skipped (bun or /opt/agent missing)"
 fi
 
-log entrypoint "desktop ready  display=$DISPLAY  novnc=:${NOVNC_PORT}  cdp=:${CDP_PORT}  agent=:${AGENT_PORT}"
+log entrypoint "desktop ready  display=$DISPLAY  selkies=:${SELKIES_PORT}  cdp=:${CDP_PORT}  agent=:${AGENT_PORT}"
 
 # Keep PID 1 alive as long as Xvfb is up.
 while xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; do

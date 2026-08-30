@@ -8,7 +8,8 @@ import { snapshotPresent, patchPodForSnapshot, injectSnapshot } from './snapshot
 NAMESPACE = process.env.NAMESPACE or 'agent-desktop'
 APP = process.env.DESKTOP_APP or 'container'
 STATEFULSET = process.env.DESKTOP_STATEFULSET or 'container'
-NOVNC_PORT = Number process.env.NOVNC_PORT or 6080
+# Selkies serves the HTML5 client + H.264/Opus stream on one port.
+STREAM_PORT = Number(process.env.SELKIES_PORT or process.env.NOVNC_PORT or 6080)
 AGENT_PORT = Number process.env.AGENT_PORT or 8091
 IN_CLUSTER = Boolean process.env.KUBERNETES_SERVICE_HOST
 MAX_CONTAINERS = 8
@@ -69,7 +70,7 @@ export listDesktops = ->
       node: pod.spec?.nodeName or null
       startedAt: pod.status?.startTime or null
       restarts: (pod.status?.containerStatuses or []).reduce ((n, c) -> n + (c.restartCount or 0)), 0
-      url: "/desktops/#{name}/websockify"
+      url: "/desktops/#{name}/"
       agentUrl: "/desktops/#{name}/agent"
     }
 
@@ -153,26 +154,26 @@ export setScale = (replicas) ->
   getScale()
 
 parseForwardPorts = (text) ->
-  novnc = null
+  stream = null
   agent = null
   re = /Forwarding from (?:127\.0\.0\.1|\[::1\]):(\d+)\s+->\s+(\d+)/g
   s = String text
   while (m = re.exec s)
     local = Number m[1]
     remote = Number m[2]
-    if remote is NOVNC_PORT
-      novnc ?= local
+    if remote is STREAM_PORT
+      stream ?= local
     else if remote is AGENT_PORT
       agent ?= local
-  { novnc, agent }
+  { stream, agent }
 
 startForward = (name) ->
-  # Both noVNC and the Angela WS. kubectl prints "Forwarding from" on stderr.
+  # Both the Selkies stream and the Angela WS. kubectl prints "Forwarding from" on stderr.
   proc = Bun.spawn [
     'kubectl', 'port-forward'
     '-n', NAMESPACE
     "pod/#{name}"
-    ":#{NOVNC_PORT}"
+    ":#{STREAM_PORT}"
     ":#{AGENT_PORT}"
   ],
     stdout: 'pipe'
@@ -193,17 +194,17 @@ startForward = (name) ->
   eat(proc.stderr).catch ->
 
   deadline = Date.now() + 8000
-  ports = { novnc: null, agent: null }
+  ports = { stream: null, agent: null }
   while Date.now() < deadline
     ports = parseForwardPorts buf
-    break if ports.novnc? and ports.agent?
+    break if ports.stream? and ports.agent?
     await Bun.sleep 50
 
-  unless ports.novnc? and ports.agent?
+  unless ports.stream? and ports.agent?
     try proc.kill()
     throw new Error "port-forward for #{name} did not start:\n#{buf}"
 
-  { proc, port: ports.novnc, agentPort: ports.agent }
+  { proc, port: ports.stream, agentPort: ports.agent }
 
 export resolveTarget = (name) ->
   desk = await getDesktop name
@@ -213,7 +214,7 @@ export resolveTarget = (name) ->
     throw Object.assign new Error("desktop #{name} is not ready"), { status: 409 }
 
   if IN_CLUSTER
-    return { host: desk.ip, port: NOVNC_PORT, agentPort: AGENT_PORT, desktop: desk }
+    return { host: desk.ip, port: STREAM_PORT, agentPort: AGENT_PORT, desktop: desk }
 
   existing = forwards.get name
   if existing?.proc

@@ -305,6 +305,37 @@ export function registerChat(M, opts = {}) {
     onAgentChange(ev) { return this.act('onAgentChange', ev) },
     onModelChange(ev) { return this.act('onModelChange', ev) },
     toggleAllowlist() { return this.act('toggleAllowlist') },
+    toggleTodos() {
+      if (this.s?.toggleTodos) return this.act('toggleTodos')
+      if (this.s) this.s.todosOpen = !this.s.todosOpen
+    },
+    get todoItems() {
+      const list = this.s?.todos
+      return Array.isArray(list) ? list : []
+    },
+    get todosOpen() {
+      return Boolean(this.s?.todosOpen)
+    },
+    get todoCurrent() {
+      return this.todoItems.find((t) => t && t.status === 'in_progress') || null
+    },
+    get todoCurrentLabel() {
+      const t = this.todoCurrent
+      if (!t) return this.todoItems.length ? 'All done' : ''
+      return t.activeForm || t.content || ''
+    },
+    get todoProgress() {
+      const list = this.todoItems
+      if (!list.length) return ''
+      const done = list.filter((t) => t.status === 'completed').length
+      return `${done}/${list.length}`
+    },
+    todoIcon(t) {
+      const s = t?.status
+      if (s === 'completed') return 'ph-check-circle'
+      if (s === 'in_progress') return 'ph-circle-notch'
+      return 'ph-circle'
+    },
     onAllowlistInput(ev) { return this.act('onAllowlistInput', ev) },
     onAllowlistBlur() { return this.act('onAllowlistBlur') },
     decideApproval(msg, decision) { return this.act('decideApproval', msg, decision) },

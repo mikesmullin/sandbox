@@ -212,6 +212,13 @@ app.delete '/api/desktops/:name/workspaces/:id', (req, res) ->
     code = err.status or 502
     res.status(code).json { error: 'agent not reachable' }
 
+app.patch '/api/desktops/:name/workspaces/:id', (req, res) ->
+  try
+    await proxyAgent req, res, "/workspaces/#{encodeURIComponent req.params.id}", { method: 'PATCH' }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
 app.post '/api/desktops/:name/workspaces/:id/focus', (req, res) ->
   try
     await proxyAgent req, res, "/workspaces/#{encodeURIComponent req.params.id}/focus", { method: 'POST' }
@@ -262,13 +269,14 @@ app.post '/api/desktops/:name/workspaces/:id/jobs/:task_id/abort', (req, res) ->
 
 app.use express.static PUBLIC_DIR, { fallthrough: true, index: false }
 
-# HTTP noVNC assets (debug / iframe fallback). Express strips the mount prefix
-# so req.url is already the remainder (e.g. /vnc.html).
+# Selkies HTML5 client + assets. Selkies runs with SELKIES_SUBFOLDER=/desktops/<pod>
+# so every route it emits is prefixed. Express strips the mount prefix from req.url,
+# so forward req.originalUrl (which keeps /desktops/<name>/...) to match the subfolder.
 app.use '/desktops/:name', (req, res) ->
   name = req.params.name
   resolveTarget name
     .then ({ host, port }) ->
-      req.url = '/' if not req.url or req.url is ''
+      req.url = req.originalUrl
       proxy.web req, res, { target: "http://#{host}:#{port}" }
     .catch (err) ->
       code = err.status or 502
@@ -294,7 +302,7 @@ app.use (req, res, next) ->
 
 # Bun's node:http polyfill does not complete WebSocket upgrades through
 # http-proxy. Express handles REST + static on loopback; Bun.serve is the
-# public socket and message-pipes RFB to each pod's websockify.
+# public socket and message-pipes each pod's Selkies + agent WebSockets.
 hmrClients = new Set()
 
 broadcastHmr = (relPath) ->
@@ -362,16 +370,34 @@ expressServer = app.listen 0, '127.0.0.1', ->
         if server.upgrade req, { data: { name, target, kind: 'agent', workspace, queue: [], upstream: null } }
           return undefined
         return new Response 'upgrade failed', { status: 500 }
-      wsMatch = url.pathname.match /^\/desktops\/([^/]+)\/(websockify|agent)\/?$/
+      wsMatch = url.pathname.match /^\/desktops\/([^/]+)\/agent\/?$/
       if wsMatch and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
         name = decodeURIComponent wsMatch[1]
-        kind = wsMatch[2]
         try
           target = await resolveTarget name
         catch err
           console.error "[ws] #{name}", err.message
           return new Response err.message, { status: err.status or 502 }
-        if server.upgrade req, { data: { name, target, kind, workspace: null, queue: [], upstream: null } }
+        if server.upgrade req, { data: { name, target, kind: 'agent', workspace: null, queue: [], upstream: null } }
+          return undefined
+        return new Response 'upgrade failed', { status: 500 }
+      # Selkies opens WebSocket(s) under its subfolder (signaling + media). We do
+      # not know the exact suffix, so catch every upgrade under /desktops/<name>/
+      # the explicit matchers above did not claim and pipe the WHOLE path to the pod.
+      selkiesMatch = url.pathname.match /^\/desktops\/([^/]+)\/(.+)$/
+      if selkiesMatch and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
+        name = decodeURIComponent selkiesMatch[1]
+        try
+          target = await resolveTarget name
+        catch err
+          console.error "[ws] selkies #{name}", err.message
+          return new Response err.message, { status: err.status or 502 }
+        proto = req.headers.get 'sec-websocket-protocol'
+        data = { name, target, kind: 'selkies', path: url.pathname + url.search, proto, workspace: null, queue: [], upstream: null }
+        upOpts = { data }
+        # Echo the negotiated subprotocol so the browser accepts the handshake.
+        upOpts.headers = { 'Sec-WebSocket-Protocol': proto.split(',')[0].trim() } if proto
+        if server.upgrade req, upOpts
           return undefined
         return new Response 'upgrade failed', { status: 500 }
       headers = new Headers
@@ -397,15 +423,20 @@ expressServer = app.listen 0, '127.0.0.1', ->
           attachLogClient ws.data.name, ws
           return
         { name, target, kind, workspace } = ws.data
-        upstreamUrl = if kind is 'agent'
+        upstreamUrl = if kind is 'selkies'
+          "ws://#{target.host}:#{target.port}#{ws.data.path}"
+        else if kind is 'agent'
           if workspace
             "ws://#{target.host}:#{target.agentPort or 8091}/workspaces/#{encodeURIComponent workspace}/ws"
           else
             "ws://#{target.host}:#{target.agentPort or 8091}/ws"
         else
-          "ws://#{target.host}:#{target.port}/websockify"
-        console.log "[ws] #{kind or 'novnc'} #{name}#{if workspace then ':' + workspace else ''} -> #{upstreamUrl}"
-        upstream = new WebSocket upstreamUrl
+          "ws://#{target.host}:#{target.port}/"
+        console.log "[ws] #{kind} #{name}#{if workspace then ':' + workspace else ''} -> #{upstreamUrl}"
+        upstream = if ws.data.proto
+          new WebSocket upstreamUrl, ws.data.proto.split(',').map (p) -> p.trim()
+        else
+          new WebSocket upstreamUrl
         ws.data.upstream = upstream
         unless kind is 'agent'
           upstream.binaryType = 'arraybuffer'

@@ -10,9 +10,9 @@ spec:
   selector:
     app: container
   ports:
-    - name: novnc
+    - name: stream
       port: 6080
-      targetPort: novnc
+      targetPort: stream
     - name: agent
       port: 8091
       targetPort: agent
@@ -49,10 +49,8 @@ spec:
           image: agent-desktop:latest
           imagePullPolicy: Never
           ports:
-            - name: novnc
+            - name: stream
               containerPort: 6080
-            - name: vnc
-              containerPort: 5900
             - name: cdp
               containerPort: 9222
             - name: agent
@@ -62,6 +60,8 @@ spec:
               value: "1280x800x24"
             - name: DISPLAY
               value: ":99"
+            - name: SELKIES_PORT
+              value: "6080"
             - name: AGENT_PORT
               value: "8091"
             - name: AGENT_MODEL
@@ -105,18 +105,18 @@ spec:
             limits:
               cpu: "2"
               memory: 3Gi
+          # Selkies serves under SELKIES_SUBFOLDER=/desktops/<pod>, so there is no
+          # fixed root health path — probe the TCP port instead.
           readinessProbe:
-            httpGet:
-              path: /vnc.html
-              port: novnc
+            tcpSocket:
+              port: stream
             initialDelaySeconds: 8
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 18
           livenessProbe:
-            httpGet:
-              path: /vnc.html
-              port: novnc
+            tcpSocket:
+              port: stream
             initialDelaySeconds: 30
             periodSeconds: 20
             timeoutSeconds: 5

@@ -7,6 +7,7 @@ export const chat = createChatStore(M, {
   name: 'chat',
   idPrefix: 'desktop',
   model: 'llama-server:default',
+  modelKey: 'agent-desktop.chatModel',
   onDraftFocus() {
     window.__desktopUngrab?.()
   },

@@ -31,6 +31,7 @@ import {
 createChatStore(M, {
   name: 'chat',
   idPrefix: 'desktop',
+  modelKey: 'agent-desktop.chatModel', // localStorage; omit for `mjs-chat.model`
   transport: wsTransport({
     url: (s) => `ws://${location.host}/desktops/${s.desktop}/agent`,
   }),
@@ -130,7 +131,7 @@ The widget does not own the wire. It calls methods on `M.store(store)` and reads
 
 Markdown / tool-card / telemetry helpers live in this package. A host store may override them.
 
-`createChatStore(M, { transport })` implements the single-session side of this contract. `wsTransport({ url })` speaks the angela WS protocol used by agent-desktop (`hello`, `state` snapshot, `user`, `assistant_delta`, `reasoning_delta`, `tool_delta`, `card` including `final` assistant / reasoning / tool_call / tool_result, `approval_needed`, `status`, `done`, …). Tool progress is a snapshot (`tool_delta.output`), not a token append. Image tool results carry `{ mimeType, bytes }` metadata, not the payload. One workspace session is shared across browsers: joining clients get `state` (history + allowlist + model + stopwatch); submitted prompts and live events broadcast to every socket. The composer is local until Send. Cowork keeps its own tabbed HTTP/NDJSON store and only mounts the widget.
+`createChatStore(M, { transport })` implements the single-session side of this contract. Dropdown `model` is written to localStorage (`modelKey`, default `mjs-chat.model`; `persistModel: false` to disable) and applied to new empty sessions after `state`. `wsTransport({ url })` speaks the angela WS protocol used by agent-desktop (`hello`, `state` snapshot, `user`, `assistant_delta`, `reasoning_delta`, `tool_delta`, `card` including `final` assistant / reasoning / tool_call / tool_result, `approval_needed`, `status`, `done`, …). Tool progress is a snapshot (`tool_delta.output`), not a token append. Image tool results carry `{ mimeType, bytes }` metadata, not the payload. One workspace session is shared across browsers: joining clients get `state` (history + allowlist + model + stopwatch); submitted prompts and live events broadcast to every socket. The composer is local until Send. Cowork keeps its own tabbed HTTP/NDJSON store and only mounts the widget.
 
 ## Theme
 

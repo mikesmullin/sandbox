@@ -1,12 +1,12 @@
 # Agent desktop
 
-A local **computer-use sandbox**: Debian XFCE desktops on Kind over rootless Podman, each with headed browser-use Chromium and an in-pod coding agent. A control-room SPA tiles the screens and talks to the agent over a cowork-style chat.
+A local **computer-use sandbox**: Debian XFCE desktops on Kind over rootless Podman, each with headed browser-use Chromium and an in-pod coding agent. Each desktop streams over **Selkies** (H.264 video + Opus audio on one WebSocket) so browser games — three.js/WebGL FPS with pointer lock — feel native. A control-room SPA tiles the screens and talks to the agent over a cowork-style chat.
 
 ## Problem
 
 Cloud agent products give the model a real Linux PC — XFCE, Thunar, a terminal, a browser — and a remote viewer so you can watch and take over. Local coding agents usually get the opposite: a process sandbox with files and a shell, no headed desktop, no clickable browser.
 
-Recreating the cloud stack on a laptop is fiddly. Chromium wants thousands of PIDs. Kind on Podman does not import images the same way Docker does. Inference has to leave the cluster without hairpinning through the LAN. The agent needs the *current* `agl-ai` providers (`llama-server`), not the stale npm package. And the human still needs a tiled VNC wall plus a chat that can approve tools.
+Recreating the cloud stack on a laptop is fiddly. Chromium wants thousands of PIDs. Kind on Podman does not import images the same way Docker does. Inference has to leave the cluster without hairpinning through the LAN. The agent needs the *current* `agl-ai` providers (`llama-server`), not the stale npm package. A VNC wall is fine for clicking but its absolute-mouse encoding cannot drive a fullscreen WebGL game. And the human still needs a tiled desktop wall plus a chat that can approve tools.
 
 ## Solution
 
@@ -15,15 +15,15 @@ This repo is that stack, running on one Kind cluster (`agent-desktop`) in namesp
 ```text
 browser  http://127.0.0.1:8080   (host SPA + HMR; recommended)
          http://127.0.0.1:8090   (in-cluster dashboard; production)
-    │  tiled noVNC + chat
+    │  tiled desktops (thumbnails) + isolate-view Selkies iframe + chat
     ▼
 dashboard  (Bun / CoffeeScript Express)
     │  REST for pods/scale
-    │  WS pipe  /desktops/:name/websockify  →  pod :6080
-    │  WS pipe  /desktops/:name/agent       →  pod :8091/ws
+    │  HTTP + WS proxy  /desktops/:name/*  →  pod :6080  (Selkies client + stream)
+    │  WS pipe          /desktops/:name/agent  →  pod :8091/ws
     ▼
 desktop-N  (Debian bookworm)
-  Xvfb → XFCE → x11vnc → websockify/noVNC
+  Xvfb → XFCE → PulseAudio → Selkies  (H.264 video + Opus audio, one WS port)
   headed browser-use Chromium  (stealth launch, CDP)
   Angela owner     (file-io, term-local, agent-browser MCP)
        │
@@ -31,6 +31,11 @@ desktop-N  (Debian bookworm)
   dad-proxy  https://host.containers.internal:1234
              (llama-server:default, pasta IP 169.254.1.2)
 ```
+
+The wall shows scrot thumbnails; clicking a workspace opens the **DESKTOP_FULL**
+view, which embeds the Selkies HTML5 client in an iframe. `Ctrl+Shift+X` is
+Selkies gaming mode (fullscreen + pointer lock + keyboard grab); hold `Esc` to
+leave gaming mode, or `Esc`/the toolbar **wall** button to return to the wall.
 
 Tools run **inside the pod**. Durable work lives in `/workspace/jails/<workspace-id>/` (emptyDir). Do not paste secrets into chat — type them on the desktop.
 
@@ -58,7 +63,7 @@ First boot of XFCE + the headed browser is slow. Open the host control room in a
 http://127.0.0.1:8080
 ```
 
-Scale replicas from the wall. Click a tile (the desktop image or its margin) to isolate it; click the desktop again to capture mouse and keyboard; **Esc** releases capture, then the wall.
+Scale replicas from the wall. Click a workspace thumbnail to isolate it into the Selkies stream; click into the stream to control it, or **Ctrl+Shift+X** for gaming mode (pointer lock + keyboard grab). **Esc** (or the toolbar **wall** button) returns to the wall.
 
 The in-cluster dashboard (Kind NodePort `http://127.0.0.1:8090`) is the production shape — scale `deploy/dashboard` to 1 when you want that. Day-to-day SPA work stays on the host so m-js HMR can reload JS/CSS. See [`CONTRIB.md`](CONTRIB.md).
 

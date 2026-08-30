@@ -9,27 +9,27 @@ Cluster name `agent-desktop`, namespace `agent-desktop`. Provider is **Podman**,
 | Host SPA + HMR (recommended) | `./scripts/dev-ui.sh` | `http://127.0.0.1:8080` |
 | In-cluster (production) | `kubectl -n agent-desktop scale deploy/dashboard --replicas=1` | `http://127.0.0.1:8090` (Kind NodePort `30080`) |
 
-Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (noVNC `:6080` **and** Angela `:8091`). Kind still owns host `:8090`, so the local SPA stays on `:8080`. `dev-ui.sh` scales the in-cluster dashboard to 0 so you do not edit one copy and load the other. In-cluster has HMR off (`KUBERNETES_SERVICE_HOST` is set).
+Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (Selkies stream `:6080` **and** Angela `:8091`). Kind still owns host `:8090`, so the local SPA stays on `:8080`. `dev-ui.sh` scales the in-cluster dashboard to 0 so you do not edit one copy and load the other. In-cluster has HMR off (`KUBERNETES_SERVICE_HOST` is set).
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `src/` | Control-room server: Express REST + static (`server.coffee`), kubectl helpers (`k8s.coffee`), browser-use snapshot (`snapshot.coffee`). Bun.serve on the public port message-pipes WebSockets — `http-proxy` does not complete WS upgrades through Bun's `node:http`. |
-| `public/` | SPA: m-js + Phosphor + vendored noVNC. `js/app.js` tiles RFB; isolate-mode chat is `x-component="mjs-chat"` from `public/vendor/m-js-cmp-chat` (`js/chat.js` is the WS store). |
+| `public/` | SPA: m-js + Phosphor. `js/app.js` tiles scrot thumbnails and, in isolate view, embeds the Selkies client in an `<iframe>` (`src=/desktops/:name/`); isolate-mode chat is `x-component="mjs-chat"` from `public/vendor/m-js-cmp-chat` (`js/chat.js` is the WS store). |
 | `agent/` | In-pod Angela harness (`src/server.coffee`). `agl-ai` / `angela` are `link:` deps. |
-| `Dockerfile` | Debian bookworm desktop: Xvfb, XFCE, headed browser-use Chromium, x11vnc, noVNC, bun, agent-browser 0.35.1 (`mcp` subcommand), plus current git/gh/pyenv/python/uv/node/npm/rust/go/zig/ruby (`scripts/install-devtools.sh`). |
+| `Dockerfile` | Debian bookworm desktop: Xvfb, XFCE, headed browser-use Chromium, PulseAudio, Selkies (pip venv at `/opt/selkies`: `selkies` + `pixelflux` + `pcmflux`), bun, agent-browser 0.35.1 (`mcp` subcommand), plus current git/gh/pyenv/python/uv/node/npm/rust/go/zig/ruby (`scripts/install-devtools.sh`). |
 | `Dockerfile.dashboard` | Bun Alpine + kubectl; copies `src/` + `public/`. |
 | `k8s/` | Namespace, RBAC (dashboard may list/create/delete pods and read the StatefulSet template), desktop StatefulSet (template only, 0 replicas), dashboard Deployment, GitLab CE (`gitlab.yaml`, ClusterIP on `http://gitlab`). |
 | `kind/cluster.yaml` | Extra port map 30080→8090, kubelet `podPidsLimit: 8192`. |
 | `scripts/up.sh` / `down.sh` | Create or delete the whole stack. |
 | `scripts/dev-ui.sh` | Host control room on `:8080` with m-js HMR; scales in-cluster dashboard to 0. |
 | `scripts/kind.sh` | Kind under `systemd-run --user --scope --property=Delegate=yes`; image load via `ctr import`. |
-| `scripts/vendor.sh` | noVNC core + Phosphor into `public/vendor/` (offline dashboard). |
+| `scripts/vendor.sh` | Phosphor icons into `public/vendor/` (offline dashboard). No VNC client is vendored — the Selkies client is served from the pod. |
 | `scripts/vendor-chat.sh` | Copy `/workspace/m-js-cmp-chat` into `public/vendor/m-js-cmp-chat` (chat UI plugin). Re-run after plugin edits, then HMR/rebuild dashboard. |
 | `scripts/vendor-agent.sh` | rsync `/workspace/agl`, `/workspace/angela`, mcp `file-io` / `term-local` into `vendor/` (strips `.env`, tokens, tests, plugins). Host `bun link` of both packages. Copies dad-proxy CA if present. |
 | `scripts/vendor-nvidia.sh` | Copy host NVIDIA userspace (`/usr/lib64/libnvidia*`, Vulkan/EGL ICD JSON) into `vendor/nvidia` (gitignored). Re-run after driver updates. |
-| `scripts/entrypoint.sh` | Xvfb → XFCE → x11vnc → websockify → headed browser-use → `bun /opt/agent/src/server.coffee`. Rewires `/workspace/node_modules` after the emptyDir hides the image copy. |
+| `scripts/entrypoint.sh` | Xvfb → XFCE → PulseAudio (null sink) → Selkies (`--subfolder=/desktops/$POD`) → headed browser-use → `bun /opt/agent/src/server.coffee`. Rewires `/workspace/node_modules` after the emptyDir hides the image copy. |
 | `scripts/install-devtools.sh` | Build-time install of current git, gh, pyenv+CPython+pip, uv, Node/npm, bun, rustup, Go, Zig, Ruby. Re-run only via desktop image rebuild. |
 
 Images: `agent-desktop:latest` (pods), `agent-desktop-ui:latest` (dashboard). Both use `imagePullPolicy: Never`.
@@ -40,7 +40,7 @@ GPU: Kind's node is privileged, so it already sees host `/dev/nvidia*` and `/dev
 
 The control-room SPA is **[m-js](/workspace/m-js/docs/index.html)** (v3: Alpine-style `x-*` on a keyed virtual DOM). Those HTML pages are the **official docs**. New contributors should read them before changing `public/` — how `M.mount` / `M.store` / `M.component` work, which directives have full parity vs trade-offs (`x-ignore`, `x-model` caret, `x-for` keys), and how HMR is supposed to be wired (`/__m_hmr`, `data-hmr-entry`, `window.__M_BOOT__`).
 
-This repo vendors `public/vendor/m.min.js` and, on the host dashboard, injects `public/js/hot-client.js` (same protocol as the docs). Do not treat m-js like Alpine’s in-place effects: a redraw with unchanged state must write nothing; named stores survive hot reload; noVNC canvases live under `x-ignore` so the reconciler does not own those nodes.
+This repo vendors `public/vendor/m.min.js` and, on the host dashboard, injects `public/js/hot-client.js` (same protocol as the docs). Do not treat m-js like Alpine’s in-place effects: a redraw with unchanged state must write nothing; named stores survive hot reload. The isolate-view Selkies `<iframe>` src is per-container, so switching workspaces in the same pod does not reload it (the agent `focus` POST flips the X display); log panes live under `x-ignore` so the reconciler does not own those nodes.
 
 Chat UI is **[m-js-cmp-chat](/workspace/m-js-cmp-chat)** (`M.component('mjs-chat')`, sidebar + fullscreen). Edit that repo, then `./scripts/vendor-chat.sh`. Do not fork the markup back into `public/js/components/`. Cowork mounts the same widget against `M.store('cowork')`.
 
@@ -101,7 +101,7 @@ Or `podman ps -a --filter label=io.x-k8s.kind.cluster`.
 - writes Secret `gitlab` / `root-password` (random 20-char, or `GITLAB_ROOT_PASSWORD`) and applies `k8s/gitlab.yaml`. `scripts/gitlab-seed.sh` writes `tmp/gitlab_password.md` (gitignored) and enables git-over-HTTP password auth, public default visibility, and dark UI. Desktop git stores HTTP creds from the Secret so clone/push/pull never prompt. Browse GitLab at `http://gitlab`. **Never echo the password from `kubectl` or logs.** No PAT.
 - writes Secret `github-ssh` from gitignored `secrets/github-ssh/` (`id_ed25519`, `.pub`, `known_hosts`) when that private key exists. Desktop pods mount it at `/opt/github-ssh`; entrypoint copies into `~/.ssh` and rewrites `https://github.com` → `git@github.com`. **Never echo the private key.** New containers only — rolling a pod still wipes `/workspace`.
 
-Without a key, chat will 401 on https inference. The dashboard still tiles VNC.
+Without a key, chat will 401 on https inference. The dashboard still tiles the desktops.
 
 Scale without rebuilding: `+ container` / `− container` in the control room (0–8). Pods are named `container-<6 hex>` (sha1 of random bytes) so a deleted instance is never recreated under the same name. Do not scale the StatefulSet — it is only a pod template (`replicas: 0`).
 
@@ -272,9 +272,10 @@ GitLab emptyDir keeps repos until that Deployment is recreated. Rolling a **desk
 - CONTEXT LOOP (`goto`, `loop_start_marker`, `waypoint`) is an opt-in angela MCP preset, not a builtin. This harness does not load `context-loop`; `stripContextLoop` still drops those names plus `term_local__bash` and `browser__close` after `listToolCatalog`.
 - Approvals: broadcast from PolicyEngine `onEvent` only. Duplicate cards with the same id are one approval — Allow/Deny one of them.
 - Abort/Stop is **not** queued behind the in-flight chat turn. It also cancels in-flight MCP `tools/call` (sends `notifications/cancelled` and rejects the pending promise) so a blocking `term_local__exec` cannot hold `runLock`. term-local SIGTERM/SIGKILL the child.
-- Capture: RFB stays `viewOnly` until the isolated desktop is clicked, so the chat sidebar can take keyboard. Esc → release capture → back to the wall. Clicking the tile image or its margin isolates; there is no separate “open”.
-- Hash router (`M.Router.setMode('hash')`): wall is `#/` (or empty); isolate-mode is `#/c/:container/w/:workspace`. Isolate pushes a history entry; Esc / wall / browser Back return to the wall; Forward restores the last workspace. Refresh keeps the hash. Do not remount the App on `Router.onChange` — that would rebuild noVNC canvases.
-- Clipboard: text only, while the isolated desktop is on screen. Guest copy (`ServerCutText`) writes `navigator.clipboard`. Host paste (Ctrl/Cmd+V while captured) stuffs guest CLIPBOARD then sends Ctrl+V; grabbing also pushes the current host clipboard. Chat/inputs are skipped. x11vnc needs XFIXES (`-noprimary`, no `-noxfixes`) so selecting text does not clobber the host. Classic RFB cut-text is Latin-1. Restart the **desktop** image after changing x11vnc flags.
+- Capture/gaming mode: the isolate view is the Selkies HTML5 client in an `<iframe allow="pointer-lock; fullscreen; clipboard-read; clipboard-write; gamepad">`. Click into the stream to control it; **Ctrl+Shift+X** is Selkies gaming mode (fullscreen + pointer lock + keyboard grab, forwarding `movementX/Y` deltas — the reason for the switch from VNC). Hold **Esc** to leave gaming mode; a plain **Esc** (not pointer-locked) or the toolbar **wall** button returns to the wall. Pointer lock works because `127.0.0.1` is a secure context and the iframe is same-origin. Clicking a workspace thumbnail isolates; there is no separate “open”.
+- Hash router (`M.Router.setMode('hash')`): wall is `#/` (or empty); isolate-mode is `#/c/:container/w/:workspace`. Isolate pushes a history entry; Esc / wall / browser Back return to the wall; Forward restores the last workspace. Refresh keeps the hash. Do not remount the App on `Router.onChange` — that would reload the Selkies iframe.
+- Clipboard: handled by the Selkies client itself (two-way text, secure-context/localhost). No RFB clipboard bridge in the SPA anymore. Restart the **desktop** image after changing the Selkies launch flags.
+- Audio: PulseAudio runs headless in the pod with a `module-null-sink` named `stream`; `pcmflux` captures its monitor and Selkies streams Opus. The iframe carries `allow="autoplay"`. No physical audio device.
 - Desktop refresh every 3s must not rewrite `ui.items` when name/ready/phase/restarts are unchanged (that redraw used to reset the allowlist).
 - Each XFCE workspace has its own Angela session, chat socket (`/desktops/:pod/workspaces/:id/agent` → in-pod `/workspaces/:id/ws`), and file-io jail (`/workspace/jails/workspace-<hex>/` = Angela `projectRoot` / `MCP_FILE_ROOT` / `MCP_TERM_CWD`). `/new` starts a new Angela session for **that** workspace only (same Chromium window). Rebuild the **desktop** image after changing angela for this to apply in-pod.
 - Git author is **per container**, set once in `~/.gitconfig` from the pod hostname (`user.email = container-<podhex>@home.local`). No workspace id in the email. GitLab is cluster-local; git CLI uses the credential helper (UI password is host `tmp/gitlab_password.md`, not chat). GitHub push uses Secret `github-ssh` (host `secrets/github-ssh/`, gitignored) mounted at `/opt/github-ssh`. Prefer `git push origin main` and `git commit --file …` — this model mangles `-u` / `-m` into `-1`. Do not auto-`git init` / clone / worktree on `+ workspace`; Angela decides inside the jail.

@@ -7,6 +7,7 @@ import { sampleTelem } from './telem.coffee'
 import {
   listWorkspaces, addWorkspace, removeWorkspace,
   focusWorkspace, thumbFile, resumeScan, startScanLoop,
+  setWorkspaceLabel,
 } from './workspaces.coffee'
 import {
   ensureRoom, destroyRoom, warmupRooms, fetchModels,
@@ -89,6 +90,13 @@ Bun.serve
             console.error '[agent] destroy room', listed.dropped, err.message or err
         delete listed.dropped
         delete listed.droppedTargetId
+        return Response.json enrichWorkspaces listed
+      catch err
+        return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
+    if wsDel and req.method is 'PATCH'
+      try
+        body = await readJson req
+        listed = setWorkspaceLabel decodeURIComponent(wsDel[1]), body.label
         return Response.json enrichWorkspaces listed
       catch err
         return Response.json { error: err.message or String(err) }, { status: err.status or 400 }

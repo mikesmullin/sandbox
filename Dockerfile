@@ -1,4 +1,5 @@
-# Debian agent desktop: Xvfb + XFCE + headed browser-use Chromium + x11vnc + noVNC
+# Debian agent desktop: Xvfb + XFCE + headed browser-use Chromium + Selkies
+# (H.264/WebSocket stream via pixelflux, Opus audio via pcmflux over PulseAudio)
 # + vercel-labs/agent-browser attached over CDP (does not launch its own Chrome)
 # + bun Angela owner process (file-io / shell / headed browser tools).
 #
@@ -12,8 +13,7 @@ ENV LANG=C.UTF-8 \
     DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:99 \
     GEOMETRY=1280x800x24 \
-    VNC_PORT=5900 \
-    NOVNC_PORT=6080 \
+    SELKIES_PORT=6080 \
     CDP_PORT=9222 \
     HOME=/home/agent \
     USER=agent \
@@ -37,7 +37,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash tini sudo ca-certificates curl wget openssl \
         dbus dbus-x11 \
-        xvfb x11-utils x11vnc \
+        xvfb x11-utils \
         xfce4 xfce4-terminal thunar mousepad \
         adwaita-icon-theme \
         fonts-dejavu-core fonts-liberation \
@@ -46,7 +46,7 @@ RUN apt-get update \
         libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 \
         libgtk-3-0 libxshmfence1 libglu1-mesa \
         python3 python3-venv python3-pip python3-numpy \
-        novnc websockify \
+        pulseaudio pulseaudio-utils \
         nodejs npm \
         xdotool scrot \
         procps htop \
@@ -157,6 +157,50 @@ RUN chmod +x /usr/local/bin/install-devtools.sh \
          >> /etc/bash.bashrc \
     && chown -R agent:agent /home/agent
 
+# Selkies: H.264/WebSocket desktop stream (video via pixelflux, Opus audio via
+# pcmflux) in its own venv. The pixelflux/pcmflux `selkies` (script `selkies`,
+# flags --subfolder / --encoder=h264enc) is not on PyPI yet — PyPI `selkies` is
+# the old GStreamer build (script `selkies-gstreamer`) and the GitHub .deb ships
+# only the js-interposer. The app needs pixelflux/pcmflux 2.1.0 (2.0.0 is missing
+# SOFTWARE_H264_ENCODER, which the settings payload references at runtime), and
+# 2.1.0 is published only on GitHub releases (not PyPI) as prebuilt manylinux_2_28
+# cp312 wheels — no Rust build on bookworm. Install those wheels first (satisfying
+# the ~=2.1.0 pin), then the app from a pinned main-commit source tarball WITH its
+# deps (pyee, cryptography, uvloop, … — __main__ imports webrtc_mode even in
+# websockets mode). Encoder auto-picks NVENC when the vendored /opt/nvidia libs +
+# a GPU are present, else software x264. Placed after the slow devtools layer so
+# iterating on Selkies does not rebuild it.
+ARG SELKIES_REF=92cdd57607309d14d14cbfa527f854bac93664b9
+ARG PIXELFLUX_WHL=https://github.com/selkies-project/pixelflux/releases/download/e72d820/pixelflux-2.1.0-cp312-cp312-manylinux_2_28_x86_64.whl
+ARG PCMFLUX_WHL=https://github.com/selkies-project/pcmflux/releases/download/a8fac8d/pcmflux-2.1.0-cp312-cp312-manylinux_2_28_x86_64.whl
+RUN export PATH="/usr/local/bin:/root/.local/bin:$PATH" \
+    && uv venv --python 3.12 /opt/selkies \
+    && uv pip install --python /opt/selkies/bin/python "${PIXELFLUX_WHL}" "${PCMFLUX_WHL}" \
+    && uv pip install --python /opt/selkies/bin/python \
+         "https://github.com/selkies-project/selkies/archive/${SELKIES_REF}.tar.gz" \
+    && /opt/selkies/bin/python -c "import pixelflux; assert hasattr(pixelflux, 'SOFTWARE_H264_ENCODER'); import selkies.__main__" \
+    && ln -sfn /opt/selkies/bin/selkies /usr/local/bin/selkies \
+    && chown -R agent:agent /opt/selkies
+
+# Selkies' HTML5 client is a Vite app (addons/selkies-web-core) that CI builds and
+# injects as the `selkies.selkies_web` package — the pip/sdist install does NOT
+# include it, so the server logs "No module named 'selkies.selkies_web'" and serves
+# no web UI. Build it here from the same pinned commit and serve it via --web-root
+# (which the server prefers over the packaged module when it has index.html).
+RUN . /etc/profile.d/devtools.sh 2>/dev/null || true; \
+    set -eux; \
+    mkdir -p /tmp/webbuild && cd /tmp/webbuild; \
+    curl -fsSL "https://github.com/selkies-project/selkies/archive/${SELKIES_REF}.tar.gz" \
+      | tar -xz --strip-components=1 "selkies-${SELKIES_REF}/addons/selkies-web-core"; \
+    cd addons/selkies-web-core; \
+    npm install --no-audit --no-fund; \
+    npm run build; \
+    mkdir -p /opt/selkies-web; \
+    cp -a dist/. /opt/selkies-web/; \
+    test -f /opt/selkies-web/index.html; \
+    cd /; rm -rf /tmp/webbuild; \
+    chown -R agent:agent /opt/selkies-web
+
 # npm's agl-ai is stale. Link the vendored /workspace/agl tree (copied to
 # /opt/vendor/agl) so every cwd — including Angela's /workspace jail —
 # resolves llama-server and the rest of the current provider set.
@@ -171,5 +215,5 @@ WORKDIR /opt/agent
 RUN bun install --production
 
 WORKDIR /workspace
-EXPOSE 6080 5900 9222 8091
+EXPOSE 6080 9222 8091
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
