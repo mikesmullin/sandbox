@@ -58,7 +58,7 @@ plus a tiny `package.json` so `bun` from cwd does not fall through to the npm ca
 
 Edit agl/angela, re-run `vendor-agent.sh`, rebuild the **desktop** image, and roll the StatefulSet. Dashboard code does not import agl.
 
-MCP servers are vendored at `/opt/mcp` (file-io, term-local). **Do not vendor `mcp/sandbox`** — ada's coordinator MCP stays on the host. Headed browser-use Chromium is driven by `agent-browser --session <workspace-id> --cdp <url> --headed --pin-tab mcp --tools core` (needs **0.34+** for `--pin-tab`; 0.27 has no `mcp` command). Do not point `AGENT_BROWSER_EXECUTABLE_PATH` at a second Chrome. Do not run xdotool/xfconf against the host display — XFCE workspaces live on the pod's `DISPLAY=:99`.
+MCP servers are vendored at `/opt/mcp` (file-io, term-local). **Do not vendor `mcp/sandbox`** — ada's coordinator MCP stays on the host. Headed browser-use Chromium is driven by `agent-browser --session <workspace-id> --cdp <url> --headed --pin-tab mcp --tools core,debug` (`core` is navigation/snapshot/eval; `debug` is console/errors/trace). Needs **0.34+** for `--pin-tab`; 0.27 has no `mcp` command. Do not point `AGENT_BROWSER_EXECUTABLE_PATH` at a second Chrome. Do not run xdotool/xfconf against the host display — XFCE workspaces live on the pod's `DISPLAY=:99`.
 
 Job HTTP (ada spawn/wait/cancel) lives on the in-pod agent next to `/workspaces`:
 

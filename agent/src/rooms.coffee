@@ -506,7 +506,7 @@ browserMcp = (wsName) ->
   {
     name: 'browser'
     command: 'agent-browser'
-    args: ['--session', wsName, '--cdp', CDP_TARGET, '--headed', '--pin-tab', 'mcp', '--tools', 'core']
+    args: ['--session', wsName, '--cdp', CDP_TARGET, '--headed', '--pin-tab', 'mcp', '--tools', 'core,debug']
     env:
       DISPLAY: DISPLAY
       HOME: process.env.HOME or '/home/agent'
