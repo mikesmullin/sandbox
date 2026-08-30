@@ -17,7 +17,15 @@ from urllib.parse import urlparse
 
 CDP_FILE = Path(os.environ.get("BROWSER_USE_CDP_FILE", "/tmp/browser-use.cdp"))
 PORT_FILE = Path(os.environ.get("BROWSER_USE_CDP_PORT_FILE", "/tmp/browser-use.cdp.port"))
-USER_DATA = Path(os.environ.get("BROWSER_USE_USER_DATA_DIR", os.path.expanduser("~/.config/browser-use")))
+# Path must contain "browser-use-user-data-dir-" so browser-use does not copy
+# the profile into a random /tmp/browser-use-user-data-dir-* (see profile.py
+# _copy_profile). Snapshot restore writes this same directory.
+USER_DATA = Path(
+    os.environ.get(
+        "BROWSER_USE_USER_DATA_DIR",
+        os.path.expanduser("~/.config/browser-use-user-data-dir-live"),
+    )
+)
 PREFERRED_PORT = int(os.environ.get("CDP_PORT", "9222"))
 
 

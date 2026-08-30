@@ -3,6 +3,7 @@
 # Container pods are created one-by-one as container-<6 hex> (sha1 of random
 # bytes) so a deleted instance is never reborn under the same name.
 import { createHash, randomBytes } from 'node:crypto'
+import { snapshotPresent, patchPodForSnapshot, injectSnapshot } from './snapshot.coffee'
 
 NAMESPACE = process.env.NAMESPACE or 'agent-desktop'
 APP = process.env.DESKTOP_APP or 'container'
@@ -110,7 +111,13 @@ export createContainer = ->
   used = new Set (d.name for d in items)
   name = "container-#{shortId used}"
   pod = podFromTemplate name
+  pod = patchPodForSnapshot pod
   run ['apply', '-f', '-'], { stdin: JSON.stringify pod }
+  if snapshotPresent()
+    try
+      await injectSnapshot name
+    catch err
+      console.error "[snapshot] inject #{name}:", err.message or err
   { name, scale: await getScale() }
 
 export deleteContainer = (name) ->

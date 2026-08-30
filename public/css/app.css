@@ -104,6 +104,11 @@ body {
 .btn:hover { border-color: var(--accent); color: var(--accent-2); }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
 .btn.ghost { background: transparent; }
+.btn.on {
+  color: var(--ink);
+  border-color: rgba(122, 176, 255, .55);
+  background: rgba(122, 176, 255, .18);
+}
 .btn i { font-size: 14px; }
 .btn.toggle.off {
   background: transparent;

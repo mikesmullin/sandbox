@@ -86,6 +86,8 @@ spec:
                   optional: true
             - name: GITLAB_URL
               value: "http://gitlab"
+            - name: BROWSER_USE_USER_DATA_DIR
+              value: "/home/agent/.config/browser-use-user-data-dir-live"
             - name: GITLAB_ROOT_PASSWORD
               valueFrom:
                 secretKeyRef:

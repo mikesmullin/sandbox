@@ -15,7 +15,7 @@ Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (noVN
 
 | Path | What |
 |---|---|
-| `src/` | Control-room server: Express REST + static (`server.coffee`), kubectl helpers (`k8s.coffee`). Bun.serve on the public port message-pipes WebSockets — `http-proxy` does not complete WS upgrades through Bun's `node:http`. |
+| `src/` | Control-room server: Express REST + static (`server.coffee`), kubectl helpers (`k8s.coffee`), browser-use snapshot (`snapshot.coffee`). Bun.serve on the public port message-pipes WebSockets — `http-proxy` does not complete WS upgrades through Bun's `node:http`. |
 | `public/` | SPA: m-js + Phosphor + vendored noVNC. `js/app.js` tiles RFB; isolate-mode chat is `x-component="mjs-chat"` from `public/vendor/m-js-cmp-chat` (`js/chat.js` is the WS store). |
 | `agent/` | In-pod Angela harness (`src/server.coffee`). `agl-ai` / `angela` are `link:` deps. |
 | `Dockerfile` | Debian bookworm desktop: Xvfb, XFCE, headed browser-use Chromium, x11vnc, noVNC, bun, agent-browser 0.35.1 (`mcp` subcommand). |
@@ -266,6 +266,7 @@ GitLab emptyDir keeps repos until that Deployment is recreated. Rolling a **desk
 - Git author is **per container**, set once in `~/.gitconfig` from the pod hostname (`user.email = container-<podhex>@home.local`). No workspace id in the email. GitLab is cluster-local; git CLI uses the credential helper (UI password is host `tmp/gitlab_password.md`, not chat). Prefer `git push origin main` and `git commit --file …` — this model mangles `-u` / `-m` into `-1`. Do not auto-`git init` / clone / worktree on `+ workspace`; Angela decides inside the jail.
 - Browser: one headed browser-use Chromium (shared cookies/history). Each workspace owns a distinct window; agent-browser MCP uses `--session <workspace-id> --pin-tab` so one session cannot drive another workspace's window. Do not call `agent-browser close` (that kills the shared browser).
 - Tile **desktop / log / gauges** toggles are independent. Booting pods force the log pane (kubectl `logs -f`, stick-to-bottom). Gauges scrape `/telem` on the in-pod agent (`/proc`, not the glibc mycloud-probe). In-cluster dashboard needs `pods/log` RBAC.
+- Browser-use **Snapshot** (toolbar, when a container tile is selected) tars the live Chromium `--user-data-dir` (cookies/logins; browser-use otherwise copies into a random `/tmp/browser-use-user-data-dir-*`). One snapshot at a time, stored as `tmp/browser-use-snapshot.tgz`. New `+ container` pods restore it into `~/.config/browser-use-user-data-dir-live` before Chromium starts (that path name stops browser-use from copying to `/tmp` again). **Clear Snapshot** deletes the tarball. In-cluster dashboard needs `pods/exec` RBAC. Rebuild the **desktop** image after changing the headed launcher.
 
 ## Do not
 

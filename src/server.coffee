@@ -3,6 +3,7 @@ import httpProxy from 'http-proxy'
 import { watch } from 'fs'
 import { extname, resolve } from 'path'
 import { listDesktops, getDesktop, getScale, setScale, createContainer, deleteContainer, resolveTarget, dropForward } from './k8s.coffee'
+import { snapshotInfo, captureSnapshot, clearSnapshot } from './snapshot.coffee'
 import { attachLogClient, detachLogClient } from './logs.coffee'
 
 PORT = Number process.env.PORT or 8080
@@ -93,7 +94,7 @@ app.get '/api/desktops', (req, res) ->
   try
     [desktops, scale] = await Promise.all [listDesktops(), getScale()]
     desktops = await Promise.all desktops.map attachWorkspaces
-    res.json { desktops, scale }
+    res.json { desktops, scale, snapshot: snapshotInfo() }
   catch err
     console.error '[api] list', err
     res.status(500).json { error: err.message }
@@ -111,7 +112,7 @@ app.post '/api/desktops', (req, res) ->
   try
     created = await createContainer()
     desktops = await Promise.all (await listDesktops()).map attachWorkspaces
-    res.json { container: created, scale: created.scale, desktops }
+    res.json { container: created, scale: created.scale, desktops, snapshot: snapshotInfo() }
   catch err
     console.error '[api] create', err
     res.status(err.status or 400).json { error: err.message }
@@ -120,7 +121,7 @@ app.delete '/api/desktops/:name', (req, res) ->
   try
     deleted = await deleteContainer req.params.name
     desktops = await Promise.all (await listDesktops()).map attachWorkspaces
-    res.json { container: deleted, scale: deleted.scale, desktops }
+    res.json { container: deleted, scale: deleted.scale, desktops, snapshot: snapshotInfo() }
   catch err
     console.error '[api] delete', err
     res.status(err.status or 400).json { error: err.message }
@@ -129,10 +130,35 @@ app.patch '/api/desktops', (req, res) ->
   try
     scale = await setScale req.body?.replicas
     desktops = await Promise.all (await listDesktops()).map attachWorkspaces
-    res.json { scale, desktops }
+    res.json { scale, desktops, snapshot: snapshotInfo() }
   catch err
     console.error '[api] scale', err
     res.status(400).json { error: err.message }
+
+app.get '/api/snapshot', (req, res) ->
+  res.json snapshotInfo()
+
+app.post '/api/snapshot', (req, res) ->
+  try
+    name = String(req.body?.container or req.body?.name or '').trim()
+    unless name
+      return res.status(400).json { error: 'container name required' }
+    desk = await getDesktop name
+    unless desk?
+      return res.status(404).json { error: "container #{name} not found" }
+    unless desk.ready
+      return res.status(409).json { error: "container #{name} is not ready" }
+    snap = await captureSnapshot name
+    res.json snap
+  catch err
+    console.error '[api] snapshot capture', err
+    res.status(err.status or 500).json { error: err.message }
+
+app.delete '/api/snapshot', (req, res) ->
+  try
+    res.json clearSnapshot()
+  catch err
+    res.status(500).json { error: err.message }
 
 app.get '/api/desktops/:name/telem', (req, res) ->
   try

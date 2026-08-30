@@ -37,6 +37,7 @@ const ui = M.store('ui', {
   error: '',
   loading: true,
   busy: false,
+  snapshot: { present: false },
   thumbGen: 0,
   vncLive: {},
   thumbOk: {},
@@ -419,6 +420,11 @@ const refresh = async () => {
     if (prev.replicas !== sc.replicas || prev.ready !== sc.ready || prev.current !== sc.current) {
       ui.scale = sc
     }
+    const snap = data.snapshot || { present: false }
+    const prevSnap = ui.snapshot || {}
+    if (prevSnap.present !== snap.present || prevSnap.source !== snap.source || prevSnap.bytes !== snap.bytes) {
+      ui.snapshot = snap
+    }
     if (ui.selectedContainer && !next.some((d) => d.name === ui.selectedContainer)) {
       ui.selectedContainer = null
     }
@@ -556,6 +562,7 @@ const burstPoll = (ms = 8000) => {
 const App = () => ({
   get items() { return ui.items },
   get scale() { return ui.scale },
+  get snapshot() { return ui.snapshot || { present: false } },
   get pickedContainer() { return ui.selectedContainer },
   get full() { return ui.fullView ? ui.selectedDesktop : null },
   get chatOpen() { return ui.chatOpen },
@@ -661,6 +668,7 @@ const App = () => ({
         ui.selectedContainer = data.container.name
         ui.selectedDesktop = null
       }
+      if (data.snapshot) ui.snapshot = data.snapshot
       queueMicrotask(syncScreens)
       burstPoll(12000)
     } catch (err) {
@@ -688,6 +696,34 @@ const App = () => ({
       }
       queueMicrotask(syncScreens)
       burstPoll(8000)
+    } catch (err) {
+      ui.error = err.message
+    } finally {
+      ui.busy = false
+    }
+  },
+  async snapshotContainer() {
+    const c = this.picked()
+    if (!c?.ready || !ui.selectedContainer) return
+    ui.busy = true
+    ui.error = ''
+    try {
+      const snap = await api('/api/snapshot', {
+        method: 'POST',
+        body: JSON.stringify({ container: c.name }),
+      })
+      ui.snapshot = snap
+    } catch (err) {
+      ui.error = err.message
+    } finally {
+      ui.busy = false
+    }
+  },
+  async clearSnapshot() {
+    ui.busy = true
+    ui.error = ''
+    try {
+      ui.snapshot = await api('/api/snapshot', { method: 'DELETE' })
     } catch (err) {
       ui.error = err.message
     } finally {
@@ -823,6 +859,9 @@ const App = () => ({
           <span>containers <b x-text="scale.replicas"></b></span>
           <span>ready <b x-text="scale.ready"></b></span>
           <span>workspaces <b x-text="workspaceCount"></b></span>
+          <span x-show="snapshot.present" title="New containers restore this browser-use profile">
+            <i class="dot live"></i>snapshot
+          </span>
         </div>
         <div class="spacer"></div>
         <span class="err" x-show="error" x-text="error"></span>
@@ -836,6 +875,19 @@ const App = () => ({
                   :disabled="busy || scale.replicas<=0 || !picked()"
                   @click="removeContainer()">
             <i class="ph ph-minus"></i> container
+          </button>
+          <button class="btn" type="button" x-show="pickedContainer"
+                  :class="snapshot.present ? 'on' : ''"
+                  :disabled="busy || !picked() || !picked().ready"
+                  title="Copy this container's browser-use cookies/logins. New containers boot from it."
+                  @click="snapshotContainer()">
+            <i class="ph ph-camera"></i> Snapshot
+          </button>
+          <button class="btn ghost" type="button" x-show="pickedContainer && snapshot.present"
+                  :disabled="busy"
+                  title="Discard the browser-use snapshot. New containers boot empty."
+                  @click="clearSnapshot()">
+            <i class="ph ph-camera-slash"></i> Clear Snapshot
           </button>
           <button class="btn" type="button" x-show="wallPicked"
                   :disabled="busy || !picked() || !picked().ready || wsCount(picked())>=8"

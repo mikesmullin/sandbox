@@ -49,6 +49,7 @@ mkdir -p \
   "$XDG_DATA_HOME" \
   "$HOME/.vnc" \
   "$HOME/.config/browser-use" \
+  "$HOME/.config/browser-use-user-data-dir-live" \
   /workspace \
   /workspace/jails
 
@@ -207,6 +208,33 @@ wait_for_port 127.0.0.1 "$VNC_PORT" x11vnc || true
 log novnc "http://0.0.0.0:${NOVNC_PORT}/vnc.html  (web root ${NOVNC_WEB})"
 websockify --heartbeat 30 --web "$NOVNC_WEB" 0.0.0.0:"$NOVNC_PORT" 127.0.0.1:"$VNC_PORT" \
   2>&1 | sed 's/^/[novnc] /' &
+
+# Optional control-room snapshot of the headed Chromium profile (cookies/logins).
+# Path must include browser-use-user-data-dir- so browser-use will not copy it
+# to a random /tmp dir. Dashboard extracts the tarball then touches ready.
+BROWSER_USE_USER_DATA_DIR="${BROWSER_USE_USER_DATA_DIR:-$HOME/.config/browser-use-user-data-dir-live}"
+export BROWSER_USE_USER_DATA_DIR
+mkdir -p "$BROWSER_USE_USER_DATA_DIR"
+if [ "${BROWSER_SNAPSHOT:-}" = "1" ]; then
+  log snapshot "waiting for profile in $BROWSER_USE_USER_DATA_DIR"
+  snap_ok=0
+  for i in $(seq 1 180); do
+    if [ -f /tmp/browser-snapshot.ready ]; then
+      snap_ok=1
+      break
+    fi
+    sleep 0.5
+  done
+  rm -f \
+    "$BROWSER_USE_USER_DATA_DIR/SingletonLock" \
+    "$BROWSER_USE_USER_DATA_DIR/SingletonSocket" \
+    "$BROWSER_USE_USER_DATA_DIR/SingletonCookie"
+  if [ "$snap_ok" = 1 ]; then
+    log snapshot "restored $BROWSER_USE_USER_DATA_DIR"
+  else
+    log snapshot "timed out — booting empty profile"
+  fi
+fi
 
 # Headed browser-use Chromium on XFCE. Writes CDP URL to /tmp/browser-use.cdp.
 sleep 2
