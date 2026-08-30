@@ -74,7 +74,7 @@ Dashboard proxies the same paths under `/api/desktops/:name/...`. Rebuild the **
 ## Start / stop the cluster
 
 ```sh
-cd /workspace/factory/container
+cd /workspace/factory/sandbox
 ./scripts/up.sh          # vendor, build images, create/start Kind, load, apply, wait for desktops
 ./scripts/dev-ui.sh      # host control room :8080 with HMR (scales deploy/dashboard to 0)
 ./scripts/down.sh        # kind delete cluster --name agent-desktop

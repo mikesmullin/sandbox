@@ -33,7 +33,7 @@ rsync_src /workspace/angela "$VENDOR/angela"
 python3 - <<'PY'
 import json
 from pathlib import Path
-p = Path("/workspace/factory/container/vendor/angela/package.json")
+p = Path("/workspace/factory/sandbox/vendor/angela/package.json")
 pkg = json.loads(p.read_text())
 deps = pkg.get("dependencies") or {}
 deps.pop("@opentui/core", None)

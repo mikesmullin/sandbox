@@ -47,7 +47,7 @@ See [`CONTRIB.md`](CONTRIB.md) for bring-up and rebuild.
 Needs **Podman**, **Bun**, and **kubectl** on the host. `scripts/up.sh` installs Kind into `~/.local/bin` if it is missing. Inference goes through a running **dad-proxy** on the host (`:1234`); `up.sh` copies `LLM_PROXY_API_KEY` from `/workspace/dad-proxy/.env` into a cluster Secret without printing it.
 
 ```sh
-cd /workspace/factory/container
+cd /workspace/factory/sandbox
 ./scripts/up.sh          # Kind cluster + desktop pods
 ./scripts/dev-ui.sh      # control room on the host (m-js HMR)
 ```
