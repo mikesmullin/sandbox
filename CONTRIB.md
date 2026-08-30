@@ -58,7 +58,18 @@ plus a tiny `package.json` so `bun` from cwd does not fall through to the npm ca
 
 Edit agl/angela, re-run `vendor-agent.sh`, rebuild the **desktop** image, and roll the StatefulSet. Dashboard code does not import agl.
 
-MCP servers are vendored at `/opt/mcp` (file-io, term-local). Headed browser-use Chromium is driven by `agent-browser --session <workspace-id> --cdp <url> --headed --pin-tab mcp --tools core` (needs **0.34+** for `--pin-tab`; 0.27 has no `mcp` command). Do not point `AGENT_BROWSER_EXECUTABLE_PATH` at a second Chrome. Do not run xdotool/xfconf against the host display — XFCE workspaces live on the pod's `DISPLAY=:99`.
+MCP servers are vendored at `/opt/mcp` (file-io, term-local). **Do not vendor `mcp/sandbox`** — ada's coordinator MCP stays on the host. Headed browser-use Chromium is driven by `agent-browser --session <workspace-id> --cdp <url> --headed --pin-tab mcp --tools core` (needs **0.34+** for `--pin-tab`; 0.27 has no `mcp` command). Do not point `AGENT_BROWSER_EXECUTABLE_PATH` at a second Chrome. Do not run xdotool/xfconf against the host display — XFCE workspaces live on the pod's `DISPLAY=:99`.
+
+Job HTTP (ada spawn/wait/cancel) lives on the in-pod agent next to `/workspaces`:
+
+```
+POST /workspaces/:id/jobs          202 { task_id, workspace_id, session_id, status }
+GET  /workspaces/:id/jobs
+GET  /workspaces/:id/jobs/:task_id
+POST /workspaces/:id/jobs/:task_id/abort
+```
+
+Dashboard proxies the same paths under `/api/desktops/:name/...`. Rebuild the **desktop** image after agent job-API edits. Host SPA (`dev-ui.sh`) picks up dashboard proxy edits without an image rebuild.
 
 ## Start / stop the cluster
 
@@ -253,9 +264,10 @@ GitLab emptyDir keeps repos until that Deployment is recreated. Rolling a **desk
 
 - Default model `llama-server:default` via `Agent.factory({ model, base_url, api_key, ca_file })`. URL is `https://host.containers.internal:1234`. CA is `/opt/certs/ca.pem` when vendored from dad-proxy. Model/allowlist/abort are per workspace session.
 - Chat WS is the source of truth for that workspace: every browser that opens the same `/desktops/:pod/workspaces/:id/agent` socket sees the same transcript, allowlist, model, run/stopwatch, and approvals. Join sends `hello` then a `state` snapshot (history rebuilt from angela `delta/v1` jsonl). Submitted prompts (`user`) and live `allowlist` / `status` / deltas fan out to all clients. The composer textarea is local until Send — do not sync in-progress typing. Seed allowlist from `hello`/`state` once; the desktop refresh must still not rewrite `ui.items` (that used to clobber the shield).
-- Policy is **ask** + Lucy allowlist, plus `file_io__write_file` and `browser__.*`. Chat Send includes the current allowlist textarea.
+- Live angela events the sidebar must understand: `assistant_delta`, `reasoning_delta`, `tool_delta` (MCP `notifications/progress` — snapshot of merged stdout, not a token append), `card` (`tool_call` / `tool_result` / `reasoning` / `assistant` from angela `final`), `approval_needed`, `status`, `done`, `visible` (eye toggle). `final` is how non-streaming (or tool-then-text) turns get an assistant bubble — do not wait only on deltas. Tool-result `image` is `{ mimeType, bytes }` metadata, not the base64 payload. Client `{ type: 'visible', eventId, visible }` writes angela `setEventVisible` + `setContextVisible` (tool_call/tool_result pair together) and fans out `{ type: 'visible', eventIds, visible }`.
+- Policy is **ask** + Lucy allowlist (includes `file_io__grep` / `file_io__find`), plus `file_io__write_file`, `file_io__edit`, `term_local__exec:.*`, and `browser__.*`. Chat Send includes the current allowlist textarea.
 - `MCP_TERM_ALLOW=.*` so term-local does not apply a second jail. The UI allowlist is the gate.
-- CONTEXT LOOP builtins (`goto`, `loop_start_marker`, `waypoint`) are stripped after `listToolCatalog`.
+- CONTEXT LOOP (`goto`, `loop_start_marker`, `waypoint`) is an opt-in angela MCP preset, not a builtin. This harness does not load `context-loop`; `stripContextLoop` still drops those names plus `term_local__bash` and `browser__close` after `listToolCatalog`.
 - Approvals: broadcast from PolicyEngine `onEvent` only. Duplicate cards with the same id are one approval — Allow/Deny one of them.
 - Abort/Stop is **not** queued behind the in-flight chat turn.
 - Capture: RFB stays `viewOnly` until the isolated desktop is clicked, so the chat sidebar can take keyboard. Esc → release capture → back to the wall. Clicking the tile image or its margin isolates; there is no separate “open”.

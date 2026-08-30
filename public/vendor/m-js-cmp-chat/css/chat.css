@@ -31,6 +31,29 @@
 .mjs-chat *,
 .mjs-chat *::before,
 .mjs-chat *::after { box-sizing: border-box; }
+.mjs-chat,
+.mjs-chat * {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+.mjs-chat *::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+.mjs-chat *::-webkit-scrollbar-track,
+.mjs-chat *::-webkit-scrollbar-corner {
+  background: transparent;
+}
+.mjs-chat *::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.mjs-chat *::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.38);
+  background-clip: padding-box;
+}
 
 .mjs-chat.mode-fullscreen { flex-direction: row; width: 100%; }
 .mjs-chat.mode-sidebar {
@@ -293,7 +316,10 @@
 .mjs-chat .msg-block.msg-user { align-self: flex-end; max-width: min(720px, 85%); }
 .mjs-chat .msg-block.msg-hidden { opacity: 0.45; }
 .mjs-chat .msg-block.msg-hidden .bubble-user,
-.mjs-chat .msg-block.msg-hidden .bubble-assistant {
+.mjs-chat .msg-block.msg-hidden .bubble-assistant,
+.mjs-chat .msg-block.msg-hidden .bubble-error,
+.mjs-chat .msg-block.msg-hidden .bubble-reasoning,
+.mjs-chat .msg-block.msg-hidden .tool-card {
   text-decoration: line-through;
   text-decoration-color: var(--mjs-dim);
 }
@@ -317,6 +343,16 @@
 }
 .mjs-chat.mode-sidebar .bubble-assistant { font-size: 13px; }
 .mjs-chat .bubble-assistant.is-streaming { white-space: pre-wrap; word-break: break-word; }
+.mjs-chat .bubble-error {
+  width: 100%;
+  padding: 4px 2px;
+  line-height: 1.55;
+  font-size: 14px;
+  color: var(--mjs-err);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.mjs-chat.mode-sidebar .bubble-error { font-size: 13px; }
 .mjs-chat .stream-caret {
   display: inline-block;
   width: 0.55ch;
@@ -337,6 +373,11 @@
   background: rgba(91, 33, 182, 0.18);
   color: #e9d5ff;
 }
+.mjs-chat .bubble-reasoning.is-collapsed .reasoning-header,
+.mjs-chat .tool-card.is-collapsed .tool-call-header,
+.mjs-chat .tool-card.is-collapsed .tool-result-header {
+  margin-bottom: 0;
+}
 .mjs-chat .reasoning-header {
   display: flex;
   align-items: center;
@@ -354,8 +395,9 @@
   white-space: pre-wrap;
   word-break: break-word;
   color: #ddd6fe;
-  max-height: min(40vh, 18rem);
-  overflow: auto;
+  --bubble-pad: 0px;
+  --bubble-max: min(40vh, 18rem);
+  --bubble-fade: color-mix(in srgb, var(--mjs-panel) 82%, rgb(91, 33, 182));
 }
 
 .mjs-chat .md-body { white-space: normal; word-wrap: break-word; overflow-wrap: anywhere; }
@@ -407,6 +449,25 @@
   font-weight: 600;
   color: var(--mjs-ink);
 }
+.mjs-chat .bubble-fold-header {
+  cursor: pointer;
+  user-select: none;
+}
+.mjs-chat .bubble-fold-header:hover .bubble-fold-caret {
+  color: var(--mjs-ink);
+}
+.mjs-chat .bubble-fold-caret {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--mjs-dim);
+}
+.mjs-chat .tool-result-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
 .mjs-chat .tool-call-name { font-family: var(--mjs-mono); color: var(--mjs-accent-2); }
 .mjs-chat .tool-call-explanation {
   color: #7dd3fc;
@@ -415,11 +476,10 @@
   line-height: 1.4;
 }
 .mjs-chat .tool-call-code,
+.mjs-chat .tool-call-progress,
 .mjs-chat .tool-result-body {
   margin: 6px 0 0;
   padding: 10px 12px;
-  max-height: min(40vh, 16rem);
-  overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
   font-size: 12px;
@@ -428,10 +488,71 @@
   background: rgba(0, 0, 0, 0.35);
   border: 1px solid var(--mjs-line);
   border-radius: 8px;
+  --bubble-pad: 20px;
+  --bubble-max: min(40vh, 16rem);
+  --bubble-fade: color-mix(in srgb, var(--mjs-tool) 65%, #000);
+}
+.mjs-chat .tool-call-progress {
+  color: var(--mjs-dim);
+  --bubble-max: min(24vh, 10rem);
+}
+.mjs-chat .bubble-scroll {
+  position: relative;
+  max-height: calc(5.6em + var(--bubble-pad, 0px));
+  max-height: calc(4lh + var(--bubble-pad, 0px));
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  cursor: ns-resize;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.mjs-chat .msg-block:hover .bubble-scroll,
+.mjs-chat .bubble-scroll:hover {
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+.mjs-chat .bubble-scroll::-webkit-scrollbar-thumb {
+  background-color: transparent;
+}
+.mjs-chat .msg-block:hover .bubble-scroll::-webkit-scrollbar-thumb,
+.mjs-chat .bubble-scroll:hover::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.22);
+}
+.mjs-chat .msg-block:hover .bubble-scroll::-webkit-scrollbar-thumb:hover,
+.mjs-chat .bubble-scroll:hover::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.38);
+}
+.mjs-chat .bubble-scroll.is-expanded {
+  max-height: var(--bubble-max, min(40vh, 16rem));
+}
+.mjs-chat .bubble-scroll::before {
+  content: "";
+  display: block;
+  position: sticky;
+  top: 0;
+  height: 1.15em;
+  height: 1lh;
+  margin-bottom: -1.15em;
+  margin-bottom: -1lh;
+  pointer-events: none;
+  z-index: 2;
+  opacity: 0;
+  background: linear-gradient(to bottom, var(--bubble-fade, var(--mjs-panel)) 0%, transparent 100%);
+}
+.mjs-chat .bubble-scroll[data-scrolled="1"]::before {
+  opacity: 1;
+}
+.mjs-chat .tool-call-progress.is-streaming {
+  border-color: var(--mjs-wait);
 }
 .mjs-chat .tool-card-row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; }
 .mjs-chat .tool-icon { flex-shrink: 0; font-size: 14px; }
 .mjs-chat .tool-size { margin-left: auto; font-size: 10px; opacity: 0.7; }
+.mjs-chat .tool-image-note {
+  font-size: 11px;
+  color: var(--mjs-accent-2);
+  font-family: var(--mjs-mono);
+}
 
 .mjs-chat .thinking {
   align-self: flex-start;
@@ -454,7 +575,7 @@
   padding: 0 4px;
   margin-bottom: 2px;
   opacity: 0;
-  transition: opacity 300ms ease 5s;
+  transition: opacity 300ms ease 1s;
   font-size: 11px;
   color: var(--mjs-dim);
   user-select: none;

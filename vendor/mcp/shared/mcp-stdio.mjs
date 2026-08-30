@@ -14,7 +14,10 @@ export function textResult(text, isError = false) {
  * @param {{ name: string, version?: string, tools: Record<string, {
  *   description: string,
  *   inputSchema: object,
- *   handler: (args: object) => Promise<object> | object
+ *   handler: (args: object, ctx?: {
+ *     notify: (method: string, params: object) => void,
+ *     progressToken: unknown,
+ *   }) => Promise<object> | object
  * }> }} options
  */
 export async function runMcpStdioServer(options) {
@@ -75,8 +78,16 @@ export async function runMcpStdioServer(options) {
           respond(id, textResult(`Unknown tool: ${toolName}`, true));
           return;
         }
+        const progressToken = params?._meta?.progressToken;
+        const ctx = {
+          notify: (methodName, nparams) => {
+            if (!methodName) return;
+            write({ jsonrpc: '2.0', method: methodName, params: nparams || {} });
+          },
+          progressToken,
+        };
         try {
-          const result = await def.handler(args);
+          const result = await def.handler(args, ctx);
           if (result && Array.isArray(result.content)) {
             respond(id, result);
           } else if (typeof result === 'string') {

@@ -13,6 +13,9 @@ import {
 const connections = (window.__rfb ??= new Map())
 
 const CHAT_OPEN_KEY = 'agent-desktop.chatOpen'
+const CHAT_WIDTH_KEY = 'agent-desktop.chatWidth'
+const CHAT_WIDTH_MIN = 240
+const CHAT_WIDTH_DEFAULT = 380
 const readChatOpen = () => {
   try {
     const v = localStorage.getItem(CHAT_OPEN_KEY)
@@ -25,6 +28,16 @@ const readChatOpen = () => {
 const writeChatOpen = (on) => {
   try { localStorage.setItem(CHAT_OPEN_KEY, on ? '1' : '0') } catch {}
 }
+const readChatWidth = () => {
+  try {
+    const n = Number(localStorage.getItem(CHAT_WIDTH_KEY))
+    if (Number.isFinite(n) && n >= CHAT_WIDTH_MIN) return Math.round(n)
+  } catch {}
+  return CHAT_WIDTH_DEFAULT
+}
+const writeChatWidth = (n) => {
+  try { localStorage.setItem(CHAT_WIDTH_KEY, String(Math.round(n))) } catch {}
+}
 
 const ui = M.store('ui', {
   items: [],
@@ -33,6 +46,7 @@ const ui = M.store('ui', {
   selectedDesktop: null,
   fullView: false,
   chatOpen: readChatOpen(),
+  chatWidth: readChatWidth(),
   captured: false,
   error: '',
   loading: true,
@@ -109,6 +123,7 @@ const flyEl = (name) => {
     el = document.createElement('div')
     el.className = 'rfb-fly'
     el.dataset.rfb = name
+    el.addEventListener('contextmenu', (ev) => ev.preventDefault())
     layer.appendChild(el)
   }
   return el
@@ -566,6 +581,10 @@ const App = () => ({
   get pickedContainer() { return ui.selectedContainer },
   get full() { return ui.fullView ? ui.selectedDesktop : null },
   get chatOpen() { return ui.chatOpen },
+  get chatWidth() { return ui.chatWidth },
+  get chatRailStyle() {
+    return { '--chat-rail': `${ui.chatWidth || CHAT_WIDTH_DEFAULT}px` }
+  },
   get error() { return ui.error },
   get loading() { return ui.loading },
   get busy() { return ui.busy },
@@ -657,6 +676,35 @@ const App = () => ({
     writeChatOpen(ui.chatOpen)
     paint()
     queueMicrotask(placeAllFlies)
+  },
+  startChatResize(ev) {
+    ev.preventDefault()
+    ev.stopPropagation()
+    this.release()
+    const handle = ev.currentTarget
+    const stage = handle?.closest?.('.stage') || document.querySelector('.stage')
+    const startX = ev.clientX
+    const startW = Number(ui.chatWidth) || CHAT_WIDTH_DEFAULT
+    handle?.classList?.add('is-drag')
+    document.body.classList.add('is-resizing-chat')
+    const onMove = (e) => {
+      const max = Math.max(
+        CHAT_WIDTH_MIN,
+        Math.floor((stage?.clientWidth || window.innerWidth) * 0.72),
+      )
+      ui.chatWidth = Math.min(max, Math.max(CHAT_WIDTH_MIN, startW + (startX - e.clientX)))
+      window.__desktopPlaceFlies?.()
+    }
+    const onUp = () => {
+      handle?.classList?.remove('is-drag')
+      document.body.classList.remove('is-resizing-chat')
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      writeChatWidth(ui.chatWidth)
+      window.__desktopPlaceFlies?.()
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
   },
   async addContainer() {
     ui.busy = true
@@ -928,6 +976,7 @@ const App = () => ({
       </header>
 
       <main class="stage" :class="(full && chatOpen) ? 'has-chat' : ''"
+            :style="chatRailStyle"
             @click="onStageBlank($event)">
         <div class="empty" x-show="!loading && items.length===0">
           <i class="ph ph-squares-four"></i>
@@ -1070,6 +1119,12 @@ const App = () => ({
           </article>
         </section>
 
+        <div
+          class="chat-split"
+          x-show="full && chatOpen"
+          title="Resize chat"
+          @pointerdown="startChatResize($event)"
+        ></div>
         <div class="chat-rail" x-show="full && chatOpen" @pointerdown="release()" @mousedown="release()">
           <div
             x-component="mjs-chat"
@@ -1080,7 +1135,7 @@ const App = () => ({
             :show-history="false"
             :show-agent="false"
             :show-goto="false"
-            :show-visibility="false"
+            :show-visibility="true"
             :show-starters="false"
             :show-status="true"
           >
@@ -1182,6 +1237,11 @@ if (!window.__DESKTOP_ONCE__) {
     } else if (ui.selectedContainer) {
       ui.selectedContainer = null
       try { M.redraw() } catch {}
+    }
+  }, true)
+  window.addEventListener('contextmenu', (ev) => {
+    if (ev.target?.closest?.('.rfb-fly, .screen, .ws-thumb, .desktop-nest')) {
+      ev.preventDefault()
     }
   }, true)
   window.addEventListener('pointerdown', onOutsideDesktop, true)

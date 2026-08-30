@@ -20,6 +20,19 @@ export const formatToolArgs = (args) => {
   }
 }
 
+/** Caption for a tool_result that attached an image (no base64 in the UI). */
+export const toolResultImageNote = (msg) => {
+  const img = msg?.image
+  if (!img || typeof img !== 'object') return ''
+  const mime = String(img.mimeType || 'image')
+  const bytes = Number(img.bytes)
+  if (Number.isFinite(bytes) && bytes > 0) {
+    const kib = bytes >= 1024 ? `${(bytes / 1024).toFixed(bytes >= 10240 ? 0 : 1)} KiB` : `${bytes} B`
+    return `${mime} · ${kib}`
+  }
+  return mime
+}
+
 /** Explanation for a tool_call bubble (top-level or args.explanation). */
 export const toolCallExplanation = (msg) => {
   if (!msg) return ''
@@ -105,6 +118,7 @@ const metricChip = (icon, text) =>
 
 /** HTML metrics row with Phosphor icons (message gutter). */
 export const formatTelemetryHtml = (t, msg) => {
+  if (msg?.kind === 'reasoning') return ''
   const chips = []
   if (t && typeof t === 'object') {
     if (t.tok_per_sec != null && Number.isFinite(Number(t.tok_per_sec))) {
@@ -180,4 +194,107 @@ export const coerceFlag = (v, fallback) => {
   if (v === true || v === 'true' || v === '') return true
   if (v == null) return fallback
   return Boolean(v)
+}
+
+const BUBBLE_STICK_GAP = 24
+
+const syncBubbleFade = (el) => {
+  if (!el?.dataset) return
+  const overflow = el.scrollHeight - el.clientHeight > 2
+  if (overflow && el.scrollTop > 2) el.dataset.scrolled = '1'
+  else delete el.dataset.scrolled
+}
+
+const clickOnScrollbar = (ev, el) => {
+  if (!el) return false
+  const yBar = el.offsetHeight > el.clientHeight
+  const xBar = el.offsetWidth > el.clientWidth
+  if (yBar && ev.offsetX >= el.clientWidth) return true
+  if (xBar && ev.offsetY >= el.clientHeight) return true
+  return false
+}
+
+/** Inner overflow regions in a transcript (tool/reasoning bodies). */
+export const bubbleScrollSelector = '.mjs-chat .bubble-scroll'
+
+export const onBubbleScroll = (ev, msg) => {
+  const el = ev?.currentTarget
+  if (!el) return
+  const gap = el.scrollHeight - el.scrollTop - el.clientHeight
+  const stick = gap < BUBBLE_STICK_GAP
+  el._stick = stick
+  if (msg) msg.scrollStick = stick
+  syncBubbleFade(el)
+}
+
+export const toggleBubbleCollapse = (msg) => {
+  if (!msg) return
+  msg.collapsed = !msg.collapsed
+}
+
+export const toggleBubbleExpand = (ev, msg) => {
+  if (!ev || !msg) return
+  const el = ev.currentTarget
+  if (clickOnScrollbar(ev, el)) return
+  const sel = typeof window !== 'undefined' ? window.getSelection?.() : null
+  if (sel && String(sel).length && el?.contains?.(sel.anchorNode)) return
+  msg.expanded = !msg.expanded
+  const stick = msg.scrollStick !== false && el?._stick !== false
+  if (stick && el) {
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight
+      syncBubbleFade(el)
+    })
+  }
+}
+
+export const pinBubbleScroll = (el) => {
+  if (!el) return
+  if (el._stick !== false) el.scrollTop = el.scrollHeight
+  syncBubbleFade(el)
+}
+
+export const stickBubbleScrolls = (root) => {
+  if (!root || typeof root.querySelectorAll !== 'function') return
+  for (const el of root.querySelectorAll('.bubble-scroll')) pinBubbleScroll(el)
+}
+
+/**
+ * Keep overflow bubbles pinned to the bottom across first layout, x-show,
+ * and later content growth — unless the user scrolled away.
+ */
+export const watchBubbleScrolls = (root) => {
+  if (!root || typeof root.querySelectorAll !== 'function') return null
+  if (root._bubbleWatch) {
+    root._bubbleWatch.scan()
+    return root._bubbleWatch
+  }
+  const ro = new ResizeObserver((entries) => {
+    for (const e of entries) pinBubbleScroll(e.target)
+  })
+  const watch = (el) => {
+    if (!el?.classList?.contains('bubble-scroll')) return
+    if (el._bubbleWatched) {
+      pinBubbleScroll(el)
+      return
+    }
+    el._bubbleWatched = true
+    ro.observe(el)
+    pinBubbleScroll(el)
+  }
+  const scan = () => {
+    for (const el of root.querySelectorAll('.bubble-scroll')) watch(el)
+  }
+  const mo = new MutationObserver(scan)
+  mo.observe(root, { childList: true, subtree: true, characterData: true })
+  scan()
+  requestAnimationFrame(() => {
+    scan()
+    requestAnimationFrame(scan)
+  })
+  setTimeout(scan, 0)
+  setTimeout(scan, 50)
+  setTimeout(scan, 200)
+  root._bubbleWatch = { ro, mo, scan }
+  return root._bubbleWatch
 }

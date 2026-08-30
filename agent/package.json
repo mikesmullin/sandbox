@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Angela harness that owns a Debian XFCE desktop (tools run in-container).",
   "scripts": {
-    "start": "bun src/server.coffee"
+    "start": "bun src/server.coffee",
+    "test": "bun test"
   },
   "dependencies": {
     "agl-ai": "link:agl-ai",

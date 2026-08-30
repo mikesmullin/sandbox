@@ -21,6 +21,12 @@ import {
   shortModel as shortModelHelper,
   toolCallCode as toolCallCodeHelper,
   toolCallExplanation as toolCallExplanationHelper,
+  toolResultImageNote as toolResultImageNoteHelper,
+  onBubbleScroll as onBubbleScrollHelper,
+  toggleBubbleExpand as toggleBubbleExpandHelper,
+  toggleBubbleCollapse as toggleBubbleCollapseHelper,
+  stickBubbleScrolls as stickBubbleScrollsHelper,
+  watchBubbleScrolls as watchBubbleScrollsHelper,
 } from './helpers.js'
 import { chatTpl } from './templates.js'
 
@@ -340,6 +346,10 @@ export function registerChat(M, opts = {}) {
       if (this.s?.toolCallCode) return this.s.toolCallCode(msg)
       return toolCallCodeHelper(msg)
     },
+    toolResultImageNote(msg) {
+      if (this.s?.toolResultImageNote) return this.s.toolResultImageNote(msg)
+      return toolResultImageNoteHelper(msg)
+    },
     formatToolArgs(args) {
       if (this.s?.formatToolArgs) return this.s.formatToolArgs(args)
       return formatToolArgs(args)
@@ -352,11 +362,32 @@ export function registerChat(M, opts = {}) {
       if (this.s?.renderMarkdown) return this.s.renderMarkdown(text)
       return renderMarkdownHelper(text, mdOpts)
     },
+    onBubbleScroll(ev, msg) {
+      if (this.s?.onBubbleScroll) return this.act('onBubbleScroll', ev, msg)
+      return onBubbleScrollHelper(ev, msg)
+    },
+    toggleBubbleExpand(ev, msg) {
+      if (this.s?.toggleBubbleExpand) return this.act('toggleBubbleExpand', ev, msg)
+      return toggleBubbleExpandHelper(ev, msg)
+    },
+    toggleBubbleCollapse(msg) {
+      if (this.s?.toggleBubbleCollapse) return this.act('toggleBubbleCollapse', msg)
+      return toggleBubbleCollapseHelper(msg)
+    },
+    stickBubbleScrolls() {
+      if (this.s?.stickBubbleScrolls) return this.act('stickBubbleScrolls')
+      const el = typeof document !== 'undefined' && document.getElementById(this.ids.messages)
+      stickBubbleScrollsHelper(el)
+    },
 
     init() {
       queueMicrotask(() => {
         this.syncOwnSelects()
         this.s?.ensureMessagesPinned?.()
+        const el = typeof document !== 'undefined' && document.getElementById(this.ids.messages)
+        if (!el) return
+        watchBubbleScrollsHelper(el)
+        this.stickBubbleScrolls()
       })
     },
 

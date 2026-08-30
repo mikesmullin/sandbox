@@ -34,6 +34,8 @@ desktop-N  (Debian bookworm)
 
 Tools run **inside the pod**. Durable work lives in `/workspace/jails/<workspace-id>/` (emptyDir). Do not paste secrets into chat — type them on the desktop.
 
+Host coordinator **ada** hires these PCs through MCP `/workspace/mcp/sandbox` (`agents_discover` / `spawn` / `message` / `wait` / `status` / `cancel`). Spawn hits the in-pod job HTTP API (`POST /workspaces/:id/jobs` → 202) via the dashboard at `:8080`, or `kubectl port-forward` if the SPA is down. Jobs share the chat `runLock` (abort-on-new-chat). That MCP is host-only — it is not in the desktop image.
+
 GitLab (in-cluster): `http://gitlab` (same-namespace DNS; FQDN `gitlab.agent-desktop.svc.cluster.local` also works)  
 UI: `root` — password is `tmp/gitlab_password.md` on the host (gitignored)  
 git CLI: credential helper already set; do not type the password in chat

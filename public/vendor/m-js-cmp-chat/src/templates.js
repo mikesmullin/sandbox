@@ -27,54 +27,121 @@ export const messageBlockTpl = `
       x-show="msg.kind === 'assistant' && !msg.streaming"
       x-html="renderMarkdown(msg.text)"
     ></div>
+    <div
+      class="bubble-error"
+      x-show="msg.kind === 'error'"
+      x-text="msg.text"
+    ></div>
 
     <div
       class="bubble-reasoning"
       x-show="msg.kind === 'reasoning'"
-      :class="{ 'is-streaming': msg.streaming }"
+      :class="{ 'is-streaming': msg.streaming, 'is-collapsed': msg.collapsed }"
     >
-      <div class="reasoning-header">
+      <div
+        class="reasoning-header bubble-fold-header"
+        title="Click to collapse or expand"
+        @click.stop="toggleBubbleCollapse(msg)"
+      >
+        <i
+          class="ph bubble-fold-caret"
+          :class="msg.collapsed ? 'ph-caret-right' : 'ph-caret-down'"
+          aria-hidden="true"
+        ></i>
         <i class="ph ph-brain reasoning-icon" aria-hidden="true"></i>
         <span class="reasoning-label">Reasoning</span>
       </div>
-      <div class="reasoning-body" x-text="msg.text || ''"></div>
+      <div
+        class="reasoning-body bubble-scroll"
+        x-show="!msg.collapsed"
+        :class="{ 'is-expanded': msg.expanded }"
+        x-text="msg.text || ''"
+        title="Click to show more lines"
+        @click="toggleBubbleExpand($event, msg)"
+        @scroll.passive="onBubbleScroll($event, msg)"
+      ></div>
     </div>
 
-    <div class="tool-card tool-call-card" x-show="msg.kind === 'tool_call'">
-      <div class="tool-call-header">
-        <i class="ph ph-terminal-window tool-icon" aria-hidden="true"></i>
+    <div
+      class="tool-card tool-call-card"
+      x-show="msg.kind === 'tool_call'"
+      :class="{ 'is-collapsed': msg.collapsed }"
+    >
+      <div
+        class="tool-call-header bubble-fold-header"
+        title="Click to collapse or expand"
+        @click.stop="toggleBubbleCollapse(msg)"
+      >
+        <i
+          class="ph bubble-fold-caret"
+          :class="msg.collapsed ? 'ph-caret-right' : 'ph-caret-down'"
+          aria-hidden="true"
+        ></i>
+        <i class="ph ph-wrench tool-icon" aria-hidden="true"></i>
         <span class="tool-call-name" x-text="msg.name"></span>
       </div>
       <div
         class="tool-call-explanation"
-        x-show="toolCallExplanation(msg)"
+        x-show="!msg.collapsed && toolCallExplanation(msg)"
         x-text="toolCallExplanation(msg)"
       ></div>
       <pre
-        class="tool-call-code"
-        x-show="toolCallCode(msg)"
+        class="tool-call-code bubble-scroll"
+        :class="{ 'is-expanded': msg.expanded }"
+        x-show="!msg.collapsed && toolCallCode(msg)"
         x-text="toolCallCode(msg)"
+        title="Click to show more lines"
+        @click="toggleBubbleExpand($event, msg)"
+        @scroll.passive="onBubbleScroll($event, msg)"
+      ></pre>
+      <pre
+        class="tool-call-progress bubble-scroll"
+        x-show="!msg.collapsed && msg.progress"
+        :class="{ 'is-streaming': msg.streaming, 'is-expanded': msg.expanded }"
+        x-text="msg.progress"
+        title="Click to show more lines"
+        @click="toggleBubbleExpand($event, msg)"
+        @scroll.passive="onBubbleScroll($event, msg)"
       ></pre>
     </div>
 
     <div
       class="tool-card tool-card-row"
       x-show="msg.kind === 'tool_result'"
-      :class="msg.ok === false ? 'err' : 'ok'"
+      :class="(msg.ok === false ? 'err' : 'ok') + (msg.collapsed ? ' is-collapsed' : '')"
     >
-      <i
-        class="ph tool-icon"
-        :class="msg.ok === false ? 'ph-x-circle' : 'ph-check-circle'"
-        aria-hidden="true"
-      ></i>
-      <span x-text="msg.name"></span>
-      <span x-show="want('showDenied') && msg.denied" class="text-red-400"> DENIED</span>
-      <span
-        class="tool-size"
-        x-show="msg.full_chars"
-        x-text="(msg.full_chars || 0).toLocaleString() + ' B'"
-      ></span>
-      <pre class="tool-result-body" x-text="msg.text || ''"></pre>
+      <div
+        class="tool-result-header bubble-fold-header"
+        title="Click to collapse or expand"
+        @click.stop="toggleBubbleCollapse(msg)"
+      >
+        <i
+          class="ph bubble-fold-caret"
+          :class="msg.collapsed ? 'ph-caret-right' : 'ph-caret-down'"
+          aria-hidden="true"
+        ></i>
+        <i
+          class="ph tool-icon"
+          :class="msg.ok === false ? 'ph-x-circle' : 'ph-check-circle'"
+          aria-hidden="true"
+        ></i>
+        <span x-text="msg.name"></span>
+        <span x-show="want('showDenied') && msg.denied" class="text-red-400"> DENIED</span>
+        <span
+          class="tool-image-note"
+          x-show="toolResultImageNote(msg)"
+          x-text="toolResultImageNote(msg)"
+        ></span>
+      </div>
+      <pre
+        class="tool-result-body bubble-scroll"
+        :class="{ 'is-expanded': msg.expanded }"
+        x-show="!msg.collapsed"
+        x-text="msg.text || ''"
+        title="Click to show more lines"
+        @click="toggleBubbleExpand($event, msg)"
+        @scroll.passive="onBubbleScroll($event, msg)"
+      ></pre>
     </div>
 
     <div
@@ -99,7 +166,7 @@ export const messageBlockTpl = `
 
     <div
       class="msg-gutter"
-      x-show="want('showVisibility') || want('showGoto') || msg.telemetry || msg.kind === 'user'"
+      x-show="want('showVisibility') || want('showGoto') || msg.kind === 'user' || (msg.telemetry && msg.kind !== 'reasoning')"
     >
       <div class="msg-gutter-actions">
         <button
@@ -145,7 +212,7 @@ export const messageBlockTpl = `
       </div>
       <div
         class="msg-gutter-metrics"
-        x-show="msg.telemetry || msg.kind === 'user'"
+        x-show="msg.kind === 'user' || (msg.telemetry && msg.kind !== 'reasoning')"
         x-html="formatTelemetryHtml(msg.telemetry, msg)"
       ></div>
     </div>
@@ -371,7 +438,6 @@ export const transcriptTpl = `
     <div class="thinking" x-show="waiting">
       Thinking <span>•</span><span>•</span><span>•</span>
     </div>
-    <div class="chat-err" x-show="error" x-text="error"></div>
   </div>
 `
 

@@ -61,28 +61,45 @@ agentUnreachable = (err) ->
   /socket connection was closed|ECONNRESET|ECONNREFUSED|Connection ended|Unable to connect/i.test msg
 
 fetchAgent = (target, path, opts = {}) ->
-  fetch "http://#{target.host}:#{target.agentPort or 8091}#{path}",
+  init =
     method: opts.method or 'GET'
-    signal: opts.signal
+  init.signal = opts.signal if opts.signal?
+  headers = {}
+  if opts.headers
+    for k, v of opts.headers
+      headers[k] = v if v?
+  if opts.body?
+    headers['content-type'] or= 'application/json'
+    init.body = if typeof opts.body is 'string' then opts.body else JSON.stringify opts.body
+  init.headers = headers if Object.keys(headers).length
+  fetch "http://#{target.host}:#{target.agentPort or 8091}#{path}", init
+
+agentFetchOpts = (req, opts = {}) ->
+  method = opts.method or req.method
+  body = opts.body
+  if body is undefined and method not in ['GET', 'HEAD', 'DELETE']
+    body = if req.body? then req.body else {}
+  out = { method, signal: opts.signal }
+  out.body = body if body isnt undefined and method not in ['GET', 'HEAD', 'DELETE']
+  out
 
 proxyAgent = (req, res, path, opts = {}) ->
   name = req.params.name
+  fetchOpts = agentFetchOpts req, opts
   target = await resolveTarget name
   r = null
   try
-    r = await fetchAgent target, path, { method: opts.method or req.method, signal: opts.signal }
+    r = await fetchAgent target, path, fetchOpts
   catch err
     if IN_CLUSTER or not agentUnreachable err
       throw Object.assign err, { status: 502 }
     console.warn "[api] agent #{name}#{path} dead forward, retrying"
     dropForward name
     target = await resolveTarget name
-    r = await fetchAgent target, path, { method: opts.method or req.method, signal: opts.signal }
+    r = await fetchAgent target, path, fetchOpts
   unless opts.raw
     body = await r.json().catch -> { error: 'bad agent response' }
-    unless r.ok
-      return res.status(r.status).json body
-    return res.json body
+    return res.status(r.status).json body
   buf = Buffer.from await r.arrayBuffer()
   res.status(r.status)
   r.headers.forEach (v, k) ->
@@ -205,6 +222,40 @@ app.post '/api/desktops/:name/workspaces/:id/focus', (req, res) ->
 app.get '/api/desktops/:name/workspaces/:id/thumb', (req, res) ->
   try
     await proxyAgent req, res, "/workspaces/#{encodeURIComponent req.params.id}/thumb", { raw: true }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+jobPath = (req, extra = '') ->
+  ws = encodeURIComponent req.params.id
+  base = "/workspaces/#{ws}/jobs"
+  return base unless extra
+  "#{base}/#{extra}"
+
+app.get '/api/desktops/:name/workspaces/:id/jobs', (req, res) ->
+  try
+    await proxyAgent req, res, jobPath req
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.post '/api/desktops/:name/workspaces/:id/jobs', (req, res) ->
+  try
+    await proxyAgent req, res, jobPath(req), { method: 'POST' }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.get '/api/desktops/:name/workspaces/:id/jobs/:task_id', (req, res) ->
+  try
+    await proxyAgent req, res, jobPath req, encodeURIComponent req.params.task_id
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.post '/api/desktops/:name/workspaces/:id/jobs/:task_id/abort', (req, res) ->
+  try
+    await proxyAgent req, res, jobPath(req, "#{encodeURIComponent req.params.task_id}/abort"), { method: 'POST' }
   catch err
     code = err.status or 502
     res.status(code).json { error: 'agent not reachable' }

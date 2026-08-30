@@ -10,9 +10,13 @@ import {
 } from './workspaces.coffee'
 import {
   ensureRoom, destroyRoom, warmupRooms, fetchModels,
-  attachClient, detachClient, healthSessions,
+  attachClient, detachClient, healthSessions, getRoom,
   handleChat, handleAbort, handleAllowlist, handleModel, handleApproval,
+  handleVisible,
 } from './rooms.coffee'
+import {
+  createJob, getJob, listJobs, abortJob, workspaceBusy,
+} from './jobs.mjs'
 
 PORT = Number process.env.AGENT_PORT or 8091
 MODEL = process.env.AGENT_MODEL or 'llama-server:default'
@@ -22,6 +26,16 @@ DAD_KEY = process.env.DAD_PROXY_API_KEY or process.env.LLM_PROXY_API_KEY or proc
 withRoom = (ws, id) ->
   name = ws.data?.workspace or id
   await ensureRoom name
+
+enrichWorkspaces = (listed) ->
+  for w in listed.workspaces or []
+    room = getRoom w.id
+    w.session_id = room?.session?.id or w.sessionId or null
+    w.busy = workspaceBusy room
+  listed
+
+readJson = (req) ->
+  req.json().catch -> {}
 
 Bun.serve
   port: PORT
@@ -46,7 +60,7 @@ Bun.serve
         return Response.json { error: err.message or String(err) }, { status: 500 }
     if url.pathname is '/workspaces' and req.method is 'GET'
       try
-        return Response.json listWorkspaces()
+        return Response.json enrichWorkspaces listWorkspaces()
       catch err
         return Response.json { error: err.message or String(err) }, { status: 500 }
     if url.pathname is '/workspaces' and req.method is 'POST'
@@ -56,12 +70,12 @@ Bun.serve
           await ensureRoom listed.current
         catch err
           console.error '[agent] ensure room', listed.current, err.message or err
-        return Response.json listWorkspaces()
+        return Response.json enrichWorkspaces listWorkspaces()
       catch err
         return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
     if url.pathname is '/workspaces/scan' and req.method is 'POST'
       try
-        return Response.json resumeScan()
+        return Response.json enrichWorkspaces resumeScan()
       catch err
         return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
     wsDel = url.pathname.match /^\/workspaces\/([^/]+)\/?$/
@@ -75,13 +89,13 @@ Bun.serve
             console.error '[agent] destroy room', listed.dropped, err.message or err
         delete listed.dropped
         delete listed.droppedTargetId
-        return Response.json listed
+        return Response.json enrichWorkspaces listed
       catch err
         return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
     wsFocus = url.pathname.match /^\/workspaces\/([^/]+)\/focus\/?$/
     if wsFocus and req.method is 'POST'
       try
-        return Response.json focusWorkspace decodeURIComponent wsFocus[1]
+        return Response.json enrichWorkspaces focusWorkspace decodeURIComponent wsFocus[1]
       catch err
         return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
     wsThumb = url.pathname.match /^\/workspaces\/([^/]+)\/thumb\/?$/
@@ -93,6 +107,42 @@ Bun.serve
         return new Response got.file, { headers: { 'content-type': 'image/png', 'cache-control': 'no-store' } }
       catch err
         return Response.json { error: err.message or String(err) }, { status: 500 }
+    wsJobAbort = url.pathname.match /^\/workspaces\/([^/]+)\/jobs\/([^/]+)\/abort\/?$/
+    if wsJobAbort and req.method is 'POST'
+      try
+        room = await ensureRoom decodeURIComponent wsJobAbort[1]
+        body = await readJson req
+        job = await abortJob room, decodeURIComponent(wsJobAbort[2]), body.reason or 'abort'
+        return Response.json job
+      catch err
+        return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
+    wsJob = url.pathname.match /^\/workspaces\/([^/]+)\/jobs\/([^/]+)\/?$/
+    if wsJob and req.method is 'GET'
+      try
+        room = await ensureRoom decodeURIComponent wsJob[1]
+        job = getJob room, decodeURIComponent wsJob[2]
+        unless job?
+          return Response.json { error: 'job not found' }, { status: 404 }
+        return Response.json job
+      catch err
+        return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
+    wsJobs = url.pathname.match /^\/workspaces\/([^/]+)\/jobs\/?$/
+    if wsJobs and req.method is 'GET'
+      try
+        room = await ensureRoom decodeURIComponent wsJobs[1]
+        return Response.json { jobs: listJobs room }
+      catch err
+        return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
+    if wsJobs and req.method is 'POST'
+      try
+        room = await ensureRoom decodeURIComponent wsJobs[1]
+        body = await readJson req
+        created = await createJob room,
+          goal: body.goal
+          task_id: body.task_id or body.taskId
+        return Response.json created, { status: 202 }
+      catch err
+        return Response.json { error: err.message or String(err) }, { status: err.status or 400 }
     upgrade = req.headers.get('upgrade')?.toLowerCase() is 'websocket'
     wsRoom = url.pathname.match /^\/workspaces\/([^/]+)\/ws\/?$/
     if wsRoom and upgrade
@@ -133,6 +183,7 @@ Bun.serve
                 .then -> handleModel room, msg
                 .catch (err) -> console.error "[agent #{room.name}]", err.message or err
             when 'approval' then handleApproval room, msg
+            when 'visible' then handleVisible room, msg
             else ws.send JSON.stringify { type: 'error', error: "unknown type #{msg.type}" }
         .catch (err) ->
           try ws.send JSON.stringify { type: 'error', error: err.message or String(err) }

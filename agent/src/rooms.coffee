@@ -15,6 +15,7 @@ import {
   hexOf, setRoomMeta, resolveName, loadState,
   ensureJail, removeJail,
 } from './workspaces.coffee'
+import { loadJobsIntoRoom, useWorkspacePersist } from './jobs.mjs'
 
 MCP_ROOT = process.env.ANGELA_MCP_ROOT or '/opt/mcp'
 GITLAB_URL = process.env.GITLAB_URL or 'http://gitlab'
@@ -27,12 +28,16 @@ CDP_TARGET = String(process.env.AGENT_BROWSER_CDP or CDP_PORT)
 DISPLAY = process.env.DISPLAY or ':99'
 CONTEXT_LOOP = new Set ['goto', 'loop_start_marker', 'waypoint']
 
+useWorkspacePersist { hexOf, setRoomMeta, loadState }
+
 export allowlistText = """
 #{DEFAULT_LUCY_ALLOWLIST}
 
-# file write (coding)
+# file write / edit (coding)
 file_io__write_file
 file_io__write_file:.*
+file_io__edit
+file_io__edit:.*
 
 # headed browser-use Chromium (agent-browser MCP)
 browser__.*
@@ -58,7 +63,8 @@ Your file-io jail and term-local cwd is #{jail}. Durable work lives there.
 Sibling screens have their own jails under the same /workspace/jails/ volume.
 Do not write into /workspace itself.
 
-Use file-io tools to read and write files under #{jail}.
+Use file-io tools under #{jail}: list_dir, read_file (text + images),
+write_file, edit, grep, find, stat. Prefer grep/find over shell search.
 Use term-local exec for host commands (argv spawn, no shell metacharacters —
 pass the binary in `command` and arguments in `args`, set `cwd` when needed).
 Do not use term_local__bash — that overlay cannot write the jail (EROFS).
@@ -132,6 +138,18 @@ cloneTelemetry = (t) ->
   catch
     Object.assign {}, t
 
+looksLikeProviderDump = (text) ->
+  t = String(text or '').trim()
+  t.startsWith('{') and /"choices"\s*:/.test(t) and /"usage"\s*:/.test(t)
+
+clipText = (s, n = 8000) ->
+  t = String(s or '')
+  if t.length > n then t.slice(0, n) else t
+
+clipTail = (s, n = 8000) ->
+  t = String(s or '')
+  if t.length > n then t.slice(-n) else t
+
 gotoFromMeta = (wrap) ->
   g = wrap?.meta?.goto
   unless g and typeof g is 'object'
@@ -172,7 +190,20 @@ messagesFromLog = (room) ->
         text: String(p.text or p.content or '')
         visible: wrap.meta?.visible isnt false
         streaming: no
-        telemetry: cloneTelemetry(wrap.meta?.telemetry or frozen or lastGen)
+        telemetry: null
+        goto: gotoFromMeta wrap
+    else if wrap.event_type is 'error' and (p.message or p.error or p.text)
+      errText = String(p.message or p.error or p.text or 'agent error')
+      unless errText.startsWith 'Error:'
+        errText = "Error: #{errText}"
+      messages.push
+        id: wrap.event_id or "#{id}-err-#{messages.length}"
+        eventId: wrap.event_id or null
+        kind: 'error'
+        text: errText
+        visible: yes
+        streaming: no
+        telemetry: null
         goto: gotoFromMeta wrap
     else if wrap.event_type is 'tool_call' and p.name
       messages.push
@@ -188,7 +219,7 @@ messagesFromLog = (room) ->
         full_chars: p.full_chars
         truncated: p.truncated
         goto: gotoFromMeta wrap
-    else if wrap.event_type is 'tool_result' and (p.name or p.text?)
+    else if wrap.event_type is 'tool_result' and (p.name or p.text? or p.image)
       messages.push
         id: wrap.event_id or "#{id}-tr-#{messages.length}"
         eventId: wrap.event_id or null
@@ -203,6 +234,7 @@ messagesFromLog = (room) ->
         telemetry: cloneTelemetry(frozen or lastGen)
         full_chars: p.full_chars
         truncated: p.truncated
+        image: p.image or null
         goto: gotoFromMeta wrap
   messages
 
@@ -241,6 +273,18 @@ liveMessages = (room) ->
         reason: req.reason or ''
         status: 'pending'
         visible: yes
+  if room.error
+    errText = String room.error
+    unless errText.startsWith 'Error:'
+      errText = "Error: #{errText}"
+    unless messages.some((m) -> m.kind is 'error' and m.text is errText)
+      messages.push
+        id: "#{room.session?.id or room.name}-err"
+        kind: 'error'
+        text: errText
+        visible: yes
+        streaming: no
+        telemetry: null
   messages
 
 tokensOf = (room) ->
@@ -334,6 +378,7 @@ stripContextLoop = (sess) ->
   catalog = await sess.listToolCatalog()
   enabled = catalog.map((t) -> t.name).filter (n) ->
     return false if CONTEXT_LOOP.has n
+    # CONTEXT LOOP is opt-in MCP; still drop if a preset sneaks in.
     # just-bash OverlayFs cannot write the jail; git must use exec.
     return false if /term_local__bash/i.test n
     # Never let one workspace kill the shared Chromium process.
@@ -358,6 +403,40 @@ makeOnEvent = (room) ->
       room.liveReasoning = (room.liveReasoning or '') + chunk if chunk
       broadcastRoom room, { type, text: chunk }
       return
+    if type is 'tool_delta'
+      out = clipTail(ev.output or ev.text or '')
+      broadcastRoom room,
+        type: 'tool_delta'
+        name: ev.name or ev.tool
+        server: ev.server
+        progressToken: ev.progressToken
+        output: out
+        text: out
+      return
+    if type is 'reasoning'
+      broadcastRoom room,
+        type: 'card'
+        card:
+          kind: 'reasoning'
+          text: ev.text or ev.content or ''
+          eventId: ev.event_id or null
+          telemetry: cloneTelemetry(ev.telemetry)
+          visible: yes
+      return
+    if type is 'final'
+      text = String(ev.result or '')
+      if looksLikeProviderDump text then text = ''
+      room.liveAssistant = ''
+      broadcastRoom room,
+        type: 'card'
+        card:
+          kind: 'assistant'
+          text: text
+          streaming: no
+          eventId: ev.event_id or null
+          telemetry: cloneTelemetry(ev.telemetry)
+          visible: yes
+      return
     if type is 'tool_call'
       room.liveAssistant = ''
       room.liveReasoning = ''
@@ -368,6 +447,7 @@ makeOnEvent = (room) ->
           name: ev.name or ev.tool
           args: ev.args or {}
           explanation: ev.explanation or null
+          eventId: ev.event_id or null
       return
     if type is 'tool_result'
       broadcastRoom room,
@@ -376,7 +456,13 @@ makeOnEvent = (room) ->
           kind: 'tool_result'
           name: ev.name or ev.tool
           ok: ev.ok isnt false
-          text: String(ev.text or '').slice 0, 8000
+          denied: Boolean ev.denied
+          text: clipText(ev.text or '')
+          explanation: ev.explanation or null
+          eventId: ev.event_id or null
+          full_chars: ev.full_chars
+          truncated: ev.truncated
+          image: ev.image or null
       return
     if type is 'aborted'
       markIdle room
@@ -492,11 +578,14 @@ doEnsure = (name) ->
     error: ''
     liveAssistant: ''
     liveReasoning: ''
+    jobs: new Map()
   }
   room.targetId = targetId or room.targetId
   room.jail = jail
   room.clients ?= new Set()
+  room.jobs ?= new Map()
   seedUi room
+  loadJobsIntoRoom room
   rooms.set name, room
 
   if targetId
@@ -681,6 +770,24 @@ export handleApproval = (room, msg) ->
   decision = msg.decision or msg.action or 'deny'
   room?.approvals?.resolve id, decision
   broadcastRoom room, { type: 'approval', id, decision }
+
+export handleVisible = (room, msg) ->
+  eventId = String(msg.eventId or msg.event_id or '')
+  return unless eventId
+  vis = Boolean msg.visible
+  store = room.harness?.sessionStore
+  sess = room.session
+  unless store?.setEventVisible and sess?.id
+    return
+  result = store.setEventVisible sess.id, eventId, vis
+  return unless result
+  try
+    sess.setContextVisible? result.eventIds, vis
+  broadcastRoom room,
+    type: 'visible'
+    eventId: eventId
+    eventIds: result.eventIds or [eventId]
+    visible: vis
 
 export attachClient = (ws, id) ->
   room = await ensureRoom id

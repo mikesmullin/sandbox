@@ -9,4 +9,10 @@ export {
   shortModel,
   toolCallCode,
   toolCallExplanation,
+  toolResultImageNote,
+  onBubbleScroll,
+  toggleBubbleExpand,
+  toggleBubbleCollapse,
+  stickBubbleScrolls,
+  watchBubbleScrolls,
 } from './helpers.js'

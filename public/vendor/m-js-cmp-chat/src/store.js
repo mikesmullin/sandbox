@@ -14,7 +14,41 @@ import {
   renderMarkdown,
   toolCallCode,
   toolCallExplanation,
+  toolResultImageNote,
+  onBubbleScroll,
+  toggleBubbleExpand,
+  toggleBubbleCollapse,
+  stickBubbleScrolls as stickBubbleScrollsHelper,
+  watchBubbleScrolls as watchBubbleScrollsHelper,
 } from './helpers.js'
+
+const looksLikeProviderDump = (text) => {
+  const t = String(text || '').trim()
+  return t.startsWith('{') && /"choices"\s*:/.test(t) && /"usage"\s*:/.test(t)
+}
+
+/** tool_call ↔ tool_result FIFO pair (providers need both sides). */
+const visibilityGroup = (messages, msg) => {
+  if (!msg) return []
+  if (msg.kind !== 'tool_call' && msg.kind !== 'tool_result') return [msg]
+  const pending = new Map()
+  const partnerOf = new Map()
+  for (const m of messages || []) {
+    if (m.kind === 'tool_call' && m.name) {
+      if (!pending.has(m.name)) pending.set(m.name, [])
+      pending.get(m.name).push(m)
+    } else if (m.kind === 'tool_result' && m.name) {
+      const q = pending.get(m.name)
+      if (q?.length) {
+        const call = q.shift()
+        partnerOf.set(call, m)
+        partnerOf.set(m, call)
+      }
+    }
+  }
+  const other = partnerOf.get(msg)
+  return other ? [msg, other] : [msg]
+}
 
 const proto = () => (typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss:' : 'ws:')
 
@@ -64,7 +98,7 @@ export function wsTransport(opts = {}) {
       })
       ws.addEventListener('error', () => {
         if (store._ws !== ws) return
-        store.error = 'agent socket error'
+        applyIncoming(store, { type: 'error', error: 'agent socket error' })
       })
     },
     send(store, payload) {
@@ -95,6 +129,13 @@ export function wsTransport(opts = {}) {
     approve(store, id, decision) {
       try {
         store._ws?.send(JSON.stringify({ type: 'approval', id, decision }))
+      } catch {
+        /* ignore */
+      }
+    },
+    setVisible(store, eventId, visible) {
+      try {
+        store._ws?.send(JSON.stringify({ type: 'visible', eventId, visible: Boolean(visible) }))
       } catch {
         /* ignore */
       }
@@ -279,7 +320,37 @@ export function applyIncoming(store, msg) {
     }
     store._lastGenInfo = cloneTelemetry(t)
     store.freezeTelemetryOnLast?.('assistant')
-    store.freezeTelemetryOnLast?.('reasoning')
+    return
+  }
+  if (msg.type === 'tool_delta') {
+    const chunk = msg.output || msg.text || ''
+    const want = msg.name || ''
+    let row = null
+    for (let i = store.messages.length - 1; i >= 0; i--) {
+      const m = store.messages[i]
+      if (m.kind !== 'tool_call') continue
+      if (want && m.name && m.name !== want) continue
+      row = m
+      break
+    }
+    if (!row) {
+      row = {
+        id: crypto.randomUUID(),
+        kind: 'tool_call',
+        name: msg.name || 'tool',
+        args: {},
+        explanation: '',
+        text: '',
+        progress: '',
+        streaming: true,
+        visible: true,
+        telemetry: null,
+      }
+      store.messages.push(row)
+    }
+    row.progress = chunk
+    row.streaming = true
+    store.scrollBottom?.()
     return
   }
   if (msg.type === 'approval_needed') {
@@ -304,6 +375,34 @@ export function applyIncoming(store, msg) {
       for (const m of store.messages) {
         if ((m.kind === 'assistant' || m.kind === 'reasoning') && m.streaming) m.streaming = false
       }
+      if (c.kind === 'tool_call') {
+        const want = c.name || ''
+        for (let i = store.messages.length - 1; i >= 0; i--) {
+          const m = store.messages[i]
+          if (m.kind !== 'tool_call') continue
+          if (want && m.name && m.name !== want) continue
+          const emptyArgs = !m.args || !Object.keys(m.args).length
+          if (emptyArgs && (m.streaming || m.progress)) {
+            m.name = c.name || m.name
+            m.args = c.args || {}
+            m.explanation = c.explanation || m.explanation || ''
+            if (c.eventId) m.eventId = c.eventId
+            store.scrollBottom?.()
+            return
+          }
+          break
+        }
+      }
+      if (c.kind === 'tool_result') {
+        const want = c.name || ''
+        for (let i = store.messages.length - 1; i >= 0; i--) {
+          const m = store.messages[i]
+          if (m.kind === 'tool_call' && m.streaming && (!want || !m.name || m.name === want)) {
+            m.streaming = false
+            break
+          }
+        }
+      }
       store.messages.push({
         id: crypto.randomUUID(),
         kind: c.kind,
@@ -311,11 +410,43 @@ export function applyIncoming(store, msg) {
         args: c.args || {},
         explanation: c.explanation || '',
         text: c.text || '',
+        progress: c.progress || '',
         ok: c.ok,
-        full_chars: c.text ? String(c.text).length : 0,
+        denied: c.denied,
+        eventId: c.eventId || null,
+        full_chars: c.full_chars != null ? c.full_chars : (c.text ? String(c.text).length : 0),
+        truncated: Boolean(c.truncated),
+        image: c.image || null,
         visible: true,
-        telemetry: null,
+        telemetry: cloneTelemetry(c.telemetry || store._lastGenInfo),
       })
+      store.scrollBottom?.()
+      return
+    }
+    if (c.kind === 'reasoning') {
+      let live = null
+      for (let i = store.messages.length - 1; i >= 0; i--) {
+        if (store.messages[i].kind === 'reasoning' && store.messages[i].streaming) {
+          live = store.messages[i]
+          break
+        }
+      }
+      const finalText = c.text != null ? String(c.text) : ''
+      if (live) {
+        if (finalText) live.text = finalText
+        live.streaming = false
+        if (c.eventId) live.eventId = c.eventId
+      } else if (finalText.trim()) {
+        store.messages.push({
+          id: crypto.randomUUID(),
+          kind: 'reasoning',
+          text: finalText,
+          streaming: false,
+          visible: true,
+          eventId: c.eventId || null,
+          telemetry: null,
+        })
+      }
       store.scrollBottom?.()
       return
     }
@@ -327,11 +458,15 @@ export function applyIncoming(store, msg) {
           break
         }
       }
-      const finalText = c.text != null ? String(c.text) : ''
+      let finalText = c.text != null ? String(c.text) : ''
+      if (looksLikeProviderDump(finalText)) finalText = ''
       if (live) {
         if (finalText) live.text = finalText
         live.streaming = false
-        if (!live.telemetry && store._lastGenInfo) live.telemetry = cloneTelemetry(store._lastGenInfo)
+        if (c.eventId) live.eventId = c.eventId
+        if (!live.telemetry && (c.telemetry || store._lastGenInfo)) {
+          live.telemetry = cloneTelemetry(c.telemetry || store._lastGenInfo)
+        }
         if (!(live.text || '').trim()) {
           const idx = store.messages.indexOf(live)
           if (idx >= 0) store.messages.splice(idx, 1)
@@ -343,24 +478,46 @@ export function applyIncoming(store, msg) {
           text: finalText,
           streaming: false,
           visible: true,
-          telemetry: cloneTelemetry(store._lastGenInfo),
+          eventId: c.eventId || null,
+          telemetry: cloneTelemetry(c.telemetry || store._lastGenInfo),
         })
       }
       store.scrollBottom?.()
     }
     return
   }
+  if (msg.type === 'visible') {
+    const ids = new Set(
+      Array.isArray(msg.eventIds)
+        ? msg.eventIds
+        : msg.eventId
+          ? [msg.eventId]
+          : [],
+    )
+    if (!ids.size) return
+    const vis = Boolean(msg.visible)
+    for (const m of store.messages) {
+      if (m.eventId && ids.has(m.eventId)) m.visible = vis
+    }
+    return
+  }
   if (msg.type === 'error') {
-    store.error = msg.error || 'agent error'
+    const err = String(msg.error || 'agent error')
+    store.error = err
     store.waiting = false
     store.stopStopwatch?.({ freeze: true })
-    store.messages.push({
-      id: crypto.randomUUID(),
-      kind: 'assistant',
-      text: `Error: ${store.error}`,
-      visible: true,
-      telemetry: null,
-    })
+    const last = store.messages[store.messages.length - 1]
+    const text = err.startsWith('Error:') ? err : `Error: ${err}`
+    if (!(last && last.kind === 'error' && last.text === text)) {
+      store.messages.push({
+        id: crypto.randomUUID(),
+        kind: 'error',
+        text,
+        visible: true,
+        telemetry: null,
+      })
+    }
+    store.scrollBottom?.()
     return
   }
   if (msg.type === 'done' || msg.type === 'aborted') {
@@ -368,7 +525,6 @@ export function applyIncoming(store, msg) {
       if (m.streaming) m.streaming = false
     }
     store.freezeTelemetryOnLast?.('assistant')
-    store.freezeTelemetryOnLast?.('reasoning')
     store.waiting = false
     store._runStartedAt = 0
     store.stopStopwatch?.({ freeze: true })
@@ -668,12 +824,20 @@ export function createChatStore(M, opts = {}) {
       transport.approve(this, id, decision)
     },
 
+    toggleMsgVisible(msg) {
+      if (!msg) return
+      const next = msg.visible === false
+      for (const m of visibilityGroup(this.messages, msg)) m.visible = next
+      if (msg.eventId && this.connected) transport.setVisible?.(this, msg.eventId, next)
+    },
+
     handle(msg) {
       applyIncoming(this, msg)
     },
 
     toolCallExplanation,
     toolCallCode,
+    toolResultImageNote,
     formatToolArgs,
     formatTelemetryHtml,
     renderMarkdown,
@@ -684,11 +848,24 @@ export function createChatStore(M, opts = {}) {
       return document.getElementById(`${this.idPrefix}-messages`)
     },
 
+    onBubbleScroll,
+    toggleBubbleExpand,
+    toggleBubbleCollapse,
+    stickBubbleScrolls() {
+      const el = this.elMessages()
+      if (el) watchBubbleScrollsHelper(el)
+      stickBubbleScrollsHelper(el)
+    },
+
     scrollBottom(force) {
       if (!force && !this._stick) return
       const el = this.elMessages()
       if (!el) return
-      requestAnimationFrame(() => { el.scrollTop = el.scrollHeight })
+      watchBubbleScrollsHelper(el)
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight
+        stickBubbleScrollsHelper(el)
+      })
     },
 
     onMessagesScroll() {

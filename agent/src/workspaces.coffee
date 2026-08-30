@@ -7,8 +7,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, unlinkS
 
 DISPLAY = process.env.DISPLAY or ':99'
 THUMB_DIR = process.env.WS_THUMB_DIR or '/tmp/ws-thumbs'
-IDS_DIR = process.env.WS_IDS_DIR or '/workspace/.agent'
-IDS_FILE = "#{IDS_DIR}/workspaces.json"
+idsDir = -> process.env.WS_IDS_DIR or '/workspace/.agent'
+idsFile = -> "#{idsDir()}/workspaces.json"
 JAILS_ROOT = process.env.ANGELA_JAILS_ROOT or '/workspace/jails'
 CDP_PORT_FILE = process.env.BROWSER_USE_CDP_PORT_FILE or '/tmp/browser-use.cdp.port'
 MAX_WS = 8
@@ -84,7 +84,7 @@ waitMs = (ms) ->
 
 export loadState = ->
   try
-    raw = JSON.parse readFileSync IDS_FILE, 'utf8'
+    raw = JSON.parse readFileSync idsFile(), 'utf8'
     if Array.isArray raw
       slots = (String s for s in raw when HEX.test String s)
       return { slots, rooms: {} }
@@ -99,13 +99,13 @@ export loadState = ->
   { slots: [], rooms: {} }
 
 export saveState = (state) ->
-  mkdirSync IDS_DIR, { recursive: true }
+  mkdirSync idsDir(), { recursive: true }
   slots = (s for s in (state?.slots or []) when HEX.test s)
   rooms = {}
   for hex, meta of (state?.rooms or {})
     continue unless HEX.test hex
     rooms[hex] = meta if meta and typeof meta is 'object'
-  writeFileSync IDS_FILE, JSON.stringify({ slots, rooms }) + '\n'
+  writeFileSync idsFile(), JSON.stringify({ slots, rooms }) + '\n'
 
 loadSlots = -> loadState().slots
 
