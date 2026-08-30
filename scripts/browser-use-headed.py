@@ -84,14 +84,31 @@ async def main() -> int:
             f"--remote-debugging-port={PREFERRED_PORT}",
             "--remote-debugging-address=127.0.0.1",
             "--start-maximized",
-            "--disable-gpu",
-            "--disable-software-rasterizer",
+            "--ignore-gpu-blocklist",
+            "--enable-gpu",
+            "--enable-webgl",
+            "--enable-webgl2",
+            "--use-gl=angle",
+            "--use-angle=vulkan",
+            "--enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE",
         ],
         env={
             "DISPLAY": display,
             "HOME": os.environ.get("HOME", "/home/agent"),
             "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", "/tmp/runtime-agent"),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
+            **{
+                k: os.environ[k]
+                for k in (
+                    "LD_LIBRARY_PATH",
+                    "VK_ICD_FILENAMES",
+                    "__EGL_VENDOR_LIBRARY_DIRS",
+                    "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS",
+                    "NVIDIA_VISIBLE_DEVICES",
+                    "NVIDIA_DRIVER_CAPABILITIES",
+                )
+                if os.environ.get(k)
+            },
         },
     )
     await browser.start()

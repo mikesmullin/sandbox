@@ -32,7 +32,13 @@ desktop-N  (Debian bookworm)
              (llama-server:default, pasta IP 169.254.1.2)
 ```
 
-Tools run **inside the pod**. Durable work lives in `/workspace` (emptyDir). Do not paste secrets into chat — type them on the desktop.
+Tools run **inside the pod**. Durable work lives in `/workspace/jails/<workspace-id>/` (emptyDir). Do not paste secrets into chat — type them on the desktop.
+
+GitLab (in-cluster): `http://gitlab` (same-namespace DNS; FQDN `gitlab.agent-desktop.svc.cluster.local` also works)  
+UI: `root` — password is `tmp/gitlab_password.md` on the host (gitignored)  
+git CLI: credential helper already set; do not type the password in chat
+
+See [`CONTRIB.md`](CONTRIB.md) for bring-up and rebuild.
 
 ## Quick start
 
@@ -61,3 +67,52 @@ Tear the cluster down:
 ```
 
 How to rebuild and roll out after a code change is in [`CONTRIB.md`](CONTRIB.md).
+
+## GPU (WebGL / three.js)
+
+Headed Chromium in each desktop pod can use the **host NVIDIA GPU** (Vulkan + ANGLE). Several pods share the same card (time-sliced; no VRAM isolation). This is not the NVIDIA CDI / `nvidia-ctk` path — Kind’s node is already privileged and sees host `/dev/nvidia*` and `/dev/dri`, and `up.sh` copies matching NVIDIA userspace into the desktop image.
+
+### Host
+
+1. Proprietary NVIDIA driver installed and loaded. Check:
+
+```sh
+nvidia-smi
+ls -l /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /dev/dri
+```
+
+2. Userspace libraries next to the driver (`libnvidia-glcore.so.*`, `libGLX_nvidia.so.*`, `libEGL_nvidia.so.*`, Vulkan ICD JSON). Typical locations: `/usr/lib64` or `/usr/lib/x86_64-linux-gnu`.
+
+You do **not** need `nvidia-container-toolkit` or `/etc/cdi/nvidia.yaml` for this stack.
+
+Without a driver or userspace, `./scripts/vendor-nvidia.sh` prints a warning and Chromium falls back to software GL. Pods still boot.
+
+### Bring-up
+
+`./scripts/up.sh` already runs `vendor-nvidia.sh` before `podman build`. That copies host NVIDIA libs into `vendor/nvidia/` (gitignored) so the image has `/opt/nvidia`. Desktop pods then mount the device nodes and run privileged so the cgroup allows them.
+
+If you built the image before NVIDIA was installed, or you upgraded the host driver:
+
+```sh
+./scripts/vendor-nvidia.sh
+podman build -t agent-desktop:latest -f Dockerfile .
+source scripts/kind.sh
+load_image docker.io/library/agent-desktop:latest
+kubectl -n agent-desktop delete pod -l app=container
+# then + container in the control room, or:
+bun src/k8s.coffee ensure 1
+```
+
+Driver version in the image must match `nvidia-smi` on the host.
+
+### Check
+
+Inside a running desktop pod:
+
+```sh
+POD=$(kubectl -n agent-desktop get pods -l app=container -o jsonpath='{.items[0].metadata.name}')
+kubectl -n agent-desktop exec "$POD" -- ls -l /dev/nvidia0 /dev/dri
+kubectl -n agent-desktop logs "$POD" -c desktop | grep '\[gpu\]'
+```
+
+Expect `[gpu] host NVIDIA device /dev/nvidia0` and `[gpu] NVIDIA userspace /opt/nvidia/lib`. In the headed browser, `chrome://gpu` should show **WebGL: Hardware accelerated** and a renderer like `ANGLE (NVIDIA, Vulkan … GeForce …)`. A three.js page uses that path.

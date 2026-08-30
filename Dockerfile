@@ -67,7 +67,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && ln -sfn "$CHROME" /opt/browser-use/chrome \
     && "$CHROME" --version
 
-# Dock / exo helper is copied later as /usr/local/bin/chromium.
+# Dock / exo helper is copied later as /usr/local/bin/browser-use-open.
 
 # vercel-labs/agent-browser MCP only. The GNU linux native binary is selected at install.
 # Do not overwrite npm's bin link — a self-symlink here makes a loop.
@@ -93,30 +93,60 @@ COPY vendor/agl /opt/vendor/agl
 COPY vendor/angela /opt/vendor/angela
 COPY agent /opt/agent
 COPY vendor/certs /opt/certs
+COPY vendor/nvidia /opt/nvidia
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY scripts/xfce-session.sh /usr/local/bin/xfce-session.sh
 COPY scripts/browser-use-headed.py /usr/local/bin/browser-use-headed.py
-COPY scripts/chromium-open.sh /usr/local/bin/chromium
+COPY scripts/browser-use-window.py /usr/local/bin/browser-use-window.py
+COPY scripts/chromium-open.sh /usr/local/bin/browser-use-open
 COPY desktop/ /etc/skel/.config/
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/xfce-session.sh \
-         /usr/local/bin/browser-use-headed.py /usr/local/bin/chromium \
+         /usr/local/bin/browser-use-headed.py /usr/local/bin/browser-use-window.py \
+         /usr/local/bin/browser-use-open \
+    && ln -sfn /usr/local/bin/browser-use-open /usr/local/bin/chromium \
     && printf '%s\n' \
          '[Desktop Entry]' \
          'Version=1.0' \
          'Type=Application' \
-         'Name=Chromium' \
-         'Comment=Web Browser' \
-         'Exec=/usr/local/bin/chromium %U' \
+         'Name=browser-use' \
+         'Comment=Headed browser-use Chromium' \
+         'Exec=/usr/local/bin/browser-use-open %U' \
          'Icon=org.xfce.webbrowser' \
          'Terminal=false' \
+         'StartupNotify=true' \
          'Categories=Network;WebBrowser;' \
-         > /usr/share/applications/chromium.desktop \
+         'MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/about;' \
+         > /usr/share/applications/browser-use.desktop \
+    && cp /usr/share/applications/browser-use.desktop /usr/share/applications/chromium.desktop \
+    && mkdir -p /usr/share/xfce4/helpers \
+    && printf '%s\n' \
+         '[Desktop Entry]' \
+         'Version=1.0' \
+         'Icon=org.xfce.webbrowser' \
+         'Type=X-XFCE-Helper' \
+         'Name=browser-use' \
+         'StartupNotify=true' \
+         'X-XFCE-Binaries=browser-use-open;' \
+         'X-XFCE-Category=WebBrowser' \
+         'X-XFCE-Commands=/usr/local/bin/browser-use-open;' \
+         'X-XFCE-CommandsWithParameter=/usr/local/bin/browser-use-open "%s";' \
+         > /usr/share/xfce4/helpers/browser-use.desktop \
     && mkdir -p /home/agent/.config /home/agent/.bun \
     && cp -a /etc/skel/.config/. /home/agent/.config/ \
     && mkdir -p /etc/xdg/xfce4/panel \
     && cp /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml \
          /etc/xdg/xfce4/panel/default.xml \
+    && if [ -f /etc/skel/.config/mimeapps.list ]; then \
+         cp /etc/skel/.config/mimeapps.list /etc/xdg/mimeapps.list; \
+       fi \
+    && update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/browser-use-open 200 \
+    && update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/browser-use-open 200 \
     && chown -R agent:agent /home/agent /opt/agent /opt/mcp /opt/vendor /opt/certs /workspace
+
+# xdg-open / gio default-app lookups. Late so Playwright layers stay cached.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xdg-utils git \
+    && rm -rf /var/lib/apt/lists/*
 
 # npm's agl-ai is stale. Link the vendored /workspace/agl tree (copied to
 # /opt/vendor/agl) so every cwd — including Angela's /workspace jail —

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Icon=org.xfce.webbrowser
+Type=X-XFCE-Helper
+Name=browser-use
+StartupNotify=true
+X-XFCE-Binaries=browser-use-open;
+X-XFCE-Category=WebBrowser
+X-XFCE-Commands=/usr/local/bin/browser-use-open;
+X-XFCE-CommandsWithParameter=/usr/local/bin/browser-use-open "%s";

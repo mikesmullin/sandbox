@@ -13,7 +13,16 @@ export const chat = createChatStore(M, {
   transport: wsTransport({
     url: (s) => {
       if (!s.desktop) return ''
-      return `${proto()}//${location.host}/desktops/${encodeURIComponent(s.desktop)}/agent`
+      const key = String(s.desktop)
+      const split = key.indexOf('::')
+      if (split > 0) {
+        const name = key.slice(0, split)
+        const ws = key.slice(split + 2)
+        if (name && ws) {
+          return `${proto()}//${location.host}/desktops/${encodeURIComponent(name)}/workspaces/${encodeURIComponent(ws)}/agent`
+        }
+      }
+      return `${proto()}//${location.host}/desktops/${encodeURIComponent(key)}/agent`
     },
   }),
 })

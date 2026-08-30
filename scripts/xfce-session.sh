@@ -4,6 +4,7 @@ set -u
 export DISPLAY="${DISPLAY:-:99}"
 export XDG_CURRENT_DESKTOP=XFCE
 export XFCE_PANEL_MIGRATE_DEFAULT=true
+export BROWSER="${BROWSER:-/usr/local/bin/browser-use-open}"
 
 # xfconfd must be up before panel / desktop read settings.
 if command -v xfconfd >/dev/null 2>&1; then

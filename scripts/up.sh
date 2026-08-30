@@ -21,6 +21,7 @@ fi
 
 "$ROOT/scripts/vendor.sh"
 "$ROOT/scripts/vendor-agent.sh"
+"$ROOT/scripts/vendor-nvidia.sh"
 bun install
 
 echo "[up] building agent-desktop (Debian XFCE + browser-use)"
@@ -49,9 +50,15 @@ if [[ -n "$node" ]]; then
   podman update --pids-limit=32768 "$node" >/dev/null || true
 fi
 
+GITLAB_IMAGE="${GITLAB_IMAGE:-docker.io/gitlab/gitlab-ce:18.3.2-ce.0}"
+echo "[up] pulling GitLab ${GITLAB_IMAGE}"
+podman pull "$GITLAB_IMAGE"
+podman tag "$GITLAB_IMAGE" docker.io/gitlab/gitlab-ce:18.3.2-ce.0 || true
+
 echo "[up] loading images into kind"
 load_image docker.io/library/agent-desktop:latest
 load_image docker.io/library/agent-desktop-ui:latest
+load_image docker.io/gitlab/gitlab-ce:18.3.2-ce.0
 
 echo "[up] applying manifests"
 kubectl apply -f "$ROOT/k8s/namespace.yaml"
@@ -81,6 +88,24 @@ else
 fi
 unset dad_key
 
+# GitLab root password: env override, else reuse the existing Secret, else
+# generate 20 alphanumeric chars. Replace a leftover `rootroot` from the
+# short-lived documented-pair experiment. Never echo the value.
+gitlab_pw="${GITLAB_ROOT_PASSWORD:-}"
+if [[ -z "$gitlab_pw" ]]; then
+  gitlab_pw="$(kubectl -n "$NS" get secret gitlab -o jsonpath='{.data.root-password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+fi
+if [[ -z "$gitlab_pw" || "$gitlab_pw" == "rootroot" ]]; then
+  gitlab_pw="$(python3 -c 'import secrets,string; a=string.ascii_letters+string.digits; print("".join(secrets.choice(a) for _ in range(20)))')"
+fi
+kubectl -n "$NS" create secret generic gitlab \
+  --from-literal=root-password="${gitlab_pw}" \
+  --from-literal=root-user=root \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "[up] gitlab secret: present"
+unset gitlab_pw
+
+kubectl apply -f "$ROOT/k8s/gitlab.yaml"
 kubectl apply -f "$ROOT/k8s/desktop.yaml"
 kubectl apply -f "$ROOT/k8s/dashboard.yaml"
 # Day-to-day SPA runs on the host (HMR). In-cluster dashboard stays at 0 replicas
@@ -88,11 +113,23 @@ kubectl apply -f "$ROOT/k8s/dashboard.yaml"
 kubectl -n "$NS" scale deploy/dashboard --replicas=0 >/dev/null 2>&1 || true
 
 echo "[up] waiting for desktops (first boot of XFCE + browser is slow)"
-kubectl -n "$NS" rollout status statefulset/desktop --timeout=420s || true
+# StatefulSet is a pod template (0 replicas). Live instances are unique pods.
+kubectl -n "$NS" scale statefulset/container --replicas=0 >/dev/null 2>&1 || true
+# Drop leftover ordinals (container-0, …) without touching container-<hex> pods.
+while read -r pod; do
+  [[ "$pod" =~ ^container-(0|[1-9][0-9]*)$ ]] || continue
+  kubectl -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+done < <(kubectl -n "$NS" get pods -l app=container -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+bun src/k8s.coffee ensure 1
+kubectl -n "$NS" wait --for=condition=Ready pod -l app=container --timeout=420s || true
 
 echo
 echo "[up] control room (host, HMR):  ./scripts/dev-ui.sh  →  http://127.0.0.1:8080"
 echo "[up] in-cluster UI (prod):      kubectl -n $NS scale deploy/dashboard --replicas=1"
 echo "[up]                            http://127.0.0.1:8090"
+echo "[up] GitLab (in-cluster DNS):   http://gitlab"
+echo "[up] GitLab UI:                 root + password in tmp/gitlab_password.md"
+echo "[up] seeding GitLab ApplicationSettings (first boot is slow; skip if not Ready yet)"
+"$ROOT/scripts/gitlab-seed.sh" || echo "[up] gitlab-seed deferred — rerun scripts/gitlab-seed.sh once GitLab is Ready"
 echo "[up] pods:"
 kubectl -n "$NS" get pods -o wide

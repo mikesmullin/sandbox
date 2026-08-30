@@ -1,18 +1,30 @@
 #!/bin/sh
-# XFCE / exo WebBrowser helper. Prefer a new tab on the running browser-use
-# instance; fall back to launching Playwright Chromium with the same profile.
+# XFCE / exo WebBrowser helper. Always a new window on the running
+# browser-use Chromium (CDP). Never spawn a second Chrome/Chromium.
 url="${1:-about:blank}"
-if [ -f /tmp/browser-use.cdp ]; then
-  cdp=$(tr -d '[:space:]' < /tmp/browser-use.cdp)
-  hostport=$(printf '%s' "$cdp" | sed -e 's#^[a-z]*://##' -e 's#/.*##')
-  enc=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$url")
-  if curl -fsS "http://${hostport}/json/new?${enc}" >/dev/null 2>&1; then
-    exit 0
-  fi
+export DISPLAY="${DISPLAY:-:99}"
+home="${HOME:-/home/agent}"
+py="${BROWSER_USE_WINDOW_PY:-}"
+if [ -z "$py" ] || [ ! -f "$py" ]; then
+  for cand in \
+      /usr/local/bin/browser-use-window.py \
+      "$home/bin/browser-use-window.py"
+  do
+    if [ -f "$cand" ]; then
+      py="$cand"
+      break
+    fi
+  done
 fi
-exec /opt/browser-use/chrome \
-  --no-sandbox \
-  --disable-gpu \
-  --disable-dev-shm-usage \
-  --user-data-dir="${HOME}/.config/browser-use" \
-  "$@"
+if [ -z "$py" ] || [ ! -f "$py" ]; then
+  echo "browser-use window helper missing" >&2
+  exit 1
+fi
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 "$py" "$url"
+fi
+if [ -x /opt/browser-use/venv/bin/python ]; then
+  exec /opt/browser-use/venv/bin/python "$py" "$url"
+fi
+echo "python3 not found; cannot talk to browser-use CDP" >&2
+exit 1

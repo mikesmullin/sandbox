@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: desktop
+  name: container
   namespace: agent-desktop
   labels:
-    app: desktop
+    app: container
 spec:
   clusterIP: None
   selector:
-    app: desktop
+    app: container
   ports:
     - name: novnc
       port: 6080
@@ -20,21 +20,23 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: desktop
+  name: container
   namespace: agent-desktop
   labels:
-    app: desktop
+    app: container
 spec:
-  serviceName: desktop
-  replicas: 2
+  serviceName: container
+  # Template only. Live pods are created as container-<6hex> via the control room
+  # so a deleted instance is never recreated under the same name.
+  replicas: 0
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      app: desktop
+      app: container
   template:
     metadata:
       labels:
-        app: desktop
+        app: container
     spec:
       automountServiceAccountToken: false
       hostAliases:
@@ -82,6 +84,18 @@ spec:
                   name: dad-proxy
                   key: api-key
                   optional: true
+            - name: GITLAB_URL
+              value: "http://gitlab"
+            - name: GITLAB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab
+                  key: root-password
+                  optional: true
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: all
           resources:
             requests:
               cpu: "250m"
@@ -106,7 +120,9 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 6
           securityContext:
-            allowPrivilegeEscalation: false
+            # Kind node is privileged and already sees host /dev/nvidia* + /dev/dri.
+            # Privileged here lets the cgroup device whitelist pass those through.
+            privileged: true
             seccompProfile:
               type: Unconfined
           volumeMounts:
@@ -116,6 +132,18 @@ spec:
               mountPath: /workspace
             - name: tmp
               mountPath: /tmp
+            - name: dri
+              mountPath: /dev/dri
+            - name: nvidia0
+              mountPath: /dev/nvidia0
+            - name: nvidiactl
+              mountPath: /dev/nvidiactl
+            - name: nvidia-uvm
+              mountPath: /dev/nvidia-uvm
+            - name: nvidia-uvm-tools
+              mountPath: /dev/nvidia-uvm-tools
+            - name: nvidia-modeset
+              mountPath: /dev/nvidia-modeset
       volumes:
         - name: dshm
           emptyDir:
@@ -125,3 +153,26 @@ spec:
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        - name: dri
+          hostPath:
+            path: /dev/dri
+        - name: nvidia0
+          hostPath:
+            path: /dev/nvidia0
+            type: CharDevice
+        - name: nvidiactl
+          hostPath:
+            path: /dev/nvidiactl
+            type: CharDevice
+        - name: nvidia-uvm
+          hostPath:
+            path: /dev/nvidia-uvm
+            type: CharDevice
+        - name: nvidia-uvm-tools
+          hostPath:
+            path: /dev/nvidia-uvm-tools
+            type: CharDevice
+        - name: nvidia-modeset
+          hostPath:
+            path: /dev/nvidia-modeset
+            type: CharDevice

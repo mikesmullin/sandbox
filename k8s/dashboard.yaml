@@ -29,9 +29,9 @@ spec:
             - name: NAMESPACE
               value: agent-desktop
             - name: DESKTOP_APP
-              value: desktop
+              value: container
             - name: DESKTOP_STATEFULSET
-              value: desktop
+              value: container
           readinessProbe:
             httpGet:
               path: /api/health

@@ -20,7 +20,7 @@ Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (noVN
 | `agent/` | In-pod Angela harness (`src/server.coffee`). `agl-ai` / `angela` are `link:` deps. |
 | `Dockerfile` | Debian bookworm desktop: Xvfb, XFCE, headed browser-use Chromium, x11vnc, noVNC, bun, agent-browser 0.35.1 (`mcp` subcommand). |
 | `Dockerfile.dashboard` | Bun Alpine + kubectl; copies `src/` + `public/`. |
-| `k8s/` | Namespace, RBAC (dashboard may list pods and scale the StatefulSet), desktop StatefulSet, dashboard Deployment. |
+| `k8s/` | Namespace, RBAC (dashboard may list/create/delete pods and read the StatefulSet template), desktop StatefulSet (template only, 0 replicas), dashboard Deployment, GitLab CE (`gitlab.yaml`, ClusterIP on `http://gitlab`). |
 | `kind/cluster.yaml` | Extra port map 30080→8090, kubelet `podPidsLimit: 8192`. |
 | `scripts/up.sh` / `down.sh` | Create or delete the whole stack. |
 | `scripts/dev-ui.sh` | Host control room on `:8080` with m-js HMR; scales in-cluster dashboard to 0. |
@@ -28,9 +28,12 @@ Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (noVN
 | `scripts/vendor.sh` | noVNC core + Phosphor into `public/vendor/` (offline dashboard). |
 | `scripts/vendor-chat.sh` | Copy `/workspace/m-js-cmp-chat` into `public/vendor/m-js-cmp-chat` (chat UI plugin). Re-run after plugin edits, then HMR/rebuild dashboard. |
 | `scripts/vendor-agent.sh` | rsync `/workspace/agl`, `/workspace/angela`, mcp `file-io` / `term-local` into `vendor/` (strips `.env`, tokens, tests, plugins). Host `bun link` of both packages. Copies dad-proxy CA if present. |
+| `scripts/vendor-nvidia.sh` | Copy host NVIDIA userspace (`/usr/lib64/libnvidia*`, Vulkan/EGL ICD JSON) into `vendor/nvidia` (gitignored). Re-run after driver updates. |
 | `scripts/entrypoint.sh` | Xvfb → XFCE → x11vnc → websockify → headed browser-use → `bun /opt/agent/src/server.coffee`. Rewires `/workspace/node_modules` after the emptyDir hides the image copy. |
 
 Images: `agent-desktop:latest` (pods), `agent-desktop-ui:latest` (dashboard). Both use `imagePullPolicy: Never`.
+
+GPU: Kind's node is privileged, so it already sees host `/dev/nvidia*` and `/dev/dri`. Desktop pods mount those devices and run privileged so the device cgroup allows them. NVIDIA userspace is copied from the host by `vendor-nvidia.sh` into the image (`/opt/nvidia`). Several pods share the same GPU (time-sliced; no VRAM isolation). Re-run `vendor-nvidia.sh` after a driver update, then rebuild the **desktop** image. Host has no `nvidia-ctk` CDI here — we do not use `--device nvidia.com/gpu=all`.
 
 ## m-js
 
@@ -55,7 +58,7 @@ plus a tiny `package.json` so `bun` from cwd does not fall through to the npm ca
 
 Edit agl/angela, re-run `vendor-agent.sh`, rebuild the **desktop** image, and roll the StatefulSet. Dashboard code does not import agl.
 
-MCP servers are vendored at `/opt/mcp` (file-io, term-local). Headed browser-use Chromium is driven by `agent-browser --cdp <url> --headed mcp --tools core` (needs **0.28+**; 0.27 has no `mcp` command). Do not point `AGENT_BROWSER_EXECUTABLE_PATH` at a second Chrome.
+MCP servers are vendored at `/opt/mcp` (file-io, term-local). Headed browser-use Chromium is driven by `agent-browser --session <workspace-id> --cdp <url> --headed --pin-tab mcp --tools core` (needs **0.34+** for `--pin-tab`; 0.27 has no `mcp` command). Do not point `AGENT_BROWSER_EXECUTABLE_PATH` at a second Chrome. Do not run xdotool/xfconf against the host display — XFCE workspaces live on the pod's `DISPLAY=:99`.
 
 ## Start / stop the cluster
 
@@ -83,42 +86,39 @@ Or `podman ps -a --filter label=io.x-k8s.kind.cluster`.
 - sets the Kind node `pids-limit` to **32768** (rootless default 2048 kills Chromium with pthread errors)
 - writes Secret `dad-proxy` / key `api-key` from `DAD_PROXY_API_KEY`, `LLM_PROXY_API_KEY`, or `/workspace/dad-proxy/.env` — **never echo the value**
 - maps pasta host IP `169.254.1.2` → `host.containers.internal` / `uber.home` so pods reach dad-proxy. Kind cannot hairpin the host LAN IP.
+- writes Secret `gitlab` / `root-password` (random 20-char, or `GITLAB_ROOT_PASSWORD`) and applies `k8s/gitlab.yaml`. `scripts/gitlab-seed.sh` writes `tmp/gitlab_password.md` (gitignored) and enables git-over-HTTP password auth, public default visibility, and dark UI. Desktop git stores HTTP creds from the Secret so clone/push/pull never prompt. Browse GitLab at `http://gitlab`. **Never echo the password from `kubectl` or logs.** No PAT.
 
 Without a key, chat will 401 on https inference. The dashboard still tiles VNC.
 
-Scale without rebuilding:
-
-```sh
-kubectl -n agent-desktop scale statefulset/desktop --replicas=1
-# or the control-room slider (0–8)
-```
+Scale without rebuilding: `+ container` / `− container` in the control room (0–8). Pods are named `container-<6 hex>` (sha1 of random bytes) so a deleted instance is never recreated under the same name. Do not scale the StatefulSet — it is only a pod template (`replicas: 0`).
 
 ## Container logs
 
-One container per pod: `desktop` on the StatefulSet, `dashboard` on the Deployment (usually **0 replicas** during host-SPA development). Entrypoint, XFCE, Chromium, and the Angela bun process all share the **desktop** container stdout (tagged `[entrypoint]`, `[agent]`, …). Host SPA logs are the `bun` process running `src/server.coffee`.
+One process container per pod: `desktop` inside uniquely named pods (`container-<6 hex>`, label `app=container`). The dashboard Deployment is usually **0 replicas** during host-SPA development. Entrypoint, XFCE, the headed browser, and the Angela bun process all share the **desktop** container stdout (tagged `[entrypoint]`, `[agent]`, …). Host SPA logs are the `bun` process running `src/server.coffee`.
 
 ```sh
 kubectl -n agent-desktop get pods -o wide
+POD=$(kubectl -n agent-desktop get pods -l app=container -o jsonpath='{.items[0].metadata.name}')
 
 # live tail (pick a replica)
-kubectl -n agent-desktop logs -f desktop-0 -c desktop
+kubectl -n agent-desktop logs -f "$POD" -c desktop
 kubectl -n agent-desktop logs -f deploy/dashboard
 
-# all desktop replicas, prefixed by pod name
-kubectl -n agent-desktop logs -f -l app=desktop --prefix --timestamps
+# all container replicas, prefixed by pod name
+kubectl -n agent-desktop logs -f -l app=container --prefix --timestamps
 
 # previous crash (CrashLoop / OOM)
-kubectl -n agent-desktop logs desktop-0 -c desktop --previous
-kubectl -n agent-desktop describe pod desktop-0
+kubectl -n agent-desktop logs "$POD" -c desktop --previous
+kubectl -n agent-desktop describe pod "$POD"
 
 # last few minutes / last N lines
-kubectl -n agent-desktop logs desktop-0 --since=10m --tail=200
+kubectl -n agent-desktop logs "$POD" --since=10m --tail=200
 ```
 
 Angela prints `session=<id>` on ready. Health (model + session id, no secrets):
 
 ```sh
-kubectl -n agent-desktop exec desktop-0 -- wget -qO- http://127.0.0.1:8091/health
+kubectl -n agent-desktop exec "$POD" -- wget -qO- http://127.0.0.1:8091/health
 ```
 
 Kind node itself (kubelet / image import / PID pressure), not the app:
@@ -130,31 +130,34 @@ podman logs "$(kind_node_name agent-desktop)"
 
 ## Angela session JSON
 
-Harness `projectRoot` is `/workspace` (`ANGELA_PROJECT_ROOT`). Sessions are written **inside the pod** on the emptyDir jail — they are not on the host, and they vanish when the pod is deleted or rolled.
+Each XFCE workspace has its own file-io jail. Harness `projectRoot` is `/workspace/jails/<workspace-id>/` (`ANGELA_JAILS_ROOT`). Sessions are written **inside the pod** on that emptyDir jail — they are not on the host, and they vanish when the pod is deleted or rolled.
 
 ```text
-/workspace/.angela/sessions/<id>.json    # metadata only (agent, model, turns, status — no transcript)
-/workspace/.angela/sessions/<id>.jsonl   # append-only event log (context window, provider I/O, tools)
+/workspace/jails/workspace-<hex>/.angela/sessions/<id>.json    # metadata only (agent, model, turns, status — no transcript)
+/workspace/jails/workspace-<hex>/.angela/sessions/<id>.jsonl   # append-only event log (context window, provider I/O, tools)
 ```
 
-Session id is the filename. Find it from logs (`[agent] ready … session=`), `/health`, or the chat WS `hello.sessionId`.
+Session id is the filename. Find it from logs (`[agent] ready … session=`), `/health` (`workspaces.<name>.jail`), or the chat WS `hello.sessionId`.
 
 ```sh
+POD=$(kubectl -n agent-desktop get pods -l app=container -o jsonpath='{.items[0].metadata.name}')
+JAIL=$(kubectl -n agent-desktop exec "$POD" -- wget -qO- http://127.0.0.1:8091/health | jq -r '.workspaces | to_entries[0].value.jail')
+
 # list
-kubectl -n agent-desktop exec desktop-0 -- ls -l /workspace/.angela/sessions/
+kubectl -n agent-desktop exec "$POD" -- ls -l "$JAIL/.angela/sessions/"
 
 # metadata
-kubectl -n agent-desktop exec desktop-0 -- cat /workspace/.angela/sessions/<id>.json
+kubectl -n agent-desktop exec "$POD" -- cat "$JAIL/.angela/sessions/<id>.json"
 
 # event log (one JSON object per line)
-kubectl -n agent-desktop exec desktop-0 -- cat /workspace/.angela/sessions/<id>.jsonl
+kubectl -n agent-desktop exec "$POD" -- cat "$JAIL/.angela/sessions/<id>.jsonl"
 ```
 
 Copy out, then inspect on the host:
 
 ```sh
 mkdir -p tmp/sessions
-kubectl -n agent-desktop cp desktop-0:/workspace/.angela/sessions tmp/sessions
+kubectl -n agent-desktop cp "$POD":"$JAIL/.angela/sessions" tmp/sessions
 jq . tmp/sessions/<id>.json
 jq -r '.event_type' tmp/sessions/<id>.jsonl
 jq 'select(.event_type=="provider_request" or .event_type=="provider_response")' tmp/sessions/<id>.jsonl
@@ -179,6 +182,8 @@ Load helper (do not use `kind load` on this Podman setup):
 
 ```sh
 source scripts/kind.sh
+# Podman often tags `localhost/IMAGE:latest`; Kind import wants docker.io/library/.
+podman tag localhost/IMAGE:latest docker.io/library/IMAGE:latest 2>/dev/null || true
 load_image docker.io/library/IMAGE:latest
 ```
 
@@ -216,14 +221,14 @@ Then `http://127.0.0.1:8090`. Stop the host `dev-ui` process first if you want a
 podman build -t agent-desktop:latest -f Dockerfile .
 source scripts/kind.sh
 load_image docker.io/library/agent-desktop:latest
-kubectl -n agent-desktop rollout restart statefulset/desktop
-kubectl -n agent-desktop rollout status statefulset/desktop --timeout=420s
+kubectl -n agent-desktop rollout restart statefulset/container
+kubectl -n agent-desktop rollout status statefulset/container --timeout=420s
 ```
 
 StatefulSet + `imagePullPolicy: Never` can keep the old image if the tag did not change. If pods do not pick up the import:
 
 ```sh
-kubectl -n agent-desktop delete pod -l app=desktop
+kubectl -n agent-desktop delete pod -l app=container
 ```
 
 `/workspace` is emptyDir — rolling a pod **wipes** jail files. Chromium profile under `$HOME` also dies with the pod.
@@ -231,8 +236,10 @@ kubectl -n agent-desktop delete pod -l app=desktop
 ### Manifests (`k8s/`, `kind/cluster.yaml`)
 
 ```sh
-kubectl apply -f k8s/namespace.yaml -f k8s/rbac.yaml -f k8s/desktop.yaml -f k8s/dashboard.yaml
+kubectl apply -f k8s/namespace.yaml -f k8s/rbac.yaml -f k8s/desktop.yaml -f k8s/dashboard.yaml -f k8s/gitlab.yaml
 ```
+
+GitLab emptyDir keeps repos until that Deployment is recreated. Rolling a **desktop** pod still wipes `/workspace` (including `/workspace/jails/`). Re-seed after GitLab is Ready: `./scripts/gitlab-seed.sh` (refreshes `tmp/gitlab_password.md` from the Secret).
 
 `kind/cluster.yaml` (port map, `podPidsLimit`) only applies at **create**. To change it: `./scripts/down.sh` then `./scripts/up.sh`. After create, still run `podman update --pids-limit=32768` on the Kind node if Chromium starts dying on threads.
 
@@ -244,20 +251,27 @@ kubectl apply -f k8s/namespace.yaml -f k8s/rbac.yaml -f k8s/desktop.yaml -f k8s/
 
 ## Agent / chat notes
 
-- Default model `llama-server:default` via `Agent.factory({ model, base_url, api_key, ca_file })`. URL is `https://host.containers.internal:1234`. CA is `/opt/certs/ca.pem` when vendored from dad-proxy.
-- Policy is **ask** + Lucy allowlist, plus `file_io__write_file` and `browser__.*`. Chat Send includes the current allowlist textarea; the shield editor must actually persist (seed once from `hello`, do not clobber on the 3s desktop refresh).
+- Default model `llama-server:default` via `Agent.factory({ model, base_url, api_key, ca_file })`. URL is `https://host.containers.internal:1234`. CA is `/opt/certs/ca.pem` when vendored from dad-proxy. Model/allowlist/abort are per workspace session.
+- Chat WS is the source of truth for that workspace: every browser that opens the same `/desktops/:pod/workspaces/:id/agent` socket sees the same transcript, allowlist, model, run/stopwatch, and approvals. Join sends `hello` then a `state` snapshot (history rebuilt from angela `delta/v1` jsonl). Submitted prompts (`user`) and live `allowlist` / `status` / deltas fan out to all clients. The composer textarea is local until Send — do not sync in-progress typing. Seed allowlist from `hello`/`state` once; the desktop refresh must still not rewrite `ui.items` (that used to clobber the shield).
+- Policy is **ask** + Lucy allowlist, plus `file_io__write_file` and `browser__.*`. Chat Send includes the current allowlist textarea.
 - `MCP_TERM_ALLOW=.*` so term-local does not apply a second jail. The UI allowlist is the gate.
 - CONTEXT LOOP builtins (`goto`, `loop_start_marker`, `waypoint`) are stripped after `listToolCatalog`.
 - Approvals: broadcast from PolicyEngine `onEvent` only. Duplicate cards with the same id are one approval — Allow/Deny one of them.
 - Abort/Stop is **not** queued behind the in-flight chat turn.
 - Capture: RFB stays `viewOnly` until the isolated desktop is clicked, so the chat sidebar can take keyboard. Esc → release capture → back to the wall. Clicking the tile image or its margin isolates; there is no separate “open”.
+- Hash router (`M.Router.setMode('hash')`): wall is `#/` (or empty); isolate-mode is `#/c/:container/w/:workspace`. Isolate pushes a history entry; Esc / wall / browser Back return to the wall; Forward restores the last workspace. Refresh keeps the hash. Do not remount the App on `Router.onChange` — that would rebuild noVNC canvases.
+- Clipboard: text only, while the isolated desktop is on screen. Guest copy (`ServerCutText`) writes `navigator.clipboard`. Host paste (Ctrl/Cmd+V while captured) stuffs guest CLIPBOARD then sends Ctrl+V; grabbing also pushes the current host clipboard. Chat/inputs are skipped. x11vnc needs XFIXES (`-noprimary`, no `-noxfixes`) so selecting text does not clobber the host. Classic RFB cut-text is Latin-1. Restart the **desktop** image after changing x11vnc flags.
 - Desktop refresh every 3s must not rewrite `ui.items` when name/ready/phase/restarts are unchanged (that redraw used to reset the allowlist).
-- Chat prompt `/new` (whole message) is a harness command: Angela closes the current session and starts an empty one. It does not call the model. The sidebar clears to “New session.” Rebuild the **desktop** image after changing angela for this to apply in-pod.
+- Each XFCE workspace has its own Angela session, chat socket (`/desktops/:pod/workspaces/:id/agent` → in-pod `/workspaces/:id/ws`), and file-io jail (`/workspace/jails/workspace-<hex>/` = Angela `projectRoot` / `MCP_FILE_ROOT` / `MCP_TERM_CWD`). `/new` starts a new Angela session for **that** workspace only (same Chromium window). Rebuild the **desktop** image after changing angela for this to apply in-pod.
+- Git author is **per container**, set once in `~/.gitconfig` from the pod hostname (`user.email = container-<podhex>@home.local`). No workspace id in the email. GitLab is cluster-local; git CLI uses the credential helper (UI password is host `tmp/gitlab_password.md`, not chat). Prefer `git push origin main` and `git commit --file …` — this model mangles `-u` / `-m` into `-1`. Do not auto-`git init` / clone / worktree on `+ workspace`; Angela decides inside the jail.
+- Browser: one headed browser-use Chromium (shared cookies/history). Each workspace owns a distinct window; agent-browser MCP uses `--session <workspace-id> --pin-tab` so one session cannot drive another workspace's window. Do not call `agent-browser close` (that kills the shared browser).
 - Tile **desktop / log / gauges** toggles are independent. Booting pods force the log pane (kubectl `logs -f`, stick-to-bottom). Gauges scrape `/telem` on the in-pod agent (`/proc`, not the glibc mycloud-probe). In-cluster dashboard needs `pods/log` RBAC.
 
 ## Do not
 
-- Put API keys, `.env`, or tokens in chat, docs, or git. `vendor-agent.sh` already excludes them.
+- Put API keys, `.env`, or tokens in chat, docs, or git. `vendor-agent.sh` already excludes them. GitLab's password is `tmp/gitlab_password.md` (gitignored) — do not echo it from `kubectl` or chat.
+- Create per-container GitLab users, deploy keys, or SSH `authorized_keys` round-trips.
+- Inject GitLab session cookies into browser-use. Log in by hand.
 - Rewrite dad-proxy. Point at it.
 - Use Docker APIs or `kind load docker-image` here.
 - Expect npm `agl-ai` to know `llama-server`.

@@ -2,7 +2,7 @@ import express from 'express'
 import httpProxy from 'http-proxy'
 import { watch } from 'fs'
 import { extname, resolve } from 'path'
-import { listDesktops, getDesktop, getScale, setScale, resolveTarget } from './k8s.coffee'
+import { listDesktops, getDesktop, getScale, setScale, createContainer, deleteContainer, resolveTarget, dropForward } from './k8s.coffee'
 import { attachLogClient, detachLogClient } from './logs.coffee'
 
 PORT = Number process.env.PORT or 8080
@@ -36,9 +36,63 @@ app.get '/api/health', (req, res) ->
     hmr: HMR
     ns: process.env.NAMESPACE or 'agent-desktop'
 
+fallbackWs = -> [{ id: 'workspace', name: 'workspace', current: true }]
+
+attachWorkspaces = (desk) ->
+  unless desk.ready
+    desk.workspaces = fallbackWs()
+    return desk
+  try
+    target = await resolveTarget desk.name
+    ac = new AbortController()
+    t = setTimeout (-> ac.abort()), 1500
+    r = await fetch "http://#{target.host}:#{target.agentPort or 8091}/workspaces",
+      signal: ac.signal
+    clearTimeout t
+    body = await r.json().catch -> {}
+    desk.workspaces = body.workspaces or fallbackWs()
+  catch
+    desk.workspaces = fallbackWs()
+  desk
+
+agentUnreachable = (err) ->
+  msg = String err?.message or err
+  /socket connection was closed|ECONNRESET|ECONNREFUSED|Connection ended|Unable to connect/i.test msg
+
+fetchAgent = (target, path, opts = {}) ->
+  fetch "http://#{target.host}:#{target.agentPort or 8091}#{path}",
+    method: opts.method or 'GET'
+    signal: opts.signal
+
+proxyAgent = (req, res, path, opts = {}) ->
+  name = req.params.name
+  target = await resolveTarget name
+  r = null
+  try
+    r = await fetchAgent target, path, { method: opts.method or req.method, signal: opts.signal }
+  catch err
+    if IN_CLUSTER or not agentUnreachable err
+      throw Object.assign err, { status: 502 }
+    console.warn "[api] agent #{name}#{path} dead forward, retrying"
+    dropForward name
+    target = await resolveTarget name
+    r = await fetchAgent target, path, { method: opts.method or req.method, signal: opts.signal }
+  unless opts.raw
+    body = await r.json().catch -> { error: 'bad agent response' }
+    unless r.ok
+      return res.status(r.status).json body
+    return res.json body
+  buf = Buffer.from await r.arrayBuffer()
+  res.status(r.status)
+  r.headers.forEach (v, k) ->
+    return if k in ['transfer-encoding', 'connection']
+    res.setHeader k, v
+  res.end buf
+
 app.get '/api/desktops', (req, res) ->
   try
     [desktops, scale] = await Promise.all [listDesktops(), getScale()]
+    desktops = await Promise.all desktops.map attachWorkspaces
     res.json { desktops, scale }
   catch err
     console.error '[api] list', err
@@ -53,10 +107,28 @@ app.get '/api/desktops/:name', (req, res) ->
   catch err
     res.status(500).json { error: err.message }
 
+app.post '/api/desktops', (req, res) ->
+  try
+    created = await createContainer()
+    desktops = await Promise.all (await listDesktops()).map attachWorkspaces
+    res.json { container: created, scale: created.scale, desktops }
+  catch err
+    console.error '[api] create', err
+    res.status(err.status or 400).json { error: err.message }
+
+app.delete '/api/desktops/:name', (req, res) ->
+  try
+    deleted = await deleteContainer req.params.name
+    desktops = await Promise.all (await listDesktops()).map attachWorkspaces
+    res.json { container: deleted, scale: deleted.scale, desktops }
+  catch err
+    console.error '[api] delete', err
+    res.status(err.status or 400).json { error: err.message }
+
 app.patch '/api/desktops', (req, res) ->
   try
     scale = await setScale req.body?.replicas
-    desktops = await listDesktops()
+    desktops = await Promise.all (await listDesktops()).map attachWorkspaces
     res.json { scale, desktops }
   catch err
     console.error '[api] scale', err
@@ -64,15 +136,52 @@ app.patch '/api/desktops', (req, res) ->
 
 app.get '/api/desktops/:name/telem', (req, res) ->
   try
-    target = await resolveTarget req.params.name
-    r = await fetch "http://#{target.host}:#{target.agentPort or 8091}/telem"
-    body = await r.json().catch -> { error: 'bad telem' }
-    unless r.ok
-      return res.status(r.status).json body
-    res.json body
+    await proxyAgent req, res, '/telem'
   catch err
     code = err.status or 502
-    res.status(code).json { error: err.message }
+    res.status(code).json { error: 'agent not reachable' }
+
+app.get '/api/desktops/:name/workspaces', (req, res) ->
+  try
+    await proxyAgent req, res, '/workspaces'
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.post '/api/desktops/:name/workspaces', (req, res) ->
+  try
+    await proxyAgent req, res, '/workspaces', { method: 'POST' }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.post '/api/desktops/:name/workspaces/scan', (req, res) ->
+  try
+    await proxyAgent req, res, '/workspaces/scan', { method: 'POST' }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.delete '/api/desktops/:name/workspaces/:id', (req, res) ->
+  try
+    await proxyAgent req, res, "/workspaces/#{encodeURIComponent req.params.id}", { method: 'DELETE' }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.post '/api/desktops/:name/workspaces/:id/focus', (req, res) ->
+  try
+    await proxyAgent req, res, "/workspaces/#{encodeURIComponent req.params.id}/focus", { method: 'POST' }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
+
+app.get '/api/desktops/:name/workspaces/:id/thumb', (req, res) ->
+  try
+    await proxyAgent req, res, "/workspaces/#{encodeURIComponent req.params.id}/thumb", { raw: true }
+  catch err
+    code = err.status or 502
+    res.status(code).json { error: 'agent not reachable' }
 
 app.use express.static PUBLIC_DIR, { fallthrough: true, index: false }
 
@@ -164,6 +273,18 @@ expressServer = app.listen 0, '127.0.0.1', ->
         if server.upgrade req, { data: { kind: 'logs', name } }
           return undefined
         return new Response 'upgrade failed', { status: 500 }
+      wsRoom = url.pathname.match /^\/desktops\/([^/]+)\/workspaces\/([^/]+)\/agent\/?$/
+      if wsRoom and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
+        name = decodeURIComponent wsRoom[1]
+        workspace = decodeURIComponent wsRoom[2]
+        try
+          target = await resolveTarget name
+        catch err
+          console.error "[ws] #{name} #{workspace}", err.message
+          return new Response err.message, { status: err.status or 502 }
+        if server.upgrade req, { data: { name, target, kind: 'agent', workspace, queue: [], upstream: null } }
+          return undefined
+        return new Response 'upgrade failed', { status: 500 }
       wsMatch = url.pathname.match /^\/desktops\/([^/]+)\/(websockify|agent)\/?$/
       if wsMatch and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
         name = decodeURIComponent wsMatch[1]
@@ -173,7 +294,7 @@ expressServer = app.listen 0, '127.0.0.1', ->
         catch err
           console.error "[ws] #{name}", err.message
           return new Response err.message, { status: err.status or 502 }
-        if server.upgrade req, { data: { name, target, kind, queue: [], upstream: null } }
+        if server.upgrade req, { data: { name, target, kind, workspace: null, queue: [], upstream: null } }
           return undefined
         return new Response 'upgrade failed', { status: 500 }
       headers = new Headers
@@ -198,12 +319,15 @@ expressServer = app.listen 0, '127.0.0.1', ->
         if ws.data?.kind is 'logs'
           attachLogClient ws.data.name, ws
           return
-        { name, target, kind } = ws.data
+        { name, target, kind, workspace } = ws.data
         upstreamUrl = if kind is 'agent'
-          "ws://#{target.host}:#{target.agentPort or 8091}/ws"
+          if workspace
+            "ws://#{target.host}:#{target.agentPort or 8091}/workspaces/#{encodeURIComponent workspace}/ws"
+          else
+            "ws://#{target.host}:#{target.agentPort or 8091}/ws"
         else
           "ws://#{target.host}:#{target.port}/websockify"
-        console.log "[ws] #{kind or 'novnc'} #{name} -> #{upstreamUrl}"
+        console.log "[ws] #{kind or 'novnc'} #{name}#{if workspace then ':' + workspace else ''} -> #{upstreamUrl}"
         upstream = new WebSocket upstreamUrl
         ws.data.upstream = upstream
         unless kind is 'agent'

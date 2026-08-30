@@ -105,6 +105,21 @@ body {
 .btn:disabled { opacity: .45; cursor: not-allowed; }
 .btn.ghost { background: transparent; }
 .btn i { font-size: 14px; }
+.btn.toggle.off {
+  background: transparent;
+  color: var(--dim);
+  border-color: var(--line-2);
+}
+.btn.toggle.off:hover { color: var(--accent-2); border-color: var(--accent); }
+.btn.toggle.on {
+  color: var(--ink);
+  border-color: rgba(122, 176, 255, .55);
+  background: rgba(122, 176, 255, .18);
+}
+.btn.toggle.on:hover {
+  border-color: var(--accent);
+  background: rgba(122, 176, 255, .28);
+}
 
 .err {
   color: var(--down);
@@ -125,7 +140,7 @@ body {
 
 .wall {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 300px));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, calc(50% - 7px)), 1fr));
   gap: 14px;
   flex: 1 1 auto;
   min-height: 0;
@@ -155,9 +170,71 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 280px;
-  max-width: 300px;
+  max-width: none;
   cursor: pointer;
 }
+.tile-head { cursor: pointer; }
+.container-tile.is-picked {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(122, 176, 255, .35);
+}
+.desktop-tile.is-picked {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(122, 176, 255, .35);
+}
+.desktop-nest {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 8px;
+  padding: 8px 10px 10px;
+  flex: 1 1 auto;
+  min-height: 148px;
+  align-content: start;
+}
+.desktop-tile {
+  max-width: none;
+  min-height: 148px;
+  min-width: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.desktop-tile.is-current { border-color: var(--line); }
+.desktop-tile.is-picked.is-current {
+  border-color: var(--accent);
+}
+.rec-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: #ff2a2a;
+  box-shadow: 0 0 5px 1px rgba(255, 42, 42, 0.85);
+  animation: rec-pulse 1.35s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 5px 1px rgba(255, 42, 42, 0.9);
+  }
+  50% {
+    opacity: 0.35;
+    box-shadow: 0 0 11px 3px rgba(255, 42, 42, 0.35);
+  }
+}
+.desktop-tile .screen { min-height: 110px; }
+.thumb-screen { background: #07090d; }
+.ws-thumb {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+  opacity: 0;
+}
+.toolbar-panes { margin-left: 2px; }
 .tile.show-log:not(.show-desktop) {
   height: 100%;
   max-height: 100%;
@@ -177,7 +254,14 @@ body {
   color: var(--dim);
   flex: 0 0 auto;
 }
-.tile-head .name { color: var(--ink); font-weight: 600; }
+.tile-head .name {
+  color: var(--ink);
+  font-weight: 600;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .tile-head .meta {
   margin-left: auto;
   display: flex;
@@ -186,12 +270,17 @@ body {
   flex-wrap: wrap;
   justify-content: flex-end;
 }
-.captured-tag {
+.capture-status {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   color: var(--accent-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
 }
+.capture-status.hint { color: var(--dim); }
+.capture-status i { font-size: 14px; }
 .pane-toggles {
   display: inline-flex;
   gap: 4px;
@@ -265,6 +354,28 @@ body {
 .placeholder i { font-size: 28px; color: var(--line-2); justify-self: center; }
 .ph-spinner { display: inline-block; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+.screen-wait {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  background: #07090d;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .04em;
+  pointer-events: none;
+}
+.screen-wait i {
+  font-size: 28px;
+  color: var(--accent);
+  justify-self: center;
+}
+.screen.is-live > .screen-wait,
+.thumb-screen.is-ready > .screen-wait { display: none; }
+.thumb-screen.is-ready .ws-thumb { opacity: 1; }
 
 .tile.show-log .screen { flex: 1 1 auto; }
 .tile.show-log:not(.show-desktop) .screen { display: none; }
@@ -382,32 +493,33 @@ body {
 .empty h2 { font-size: 16px; color: var(--ink); }
 .empty p { color: var(--dimmer); font-size: 13px; }
 
-.capture {
-  position: absolute;
-  left: 14px;
-  bottom: 14px;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  background: rgba(12,14,18,.82);
-  border: 1px solid var(--line-2);
-  color: var(--accent-2);
-  font-family: var(--mono);
-  font-size: 11px;
-  backdrop-filter: blur(8px);
-  pointer-events: none;
-}
-.capture.hint { color: var(--dim); }
-.capture i { font-size: 14px; }
 .kbd {
   border: 1px solid var(--line-2);
   padding: 0 5px;
   border-radius: 4px;
   color: var(--ink);
 }
+
+.rfb-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 8;
+}
+.rfb-fly {
+  position: fixed;
+  overflow: hidden;
+  background: #07090d;
+  pointer-events: none;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.rfb-fly,
+.rfb-fly > * {
+  overflow: hidden !important;
+}
+.rfb-fly.is-hidden { visibility: hidden; }
+.rfb-fly.is-capturing { pointer-events: auto; z-index: 12; }
 
 /* Isolate-mode chat rail (widget lives in vendor/m-js-cmp-chat). */
 .stage.has-chat {

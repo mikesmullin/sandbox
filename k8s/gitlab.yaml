@@ -1,0 +1,127 @@
+# In-cluster GitLab CE (omnibus) for the agent-desktop Kind cluster.
+# Browse and git-push from desktop pods at http://gitlab (same-namespace
+# kube-dns: gitlab → gitlab.agent-desktop.svc.cluster.local). FQDN still
+# resolves; nginx also accepts that Host. external_url must match the URL
+# you type in Chromium or login CSRF/host checks 422.
+#
+# Root password is Secret `gitlab` / `root-password` (random, scripts/up.sh).
+# Written to tmp/gitlab_password.md on the host (gitignored). Never echo it.
+# Seed enables git-over-HTTP password auth, public default visibility, dark UI.
+# Do not set gitlab_rails['allowed_hosts'] — kube probes use the pod IP Host
+# header and would 403. nginx extra server_name still accepts the FQDN.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitlab
+  namespace: agent-desktop
+  labels:
+    app: gitlab
+spec:
+  type: ClusterIP
+  selector:
+    app: gitlab
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitlab
+  namespace: agent-desktop
+  labels:
+    app: gitlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitlab
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: gitlab
+    spec:
+      hostname: gitlab
+      automountServiceAccountToken: false
+      containers:
+        - name: gitlab
+          image: docker.io/gitlab/gitlab-ce:18.3.2-ce.0
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            - name: GITLAB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab
+                  key: root-password
+            - name: GITLAB_OMNIBUS_CONFIG
+              value: |
+                external_url 'http://gitlab'
+                nginx['listen_https'] = false
+                nginx['listen_port'] = 80
+                nginx['redirect_http_to_https'] = false
+                nginx['custom_gitlab_server_config'] = "server_name gitlab.agent-desktop.svc.cluster.local;"
+                letsencrypt['enable'] = false
+                prometheus_monitoring['enable'] = false
+                puma['worker_processes'] = 2
+                sidekiq['max_concurrency'] = 8
+                gitlab_rails['gitlab_signup_enabled'] = false
+                gitlab_rails['gitlab_default_theme'] = 2
+                gitlab_rails['gitlab_default_color_mode'] = 2
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 3Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: true
+            seccompProfile:
+              type: Unconfined
+          startupProbe:
+            httpGet:
+              path: /users/sign_in
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /users/sign_in
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /users/sign_in
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 10
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: gitlab-data
+              mountPath: /var/opt/gitlab
+            - name: gitlab-cfg
+              mountPath: /etc/gitlab
+            - name: gitlab-log
+              mountPath: /var/log/gitlab
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        - name: gitlab-data
+          emptyDir: {}
+        - name: gitlab-cfg
+          emptyDir: {}
+        - name: gitlab-log
+          emptyDir: {}

@@ -120,6 +120,40 @@ export function applyIncoming(store, msg) {
     store.applyNewSession?.(msg.sessionId)
     return
   }
+  if (msg.type === 'state') {
+    store.model = msg.model || store.model
+    if (Array.isArray(msg.models) && msg.models.length) store.models = msg.models
+    store.sessionId = msg.sessionId || store.sessionId
+    if (msg.allowlist != null) {
+      store.allowlist = String(msg.allowlist)
+      store.allowlistBaseline = String(msg.allowlistBaseline ?? msg.allowlist)
+      store.allowlistInited = true
+      if (msg.allowlistOverridden != null) {
+        store.allowlistOverridden = Boolean(msg.allowlistOverridden)
+      } else {
+        store.allowlistOverridden = (store.allowlist ?? '') !== (store.allowlistBaseline ?? '')
+      }
+    }
+    if (msg.contextWindow) store.contextWindow = Number(msg.contextWindow) || store.contextWindow
+    if (msg.tokensUsed != null && msg.tokensUsed !== '') {
+      const n = Number(msg.tokensUsed)
+      if (Number.isFinite(n) && n >= 0) store.tokensUsed = n
+    }
+    store.error = msg.error || ''
+    if (Array.isArray(msg.messages)) {
+      store.messages = msg.messages.map((m) => (m && typeof m === 'object' ? { ...m } : m))
+    }
+    const running = Boolean(msg.waiting || msg.phase === 'running')
+    store.waiting = running
+    if (running && msg.runStartedAt) {
+      store.startStopwatch?.(msg.runStartedAt)
+    } else if (!running) {
+      store.stopStopwatch?.({ freeze: false })
+      store._runStartedAt = 0
+    }
+    store.scrollBottom?.(true)
+    return
+  }
   if (msg.type === 'hello') {
     store.model = msg.model || store.model
     if (Array.isArray(msg.models) && msg.models.length) store.models = msg.models
@@ -136,7 +170,56 @@ export function applyIncoming(store, msg) {
     store.models = msg.models
     return
   }
-  if (msg.type === 'allowlist') return
+  if (msg.type === 'model' && msg.model) {
+    store.model = msg.model
+    if (msg.contextWindow) store.contextWindow = Number(msg.contextWindow) || store.contextWindow
+    return
+  }
+  if (msg.type === 'draft') return
+  if (msg.type === 'user') {
+    const text = String(msg.text || '')
+    if (!text) return
+    const last = store.messages[store.messages.length - 1]
+    if (last && last.kind === 'user' && last.text === text) return
+    store.messages.push({
+      id: crypto.randomUUID(),
+      kind: 'user',
+      text,
+      visible: true,
+      telemetry: null,
+    })
+    store.scrollBottom?.()
+    return
+  }
+  if (msg.type === 'allowlist') {
+    if (msg.text != null) {
+      store.allowlist = String(msg.text)
+      store.allowlistInited = true
+      if (msg.overridden != null) store.allowlistOverridden = Boolean(msg.overridden)
+      else store.allowlistOverridden = (store.allowlist ?? '') !== (store.allowlistBaseline ?? '')
+    }
+    return
+  }
+  if (msg.type === 'status') {
+    const running = msg.phase === 'running' || msg.waiting === true
+    store.waiting = running
+    if (msg.sessionId) store.sessionId = msg.sessionId
+    if (running) {
+      if (msg.runStartedAt && !store._runStartedAt) store.startStopwatch?.(msg.runStartedAt)
+    } else {
+      store.stopStopwatch?.({ freeze: true })
+      store._runStartedAt = 0
+    }
+    return
+  }
+  if (msg.type === 'approval' && (msg.id || msg.approvalId)) {
+    const aid = msg.id || msg.approvalId
+    const decision = msg.decision || msg.action || 'deny'
+    for (const m of store.messages) {
+      if (m.kind === 'approval_needed' && m.approvalId === aid) m.status = decision
+    }
+    return
+  }
   if (msg.type === 'assistant_delta') {
     const chunk = msg.text || ''
     if (!chunk) return
@@ -287,6 +370,7 @@ export function applyIncoming(store, msg) {
     store.freezeTelemetryOnLast?.('assistant')
     store.freezeTelemetryOnLast?.('reasoning')
     store.waiting = false
+    store._runStartedAt = 0
     store.stopStopwatch?.({ freeze: true })
     store.scrollBottom?.()
   }
@@ -333,6 +417,8 @@ export function createChatStore(M, opts = {}) {
     _elapsedT0: 0,
     _elapsedTimer: 0,
     _elapsedGen: 0,
+    _runStartedAt: 0,
+    _allowTimer: 0,
     _reconnect: opts.reconnect !== false,
     idPrefix,
 
@@ -356,6 +442,7 @@ export function createChatStore(M, opts = {}) {
       this.error = ''
       this.tokensUsed = 0
       this._lastGenInfo = null
+      this._runStartedAt = 0
       this.stopStopwatch({ freeze: false })
       this.messages.push({
         id: crypto.randomUUID(),
@@ -387,8 +474,10 @@ export function createChatStore(M, opts = {}) {
     attach(key) {
       const live = this._ws && (this._ws.readyState === WebSocket.OPEN || this._ws.readyState === WebSocket.CONNECTING)
       if (this.desktop === key && live && this.connected) return
+      const keepDraft = this.desktop === key && key ? this.draft : ''
       this.reset()
       this.desktop = key
+      this.draft = keepDraft
       if (!key) return
       transport.connect(this)
     },
@@ -418,7 +507,7 @@ export function createChatStore(M, opts = {}) {
       this._stick = true
       this._turnStartedAt = Date.now()
       this._lastGenInfo = null
-      if (!isNew) this.startStopwatch()
+      if (!isNew) this.startStopwatch(this._turnStartedAt)
       transport.send(this, {
         type: 'chat',
         content,
@@ -428,15 +517,16 @@ export function createChatStore(M, opts = {}) {
       this.scrollBottom(true)
     },
 
-    startStopwatch() {
+    startStopwatch(originWallMs) {
       this.stopStopwatch({ freeze: false })
-      this._elapsedT0 = performance.now()
+      this._runStartedAt = Number(originWallMs) || Date.now()
+      this._elapsedT0 = this._runStartedAt
       this._elapsedGen += 1
       const gen = this._elapsedGen
-      this.elapsed = '0.000s'
+      this.elapsed = formatElapsed(Date.now() - this._runStartedAt)
       const tick = () => {
         if (gen !== this._elapsedGen) return
-        const text = formatElapsed(performance.now() - this._elapsedT0)
+        const text = formatElapsed(Date.now() - this._runStartedAt)
         const el = typeof document !== 'undefined' && document.querySelector('.chat-elapsed')
         if (el) {
           el.textContent = text
@@ -499,6 +589,11 @@ export function createChatStore(M, opts = {}) {
       if (v != null) this.allowlist = v
       this.allowlistInited = true
       this.allowlistOverridden = (this.allowlist ?? '') !== (this.allowlistBaseline ?? '')
+      if (!this.connected) return
+      clearTimeout(this._allowTimer)
+      this._allowTimer = setTimeout(() => {
+        transport.setAllowlist(this, this.allowlist ?? '', this.allowlistOverridden)
+      }, 80)
     },
 
     onAllowlistBlur() {

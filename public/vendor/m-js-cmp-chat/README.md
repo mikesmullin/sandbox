@@ -43,7 +43,6 @@ M.mount('#app', {
          mode="sidebar"
          store="chat"
          id-prefix="desktop"
-         title="desktop agent"
          :show-tabs="false"
          :show-agent="false"
          :show-goto="false"
@@ -82,8 +81,8 @@ Host children fill the welcome `<slot>`. Feature flags default to the cowork ful
 | `mode` | `"sidebar"` | `"sidebar"` \| `"fullscreen"` |
 | `store` | `"chat"` | `M.store` name the widget reads |
 | `id-prefix` | `mjs-chat` / `mjs-chat-side` | Prefix for `#…-messages`, `#…-draft`, `#…-model`, `#…-agent`, `#…-allowlist` |
-| `title` | `"Session"` / `"Chat"` | Header + default welcome `<h1>` |
-| `show-tabs` | `true` | Tab strip. Sidebar with this off shows a single title chip |
+| `title` | `"Session"` / `"Chat"` | Default welcome `<h1>` when the host does not fill the slot |
+| `show-tabs` | `true` | Tab strip. Sidebar with this off hides tabs (status can still show) |
 | `show-history` | fullscreen only | Left session list |
 | `show-agent` | fullscreen only | Agent `<select>` |
 | `show-model` | `true` | Model `<select>` |
@@ -131,7 +130,7 @@ The widget does not own the wire. It calls methods on `M.store(store)` and reads
 
 Markdown / tool-card / telemetry helpers live in this package. A host store may override them.
 
-`createChatStore(M, { transport })` implements the single-session side of this contract. `wsTransport({ url })` speaks the angela WS protocol used by agent-desktop (`hello`, `assistant_delta`, `card`, `approval_needed`, `done`, …). Cowork keeps its own tabbed HTTP/NDJSON store and only mounts the widget.
+`createChatStore(M, { transport })` implements the single-session side of this contract. `wsTransport({ url })` speaks the angela WS protocol used by agent-desktop (`hello`, `state` snapshot, `user`, `assistant_delta`, `card`, `approval_needed`, `status`, `done`, …). One workspace session is shared across browsers: joining clients get `state` (history + allowlist + model + stopwatch); submitted prompts and live events broadcast to every socket. The composer is local until Send. Cowork keeps its own tabbed HTTP/NDJSON store and only mounts the widget.
 
 ## Theme
 

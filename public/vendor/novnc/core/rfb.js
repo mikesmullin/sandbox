@@ -2216,10 +2216,8 @@ export default class RFB extends EventTargetMixin {
         if (length >= 0) {
             //Standard msg
             const text = this._sock.rQshiftStr(length);
-            if (this._viewOnly) {
-                return true;
-            }
-
+            // Clipboard is display state, not pointer/keyboard input.
+            // Surface guest copies even while the control room is viewOnly.
             this.dispatchEvent(new CustomEvent(
                 "clipboard",
                 { detail: { text: text } }));
@@ -2307,10 +2305,6 @@ export default class RFB extends EventTargetMixin {
                 }
 
             } else if (actions === extendedClipboardActionProvide) {
-                if (this._viewOnly) {
-                    return true;
-                }
-
                 if (!(formats & extendedClipboardFormatText)) {
                     return true;
                 }

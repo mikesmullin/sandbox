@@ -16,11 +16,31 @@ export XDG_CACHE_HOME="${HOME}/.cache"
 export XDG_DATA_HOME="${HOME}/.local/share"
 export XDG_CURRENT_DESKTOP=XFCE
 export XFCE_PANEL_MIGRATE_DEFAULT=true
+export BROWSER="${BROWSER:-/usr/local/bin/browser-use-open}"
 export AGENT_BROWSER_HEADED=1
 export IN_DOCKER="${IN_DOCKER:-1}"
 export BROWSER_USE_CHROME_NO_SANDBOX="${BROWSER_USE_CHROME_NO_SANDBOX:-1}"
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}"
 unset AGENT_BROWSER_EXECUTABLE_PATH
+
+log() { printf '[%s] %s\n' "$1" "$2"; }
+
+# Host NVIDIA userspace is vendored at /opt/nvidia (see scripts/vendor-nvidia.sh).
+# Devices come from the pod spec (Kind node already sees host /dev/nvidia*).
+if [ -d /opt/nvidia/lib ]; then
+  export LD_LIBRARY_PATH="/opt/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+if [ -f /opt/nvidia/share/vulkan/icd.d/nvidia_icd.json ]; then
+  export VK_ICD_FILENAMES="/opt/nvidia/share/vulkan/icd.d/nvidia_icd.json${VK_ICD_FILENAMES:+:$VK_ICD_FILENAMES}"
+fi
+if [ -d /opt/nvidia/share/glvnd/egl_vendor.d ]; then
+  export __EGL_VENDOR_LIBRARY_DIRS="/opt/nvidia/share/glvnd/egl_vendor.d${__EGL_VENDOR_LIBRARY_DIRS:+:$__EGL_VENDOR_LIBRARY_DIRS}"
+fi
+if [ -d /opt/nvidia/share/egl/egl_external_platform.d ]; then
+  export __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS="/opt/nvidia/share/egl/egl_external_platform.d${__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS:+:$__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS}"
+fi
+export NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:-all}"
+export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-all}"
 
 mkdir -p \
   "$XDG_RUNTIME_DIR" \
@@ -29,16 +49,54 @@ mkdir -p \
   "$XDG_DATA_HOME" \
   "$HOME/.vnc" \
   "$HOME/.config/browser-use" \
-  /workspace
+  /workspace \
+  /workspace/jails
 
-# emptyDir hides the image /workspace. Point the jail at the bun-linked
+# emptyDir hides the image /workspace. Point node_modules at the bun-linked
 # vendor trees so `bun` from cwd does not fall through to npm's stale agl-ai.
-mkdir -p /workspace/node_modules
+# Per-XFCE-workspace file-io jails live under /workspace/jails/<id>/.
+mkdir -p /workspace/node_modules /workspace/jails
 ln -sfn /opt/vendor/agl /workspace/node_modules/agl-ai
 ln -sfn /opt/vendor/angela /workspace/node_modules/angela
 if [ ! -f /workspace/package.json ]; then
   printf '%s\n' '{"name":"desktop-workspace","private":true,"type":"module"}' > /workspace/package.json
 fi
+
+# Cluster GitLab. UI password lives on the host as tmp/gitlab_password.md.
+# Credential helper embeds it so git clone/push/pull never prompt. Never print it.
+# Git author is the container (pod hostname), not the XFCE workspace.
+GITLAB_URL="${GITLAB_URL:-http://gitlab}"
+export GITLAB_URL
+export ANGELA_JAILS_ROOT="${ANGELA_JAILS_ROOT:-/workspace/jails}"
+gitlab_pw="${GITLAB_ROOT_PASSWORD:-}"
+if [ -z "$gitlab_pw" ] && [ -s /opt/gitlab/root-password ]; then
+  gitlab_pw="$(tr -d '\r\n' < /opt/gitlab/root-password)"
+fi
+if command -v git >/dev/null 2>&1; then
+  pod="${HOSTNAME:-$(hostname 2>/dev/null || true)}"
+  pod="${pod%%.*}"
+  if [ -z "$pod" ] || [ "$pod" = "localhost" ]; then
+    pod="container"
+  fi
+  git config --global user.name "$pod"
+  git config --global user.email "${pod}@home.local"
+  git config --global init.defaultBranch main
+  git config --global --add safe.directory /workspace
+  git config --global --add safe.directory '*'
+  if [ -n "$gitlab_pw" ]; then
+    : > "$HOME/.git-credentials"
+    for host in gitlab gitlab.agent-desktop.svc.cluster.local; do
+      printf 'http://root:%s@%s\n' "$gitlab_pw" "$host" >> "$HOME/.git-credentials"
+    done
+    chmod 600 "$HOME/.git-credentials"
+    git config --global credential.helper store
+    log git "author ${pod}@home.local  credential helper for ${GITLAB_URL}"
+  else
+    log git "no GITLAB_ROOT_PASSWORD — git push to GitLab will prompt"
+  fi
+fi
+unset gitlab_pw
+unset GITLAB_ROOT_PASSWORD
 
 chmod 700 "$XDG_RUNTIME_DIR" || true
 
@@ -54,7 +112,14 @@ if [ -z "$NOVNC_WEB" ]; then
   exit 1
 fi
 
-log() { printf '[%s] %s\n' "$1" "$2"; }
+if [ -e /dev/nvidia0 ]; then
+  log gpu "host NVIDIA device /dev/nvidia0"
+else
+  log gpu "no /dev/nvidia0 — Chromium WebGL will be software"
+fi
+if [ -d /opt/nvidia/lib ] && ls /opt/nvidia/lib/libnvidia-glcore.so* >/dev/null 2>&1; then
+  log gpu "NVIDIA userspace /opt/nvidia/lib"
+fi
 
 wait_for_x() {
   local i
@@ -120,6 +185,8 @@ sleep 1
 
 # x11vnc talks only to localhost; noVNC/websockify is the published surface.
 log x11vnc "listening on 127.0.0.1:${VNC_PORT}"
+# XFIXES watches CLIPBOARD so guest copy reaches VNC ServerCutText.
+# -noprimary: selecting text must not clobber the host clipboard.
 x11vnc \
   -display "$DISPLAY" \
   -rfbport "$VNC_PORT" \
@@ -129,7 +196,7 @@ x11vnc \
   -nopw \
   -xkb \
   -noxdamage \
-  -noxfixes \
+  -noprimary \
   -repeat \
   -wait 10 \
   -defer 10 \
@@ -191,12 +258,10 @@ if [ -s /tmp/browser-use.cdp ]; then
 fi
 export AGENT_BROWSER_CDP="$CDP_TARGET"
 
-# Attach agent-browser to the browser-use instance (does not launch a second browser).
+# Do not attach a shared agent-browser --session here. Each XFCE workspace
+# pins its own session to its Chromium window from the Angela owner.
 if command -v agent-browser >/dev/null 2>&1; then
-  log agent-browser "connecting via CDP ${CDP_TARGET}"
-  agent-browser --cdp "$CDP_TARGET" --session desktop snapshot >/tmp/agent-browser-snapshot.txt 2>&1 || \
-    log agent-browser "initial snapshot skipped (browser still starting)"
-  log agent-browser "ready — run: agent-browser --cdp ${CDP_TARGET} --session desktop <cmd>"
+  log agent-browser "CDP ${CDP_TARGET} — per-workspace sessions attach from agent"
 else
   log agent-browser "binary not on PATH"
 fi
@@ -211,7 +276,13 @@ if [ -f /opt/agent/src/server.coffee ] && command -v bun >/dev/null 2>&1; then
     export AGENT_PORT DISPLAY CDP_PORT AGENT_BROWSER_CDP
     export ANGELA_MCP_ROOT="${ANGELA_MCP_ROOT:-/opt/mcp}"
     export ANGELA_PROJECT_ROOT="${ANGELA_PROJECT_ROOT:-/workspace}"
-    bun src/server.coffee
+    export ANGELA_JAILS_ROOT="${ANGELA_JAILS_ROOT:-/workspace/jails}"
+    unset GITLAB_ROOT_PASSWORD
+    while true; do
+      bun src/server.coffee
+      echo "angela exited $? — restart in 2s"
+      sleep 2
+    done
   ) 2>&1 | sed 's/^/[agent] /' &
 else
   log agent "skipped (bun or /opt/agent missing)"

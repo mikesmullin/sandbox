@@ -1,0 +1,15 @@
+[Default Applications]
+text/html=browser-use.desktop
+text/xml=browser-use.desktop
+application/xhtml+xml=browser-use.desktop
+x-scheme-handler/http=browser-use.desktop
+x-scheme-handler/https=browser-use.desktop
+x-scheme-handler/about=browser-use.desktop
+inode/directory=thunar.desktop
+
+[Added Associations]
+text/html=browser-use.desktop;
+text/xml=browser-use.desktop;
+application/xhtml+xml=browser-use.desktop;
+x-scheme-handler/http=browser-use.desktop;xfce4-web-browser.desktop;
+x-scheme-handler/https=browser-use.desktop;xfce4-web-browser.desktop;

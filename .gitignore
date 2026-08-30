@@ -6,6 +6,8 @@ agent/node_modules/
 tmp/
 *.log
 .DS_Store
+__pycache__/
+*.pyc
 
 # secrets — vendor-agent.sh copies CA locally; never commit keys
 .env
@@ -14,5 +16,6 @@ tmp/
 **/.copilot_tokens.json
 **/.angela/
 vendor/certs/
+vendor/nvidia/
 *.pem
 *.key

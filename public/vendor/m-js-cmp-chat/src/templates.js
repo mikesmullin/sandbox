@@ -396,12 +396,8 @@ export const chatTpl = `
           <i class="ph ph-list" aria-hidden="true"></i>
         </button>
 
-        <div class="sheet-chat-tabs" x-show="isSidebar && !want('showTabs')">
-          <div class="tab active">
-            <i class="ph ph-robot"></i>
-            <span x-text="welcomeTitle"></span>
-          </div>
-          <div class="chat-header-meta" x-show="want('showStatus')">
+        <div class="sheet-chat-tabs" x-show="isSidebar && !want('showTabs') && want('showStatus')">
+          <div class="chat-header-meta">
             <span class="chat-status" :class="statusClass" x-text="statusLabel"></span>
             <span class="chat-elapsed" x-show="elapsed" x-text="elapsed"></span>
           </div>
