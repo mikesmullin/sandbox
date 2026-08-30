@@ -146,6 +146,9 @@ spec:
               mountPath: /dev/nvidia-uvm-tools
             - name: nvidia-modeset
               mountPath: /dev/nvidia-modeset
+            - name: github-ssh
+              mountPath: /opt/github-ssh
+              readOnly: true
       volumes:
         - name: dshm
           emptyDir:
@@ -178,3 +181,8 @@ spec:
           hostPath:
             path: /dev/nvidia-modeset
             type: CharDevice
+        - name: github-ssh
+          secret:
+            secretName: github-ssh
+            optional: true
+            defaultMode: 0444

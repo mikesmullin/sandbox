@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/browser-use/venv/bin/python
 """Open a URL in a new window of the running browser-use Chromium via CDP.
 
 Does not spawn a second Chrome. Pins the new window to the current XFCE

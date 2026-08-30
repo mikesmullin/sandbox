@@ -145,8 +145,17 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/xfce-session.sh \
 
 # xdg-open / gio default-app lookups. Late so Playwright layers stay cached.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends xdg-utils git \
+    && apt-get install -y --no-install-recommends xdg-utils git openssh-client \
     && rm -rf /var/lib/apt/lists/*
+
+# Current git / gh / pyenv+CPython / uv / node+npm / bun / rust / go / zig / ruby.
+COPY scripts/install-devtools.sh /usr/local/bin/install-devtools.sh
+COPY scripts/devtools-profile.sh /etc/profile.d/devtools.sh
+RUN chmod +x /usr/local/bin/install-devtools.sh \
+    && /usr/local/bin/install-devtools.sh \
+    && printf '\n# desktop toolchains\n[ -f /etc/profile.d/devtools.sh ] && . /etc/profile.d/devtools.sh\n' \
+         >> /etc/bash.bashrc \
+    && chown -R agent:agent /home/agent
 
 # npm's agl-ai is stale. Link the vendored /workspace/agl tree (copied to
 # /opt/vendor/agl) so every cwd — including Angela's /workspace jail —

@@ -16,6 +16,10 @@ to 2000 lines / 50KiB; full output spills under `.angela/tmp/` when truncated.
 
 Progress: MCP `notifications/progress` with `{ progressToken, output }`.
 
+Cancel: MCP `notifications/cancelled` with `{ requestId }` (Stop / new prompt)
+aborts the matching in-flight `tools/call`, SIGTERM then SIGKILL the child, and
+returns `Command aborted`. `abortAllTermLocal()` kills every tracked child.
+
 ## Env
 
 - `MCP_TERM_CWD` — default working directory

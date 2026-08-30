@@ -84,6 +84,29 @@ export class McpStdioClient {
     return this.#request('tools/call', params);
   }
 
+  /**
+   * Cancel in-flight `tools/call` requests (Stop / new prompt).
+   * Sends MCP `notifications/cancelled` so the server can kill children, and
+   * rejects the local pending promises so the agent turn is not stuck if the
+   * server ignores cancel (browser MCP, etc.).
+   */
+  abort(reason = 'aborted') {
+    const err = mcpAbortError(reason);
+    for (const [id, p] of [...this.#pending]) {
+      if (p.method && p.method !== 'tools/call') continue;
+      this.#pending.delete(id);
+      this.#notify('notifications/cancelled', {
+        requestId: id,
+        reason: reason || 'aborted',
+      });
+      try {
+        p.reject(err);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   async close() {
     if (!this.#proc) return;
     try {
@@ -184,7 +207,7 @@ export class McpStdioClient {
     const id = this.#nextId++;
     const payload = { jsonrpc: '2.0', id, method, params };
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      this.#pending.set(id, { resolve, reject, method });
       this.#writeMsg(payload);
     });
   }
@@ -192,6 +215,12 @@ export class McpStdioClient {
   #notify(method, params) {
     this.#writeMsg({ jsonrpc: '2.0', method, params });
   }
+}
+
+export function mcpAbortError(reason = 'aborted') {
+  const e = new Error(reason || 'aborted');
+  e.aborted = true;
+  return e;
 }
 
 /** Raw MCP content parts (text / image / …). */
@@ -282,15 +311,37 @@ export function mcpResultImageMeta(result) {
 }
 
 /**
- * Best-effort: omit images only when the model is a known text-only id.
- * Unknown models keep the image attached (provider may drop it).
+ * Whether this model id is expected to accept image_url / image parts.
+ * Unknown ids default true (attach; the provider may drop).
+ *
+ * Gemma 4 is natively multimodal (text + image in, all sizes including
+ * 12B QAT and 26B-A4B). Do not require a "vision" / "vl" suffix — that
+ * was a Gemma 2 vs PaliGemma split and wrongly omitted Gemma 4 images.
  */
 export function modelSupportsImages(model) {
   const s = String(model || '').toLowerCase();
   if (!s) return true;
-  if (/\b(vision|vl-|vl\b|gpt-4o|gpt-4\.1|gpt-5|claude|gemini|omni)\b/.test(s)) return true;
-  if (/gemma/.test(s) && !/vision|vl/.test(s)) return false;
-  if (/\b(llama-?3|qwen2(?:\.5)?|mistral|deepseek|coder)\b/.test(s) && !/vision|vl/.test(s)) {
+
+  if (
+    /\b(vision|vl-|vl\b|gpt-4o|gpt-4\.1|gpt-5|claude|gemini|omni|paligemma)\b/.test(s)
+  ) {
+    return true;
+  }
+
+  // Gemma 4 family: E2B, E4B, 12B, 26B-A4B, 31B — image input on all.
+  if (/gemma[-_]?4/.test(s)) return true;
+  // Gemma 3n + Gemma 3 4B/12B/27B
+  if (/gemma[-_]?3n/.test(s)) return true;
+  if (/gemma[-_]?3-?(4|12|27)b/.test(s)) return true;
+
+  // Known text-only
+  if (/gemma[-_]?2/.test(s)) return false;
+  if (/gemma[-_]?3-?(270m|1b)\b/.test(s)) return false;
+  if (/gemma[-_]?1\b/.test(s)) return false;
+  if (
+    /\b(llama-?3|qwen2(?:\.5)?|mistral|deepseek|coder)\b/.test(s) &&
+    !/vision|vl/.test(s)
+  ) {
     return false;
   }
   return true;

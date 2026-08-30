@@ -23,6 +23,17 @@ DEFAULT_MODEL = process.env.AGENT_MODEL or 'llama-server:default'
 DAD_URL = process.env.DAD_PROXY_URL or process.env.LLAMA_SERVER_BASE_URL or 'https://host.containers.internal:1234'
 DAD_KEY = process.env.DAD_PROXY_API_KEY or process.env.LLM_PROXY_API_KEY or process.env.LLAMA_SERVER_API_KEY or ''
 DAD_CA = process.env.DAD_PROXY_CA_FILE or process.env.LLAMA_SERVER_CA_FILE or '/opt/certs/ca.pem'
+
+# Agent.factory({ proxy: 'host:port' }) — every provider:model POSTs here.
+dadProxyHostPort = (url = DAD_URL) ->
+  s = String(url or '').trim()
+  return '' unless s
+  try
+    u = new URL(if /^[a-z][a-z0-9+.-]*:\/\//i.test(s) then s else "https://#{s}")
+    if u.port then "#{u.hostname}:#{u.port}" else u.hostname
+  catch
+    s.replace(/^https?:\/\//i, '').replace(/\/.*$/, '')
+
 CDP_PORT = String process.env.CDP_PORT or '9222'
 CDP_TARGET = String(process.env.AGENT_BROWSER_CDP or CDP_PORT)
 DISPLAY = process.env.DISPLAY or ':99'
@@ -594,6 +605,7 @@ doEnsure = (name) ->
   unless room.createOpts?
     room.createOpts =
       model: room.model
+      proxy: dadProxyHostPort()
       base_url: DAD_URL
       api_key: DAD_KEY
       ca_file: DAD_CA

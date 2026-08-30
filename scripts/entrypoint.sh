@@ -23,6 +23,12 @@ export BROWSER_USE_CHROME_NO_SANDBOX="${BROWSER_USE_CHROME_NO_SANDBOX:-1}"
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}"
 unset AGENT_BROWSER_EXECUTABLE_PATH
 
+# pyenv / rustup / go / node / zig / rbenv (see scripts/install-devtools.sh)
+if [ -f /etc/profile.d/devtools.sh ]; then
+  # shellcheck disable=SC1091
+  . /etc/profile.d/devtools.sh
+fi
+
 log() { printf '[%s] %s\n' "$1" "$2"; }
 
 # Host NVIDIA userspace is vendored at /opt/nvidia (see scripts/vendor-nvidia.sh).
@@ -94,6 +100,31 @@ if command -v git >/dev/null 2>&1; then
     log git "author ${pod}@home.local  credential helper for ${GITLAB_URL}"
   else
     log git "no GITLAB_ROOT_PASSWORD — git push to GitLab will prompt"
+  fi
+  if [ -s /opt/github-ssh/id_ed25519 ]; then
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    if ! cp /opt/github-ssh/id_ed25519 "$HOME/.ssh/id_ed25519"; then
+      log git "github ssh: could not copy private key (check secret mode)"
+    else
+      [ -s /opt/github-ssh/id_ed25519.pub ] && cp /opt/github-ssh/id_ed25519.pub "$HOME/.ssh/id_ed25519.pub"
+      [ -s /opt/github-ssh/known_hosts ] && cp /opt/github-ssh/known_hosts "$HOME/.ssh/known_hosts"
+      chmod 600 "$HOME/.ssh/id_ed25519"
+      chmod 644 "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/known_hosts" 2>/dev/null || true
+      printf '%s\n' \
+        'Host github.com' \
+        '  HostName github.com' \
+        '  User git' \
+        '  IdentityFile ~/.ssh/id_ed25519' \
+        '  IdentitiesOnly yes' \
+        '  StrictHostKeyChecking yes' \
+        > "$HOME/.ssh/config"
+      chmod 600 "$HOME/.ssh/config"
+      git config --global --unset-all url.git@github.com:.insteadof 2>/dev/null || true
+      git config --global --add url.git@github.com:.insteadOf https://github.com/
+      git config --global --add url.git@github.com:.insteadOf https://www.github.com/
+      log git "github ssh identity installed (https://github.com → git@github.com)"
+    fi
   fi
 fi
 unset gitlab_pw

@@ -105,6 +105,20 @@ kubectl -n "$NS" create secret generic gitlab \
 echo "[up] gitlab secret: present"
 unset gitlab_pw
 
+# GitHub SSH for in-pod git push (host secrets/github-ssh/, gitignored).
+# Never echo the private key.
+gh_ssh="$ROOT/secrets/github-ssh"
+if [[ -s "$gh_ssh/id_ed25519" ]]; then
+  kubectl -n "$NS" create secret generic github-ssh \
+    --from-file=id_ed25519="$gh_ssh/id_ed25519" \
+    --from-file=id_ed25519.pub="$gh_ssh/id_ed25519.pub" \
+    --from-file=known_hosts="$gh_ssh/known_hosts" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  echo "[up] github-ssh secret: present"
+else
+  echo "[up] github-ssh secret: skip (no $gh_ssh/id_ed25519)"
+fi
+
 kubectl apply -f "$ROOT/k8s/gitlab.yaml"
 kubectl apply -f "$ROOT/k8s/desktop.yaml"
 kubectl apply -f "$ROOT/k8s/dashboard.yaml"

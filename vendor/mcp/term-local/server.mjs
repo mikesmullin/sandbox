@@ -174,8 +174,32 @@ function createProgressEmitter(ctx) {
   };
 }
 
-function runProcess(command, args, { cwd, env, track = false, timeoutSec, onChunk } = {}) {
+function killChild(child) {
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    /* ignore */
+  }
+  setTimeout(() => {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }, 1000);
+}
+
+function runProcess(command, args, { cwd, env, track = false, timeoutSec, onChunk, signal } = {}) {
   return new Promise((resolvePromise) => {
+    if (signal?.aborted) {
+      resolvePromise({
+        code: 130,
+        merged: '',
+        timedOut: false,
+        aborted: true,
+      });
+      return;
+    }
     const child = spawn(command, args, {
       cwd: cwd || DEFAULT_CWD,
       env: env || process.env,
@@ -184,18 +208,22 @@ function runProcess(command, args, { cwd, env, track = false, timeoutSec, onChun
     if (track) activeChildren.add(child);
     let merged = '';
     let timedOut = false;
+    let aborted = false;
     let timer;
+    const onAbort = () => {
+      aborted = true;
+      killChild(child);
+    };
     if (timeoutSec && Number(timeoutSec) > 0) {
       timer = setTimeout(() => {
         timedOut = true;
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-        setTimeout(() => {
-          try { child.kill('SIGKILL'); } catch { /* ignore */ }
-        }, 1000);
+        killChild(child);
       }, Number(timeoutSec) * 1000);
     }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     const done = (result) => {
       if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
       if (track) activeChildren.delete(child);
       resolvePromise(result);
     };
@@ -214,13 +242,14 @@ function runProcess(command, args, { cwd, env, track = false, timeoutSec, onChun
         aborted: false,
       });
     });
-    child.on('close', (code, signal) => {
-      const aborted = !timedOut && (signal === 'SIGTERM' || signal === 'SIGKILL');
+    child.on('close', (code, sig) => {
+      const wasAbort =
+        aborted || (!timedOut && (sig === 'SIGTERM' || sig === 'SIGKILL'));
       done({
-        code: timedOut ? 124 : aborted ? 130 : (code ?? 0),
+        code: timedOut ? 124 : wasAbort ? 130 : (code ?? 0),
         merged,
         timedOut,
-        aborted,
+        aborted: wasAbort && !timedOut,
         timeoutSec: timedOut ? Number(timeoutSec) : undefined,
       });
     });
@@ -298,7 +327,7 @@ function finishShellResult(formatted, raw) {
   return textResult(text || '(no output)');
 }
 
-async function runJustBash(script, { cwd, timeoutSec, onChunk } = {}) {
+async function runJustBash(script, { cwd, timeoutSec, onChunk, signal } = {}) {
   checkAllow(script);
   const body = withEnvExports(String(script));
   const args = ['-c', body, '--root', JB_ROOT];
@@ -319,6 +348,7 @@ async function runJustBash(script, { cwd, timeoutSec, onChunk } = {}) {
     track: true,
     timeoutSec,
     onChunk,
+    signal,
   });
 }
 
@@ -345,6 +375,7 @@ const tools = {
         cwd,
         timeoutSec: timeout,
         onChunk: (_chunk, merged) => progress.push(merged),
+        signal: ctx?.signal,
       });
       progress.flush();
       const formatted = await formatShellOutput(raw.merged, { jailRoot: JB_ROOT });
@@ -381,6 +412,7 @@ const tools = {
         track: true,
         timeoutSec: timeout,
         onChunk: (_chunk, merged) => progress.push(merged),
+        signal: ctx?.signal,
       });
       progress.flush();
       const formatted = await formatShellOutput(raw.merged, { jailRoot: workdir });

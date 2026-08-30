@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/browser-use/venv/bin/python
 """Launch a headed browser-use Chromium on DISPLAY and keep it alive.
 
 Stealth launch args come from browser-use (no --enable-automation, blink

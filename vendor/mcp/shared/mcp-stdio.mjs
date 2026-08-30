@@ -17,6 +17,7 @@ export function textResult(text, isError = false) {
  *   handler: (args: object, ctx?: {
  *     notify: (method: string, params: object) => void,
  *     progressToken: unknown,
+ *     signal: AbortSignal,
  *   }) => Promise<object> | object
  * }> }} options
  */
@@ -30,6 +31,8 @@ export async function runMcpStdioServer(options) {
 
   let buffer = '';
   let closed = false;
+  /** @type {Map<string|number, AbortController>} */
+  const inFlight = new Map();
 
   const write = (msg) => {
     if (closed) return;
@@ -40,11 +43,33 @@ export async function runMcpStdioServer(options) {
   const respondError = (id, code, message) =>
     write({ jsonrpc: '2.0', id, error: { code, message } });
 
+  function abortInFlight(requestId, reason) {
+    const why = reason || 'cancelled';
+    for (const [id, ac] of inFlight) {
+      if (requestId != null && requestId !== '' && String(id) !== String(requestId)) {
+        continue;
+      }
+      if (!ac.signal.aborted) {
+        try {
+          ac.abort(why);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
   async function handleMessage(msg) {
     if (!msg || typeof msg !== 'object') return;
 
-    // notifications (no id)
+    // notifications (no id) — Stop sends notifications/cancelled
     if (msg.method && msg.id === undefined) {
+      if (
+        msg.method === 'notifications/cancelled' ||
+        msg.method === 'cancelled'
+      ) {
+        abortInFlight(msg.params?.requestId, msg.params?.reason);
+      }
       return;
     }
 
@@ -79,12 +104,15 @@ export async function runMcpStdioServer(options) {
           return;
         }
         const progressToken = params?._meta?.progressToken;
+        const ac = new AbortController();
+        inFlight.set(id, ac);
         const ctx = {
           notify: (methodName, nparams) => {
             if (!methodName) return;
             write({ jsonrpc: '2.0', method: methodName, params: nparams || {} });
           },
           progressToken,
+          signal: ac.signal,
         };
         try {
           const result = await def.handler(args, ctx);
@@ -97,6 +125,8 @@ export async function runMcpStdioServer(options) {
           }
         } catch (err) {
           respond(id, textResult(err?.message || String(err), true));
+        } finally {
+          inFlight.delete(id);
         }
         return;
       }
