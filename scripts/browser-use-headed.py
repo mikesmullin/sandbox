@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import json
 import os
+import re
 import signal
 import sys
 from pathlib import Path
+from urllib.request import urlopen
 from urllib.parse import urlparse
 
 CDP_FILE = Path(os.environ.get("BROWSER_USE_CDP_FILE", "/tmp/browser-use.cdp"))
@@ -59,6 +62,28 @@ def write_cdp(url: str) -> None:
     port = parsed.port or PREFERRED_PORT
     PORT_FILE.write_text(str(port) + "\n")
     print(f"[browser-use] cdp={url}", flush=True)
+
+
+def discover_cdp() -> str | None:
+    for cmdline_path in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            cmdline = Path(cmdline_path).read_bytes().replace(b"\0", b" ").decode()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "chrome" not in cmdline:
+            continue
+        match = re.search(r"--remote-debugging-port=(\d+)", cmdline)
+        if not match:
+            continue
+        url = f"http://127.0.0.1:{match.group(1)}"
+        try:
+            with urlopen(f"{url}/json/version", timeout=0.2) as response:
+                data = json.load(response)
+            if data.get("webSocketDebuggerUrl"):
+                return url
+        except Exception:
+            continue
+    return None
 
 
 async def main() -> int:
@@ -119,8 +144,20 @@ async def main() -> int:
             },
         },
     )
-    await browser.start()
-    cdp = browser.cdp_url or f"http://127.0.0.1:{PREFERRED_PORT}"
+    start_task = asyncio.create_task(browser.start())
+    cdp = None
+    for _ in range(240):
+        if start_task.done():
+            await start_task
+            cdp = browser.cdp_url
+            break
+        cdp = await asyncio.to_thread(discover_cdp)
+        if cdp:
+            break
+        await asyncio.sleep(0.25)
+    if not cdp:
+        await start_task
+        cdp = browser.cdp_url or f"http://127.0.0.1:{PREFERRED_PORT}"
     write_cdp(cdp)
 
     stop = asyncio.Event()

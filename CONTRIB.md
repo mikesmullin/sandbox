@@ -19,6 +19,7 @@ Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (Selk
 | `public/` | SPA: m-js + Phosphor. `js/app.js` tiles scrot thumbnails and, in isolate view, embeds the Selkies client in an `<iframe>` (`src=/desktops/:name/`); isolate-mode chat is `x-component="mjs-chat"` from `public/vendor/m-js-cmp-chat` (`js/chat.js` is the WS store). |
 | `agent/` | In-pod Angela harness (`src/server.coffee`). `agl-ai` / `angela` are `link:` deps. |
 | `Dockerfile` | Debian bookworm desktop: Xvfb, XFCE, headed browser-use Chromium, PulseAudio, Selkies (pip venv at `/opt/selkies`: `selkies` + `pixelflux` + `pcmflux`), bun, agent-browser 0.35.1 (`mcp` subcommand), plus current git/gh/pyenv/python/uv/node/npm/rust/go/zig/ruby (`scripts/install-devtools.sh`). |
+| `patches/selkies-start-video.patch` | Makes the non-shared WebSocket client request its initial video stream; remove after the pinned Selkies revision includes the upstream fix. |
 | `Dockerfile.dashboard` | Bun Alpine + kubectl; copies `src/` + `public/`. |
 | `k8s/` | Namespace, RBAC (dashboard may list/create/delete pods and read the StatefulSet template), desktop StatefulSet (template only, 0 replicas), dashboard Deployment, GitLab CE (`gitlab.yaml`, ClusterIP on `http://gitlab`). |
 | `kind/cluster.yaml` | Extra port map 30080→8090, kubelet `podPidsLimit: 8192`. |
@@ -34,7 +35,22 @@ Host mode uses your kubeconfig and `kubectl port-forward` for each desktop (Selk
 
 Images: `agent-desktop:latest` (pods), `agent-desktop-ui:latest` (dashboard). Both use `imagePullPolicy: Never`.
 
+The lightweight ARM64 build still includes Git, GitHub CLI, GCC/G++, Make,
+CMake, Python/pip/uv, Node/npm, Bun, Rust/Cargo, Go, Zig, Ruby, and common
+network diagnostics (`ping`, `dig`, `nslookup`, `traceroute`, `ip`, `ss`,
+`netcat`, `tcpdump`, `nmap`, `lsof`, `jq`, and `rsync`). It skips only the slow
+from-source upgrades performed by `INSTALL_FULL_DEVTOOLS=1`.
+
+`copilot:gpt-5.6-luna` uses non-streaming inference because the Copilot Responses
+route rejects streaming requests. Model changes rebind the active Angela agent
+in place so its connected MCP clients and tool catalog are reused.
+
 GPU: Kind's node is privileged, so it already sees host `/dev/nvidia*` and `/dev/dri`. Desktop pods mount those devices and run privileged so the device cgroup allows them. NVIDIA userspace is copied from the host by `vendor-nvidia.sh` into the image (`/opt/nvidia`). Several pods share the same GPU (time-sliced; no VRAM isolation). Re-run `vendor-nvidia.sh` after a driver update, then rebuild the **desktop** image. Host has no `nvidia-ctk` CDI here — we do not use `--device nvidia.com/gpu=all`.
+
+On macOS, Podman exposes a virtual `/dev/dri` device through the VM and kind,
+but Mesa identifies it as `llvmpipe` (`Accelerated: no`, Vulkan device type
+CPU). This is software rendering, not Apple GPU/Metal passthrough. Real GPU
+forwarding therefore requires a Linux host with supported DRM or NVIDIA devices.
 
 ## m-js
 
@@ -272,10 +288,10 @@ GitLab emptyDir keeps repos until that Deployment is recreated. Rolling a **desk
 - CONTEXT LOOP (`goto`, `loop_start_marker`, `waypoint`) is an opt-in angela MCP preset, not a builtin. This harness does not load `context-loop`; `stripContextLoop` still drops those names plus `term_local__bash` and `browser__close` after `listToolCatalog`.
 - Approvals: broadcast from PolicyEngine `onEvent` only. Duplicate cards with the same id are one approval — Allow/Deny one of them.
 - Abort/Stop is **not** queued behind the in-flight chat turn. It also cancels in-flight MCP `tools/call` (sends `notifications/cancelled` and rejects the pending promise) so a blocking `term_local__exec` cannot hold `runLock`. term-local SIGTERM/SIGKILL the child.
-- Capture/gaming mode: the isolate view is the Selkies HTML5 client in an `<iframe allow="pointer-lock; fullscreen; clipboard-read; clipboard-write; gamepad">`. Click into the stream to control it; **Ctrl+Shift+X** is Selkies gaming mode (fullscreen + pointer lock + keyboard grab, forwarding `movementX/Y` deltas — the reason for the switch from VNC). Hold **Esc** to leave gaming mode; a plain **Esc** (not pointer-locked) or the toolbar **wall** button returns to the wall. Pointer lock works because `127.0.0.1` is a secure context and the iframe is same-origin. Clicking a workspace thumbnail isolates; there is no separate “open”.
+- Mouse input: the isolate view is the Selkies HTML5 client in an `<iframe allow="fullscreen; clipboard-read; clipboard-write; gamepad; autoplay">`. Ordinary clicks and movement use visible absolute-pointer mode. The toolbar **mouse lock** and **Ctrl+Shift+X** are reserved for relative gaming input, where the browser cursor is intentionally hidden. Hold **Esc** to leave gaming mode; a plain **Esc** (not pointer-locked) or the toolbar **wall** button returns to the wall. Clicking a workspace thumbnail isolates; there is no separate “open”.
 - Hash router (`M.Router.setMode('hash')`): wall is `#/` (or empty); isolate-mode is `#/c/:container/w/:workspace`. Isolate pushes a history entry; Esc / wall / browser Back return to the wall; Forward restores the last workspace. Refresh keeps the hash. Do not remount the App on `Router.onChange` — that would reload the Selkies iframe.
 - Clipboard: handled by the Selkies client itself (two-way text, secure-context/localhost). No RFB clipboard bridge in the SPA anymore. Restart the **desktop** image after changing the Selkies launch flags.
-- Audio: PulseAudio runs headless in the pod with a `module-null-sink` named `stream`; `pcmflux` captures its monitor and Selkies streams Opus. The iframe carries `allow="autoplay"`. No physical audio device.
+- Audio: PulseAudio runs headless in the pod with a `module-null-sink` named `stream`. The laptop-tools template currently disables Selkies audio while its web client initializes an invalid decoder configuration before applying server settings. No physical audio device.
 - Desktop refresh every 3s must not rewrite `ui.items` when name/ready/phase/restarts are unchanged (that redraw used to reset the allowlist).
 - Each XFCE workspace has its own Angela session, chat socket (`/desktops/:pod/workspaces/:id/agent` → in-pod `/workspaces/:id/ws`), and file-io jail (`/workspace/jails/workspace-<hex>/` = Angela `projectRoot` / `MCP_FILE_ROOT` / `MCP_TERM_CWD`). `/new` starts a new Angela session for **that** workspace only (same Chromium window). Rebuild the **desktop** image after changing angela for this to apply in-pod.
 - Git author is **per container**, set once in `~/.gitconfig` from the pod hostname (`user.email = container-<podhex>@home.local`). No workspace id in the email. GitLab is cluster-local; git CLI uses the credential helper (UI password is host `tmp/gitlab_password.md`, not chat). GitHub push uses Secret `github-ssh` (host `secrets/github-ssh/`, gitignored) mounted at `/opt/github-ssh`. Prefer `git push origin main` and `git commit --file …` — this model mangles `-u` / `-m` into `-1`. Do not auto-`git init` / clone / worktree on `+ workspace`; Angela decides inside the jail.

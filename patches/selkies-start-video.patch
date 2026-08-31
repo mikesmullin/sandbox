@@ -1,0 +1,12 @@
+--- a/selkies-ws-core.js
++++ b/selkies-ws-core.js
+@@ -6391,6 +6391,9 @@
+             }
+         } else {
+             if (websocket && websocket.readyState === WebSocket.OPEN) {
++              websocket.send('START_VIDEO');
++              armStartVideoWatchdog();
++              console.log('Sent START_VIDEO for initial controller stream.');
+               if (isAudioPipelineActive) websocket.send('START_AUDIO');
+             }
+         }

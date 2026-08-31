@@ -43,9 +43,10 @@ ln -sfn /opt/cargo/bin/cargo /usr/local/bin/cargo
 ln -sfn /opt/cargo/bin/rustup /usr/local/bin/rustup
 export PATH="/opt/cargo/bin:/usr/local/bin:$PATH"
 
-# --- git (build latest stable tag) ---
-GIT_VER="$(curl -fsSL https://api.github.com/repos/git/git/tags \
-  | python3 -c 'import json,re,sys
+# --- git (build latest stable tag unless the image requests packaged Git) ---
+if [[ "${SKIP_GIT_SOURCE_BUILD:-0}" != "1" ]]; then
+  GIT_VER="$(curl -fsSL https://api.github.com/repos/git/git/tags \
+    | python3 -c 'import json,re,sys
 try:
     tags=json.load(sys.stdin)
 except Exception:
@@ -55,13 +56,16 @@ for t in tags:
     if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", n):
         print(n); break
 ' || true)"
-GIT_VER="${GIT_VER:-2.51.0}"
-log "git $GIT_VER"
-curl -fsSL "https://codeload.github.com/git/git/tar.gz/refs/tags/v${GIT_VER}" \
-  | tar -xz -C /tmp
-make -C "/tmp/git-${GIT_VER}" prefix=/usr/local all -j"$(nproc)"
-make -C "/tmp/git-${GIT_VER}" prefix=/usr/local install
-rm -rf "/tmp/git-${GIT_VER}"
+  GIT_VER="${GIT_VER:-2.51.0}"
+  log "git $GIT_VER"
+  curl -fsSL "https://codeload.github.com/git/git/tar.gz/refs/tags/v${GIT_VER}" \
+    | tar -xz -C /tmp
+  make -C "/tmp/git-${GIT_VER}" prefix=/usr/local all -j"$(nproc)"
+  make -C "/tmp/git-${GIT_VER}" prefix=/usr/local install
+  rm -rf "/tmp/git-${GIT_VER}"
+else
+  log "git source build skipped; using $(git --version)"
+fi
 
 # --- Node.js + npm (newest Current) ---
 NODE_VER="$(curl -fsSL https://nodejs.org/dist/index.json \

@@ -1,5 +1,6 @@
-import M from '/vendor/m.min.js'
+import M from '../vendor/m.min.js'
 import { drawGauge, drawSpark, formatBytes, formatBps, SPARK_N } from './components/Spark.js'
+import { withBase, wsUrl } from './paths.js'
 
 const MAX_LINES = 400
 const SPARK_KEYS = ['cpu', 'netRx', 'netTx', 'diskR', 'diskW']
@@ -53,8 +54,6 @@ export const toggleGauges = (d, ev) => {
   ev?.stopPropagation?.()
   setPane(d.name, { gauges: !wantGauges(d) })
 }
-
-const proto = () => (location.protocol === 'https:' ? 'wss:' : 'ws:')
 
 const logEl = (name) => {
   const shell = document.querySelector(`.log-for-${CSS.escape(name)}`)
@@ -153,7 +152,7 @@ export const onLogScroll = (name, ev) => {
 
 const connectLogs = (name) => {
   if (logSocks.has(name)) return
-  const ws = new WebSocket(`${proto()}//${location.host}/desktops/${encodeURIComponent(name)}/logs`)
+  const ws = new WebSocket(wsUrl(`/desktops/${encodeURIComponent(name)}/logs`))
   logSocks.set(name, ws)
   logPinned.set(name, true)
   logScroll.delete(name)
@@ -235,7 +234,7 @@ const telemTimers = new Map()
 
 const pollTelem = async (name) => {
   try {
-    const res = await fetch(`/api/desktops/${encodeURIComponent(name)}/telem`)
+    const res = await fetch(withBase(`/api/desktops/${encodeURIComponent(name)}/telem`))
     const sample = await res.json()
     if (!res.ok) throw new Error(sample.error || res.statusText)
     const prev = telem.byName[name] || { series: emptySeries() }

@@ -1,7 +1,6 @@
-import M from '/vendor/m.min.js'
-import { createChatStore, wsTransport } from '/vendor/m-js-cmp-chat/src/index.js'
-
-const proto = () => (location.protocol === 'https:' ? 'wss:' : 'ws:')
+import M from '../vendor/m.min.js'
+import { createChatStore, wsTransport } from '../vendor/m-js-cmp-chat/src/index.js'
+import { wsUrl } from './paths.js'
 
 export const chat = createChatStore(M, {
   name: 'chat',
@@ -20,10 +19,10 @@ export const chat = createChatStore(M, {
         const name = key.slice(0, split)
         const ws = key.slice(split + 2)
         if (name && ws) {
-          return `${proto()}//${location.host}/desktops/${encodeURIComponent(name)}/workspaces/${encodeURIComponent(ws)}/agent`
+          return wsUrl(`/desktops/${encodeURIComponent(name)}/workspaces/${encodeURIComponent(ws)}/agent`)
         }
       }
-      return `${proto()}//${location.host}/desktops/${encodeURIComponent(key)}/agent`
+      return wsUrl(`/desktops/${encodeURIComponent(key)}/agent`)
     },
   }),
 })

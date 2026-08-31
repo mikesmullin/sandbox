@@ -2,6 +2,7 @@ import express from 'express'
 import httpProxy from 'http-proxy'
 import { watch } from 'fs'
 import { extname, resolve } from 'path'
+import { importSPKI, jwtVerify } from 'jose'
 import { listDesktops, getDesktop, getScale, setScale, createContainer, deleteContainer, resolveTarget, dropForward } from './k8s.coffee'
 import { snapshotInfo, captureSnapshot, clearSnapshot } from './snapshot.coffee'
 import { attachLogClient, detachLogClient } from './logs.coffee'
@@ -10,6 +11,46 @@ PORT = Number process.env.PORT or 8080
 PUBLIC_DIR = resolve import.meta.dir, '../public'
 IN_CLUSTER = Boolean process.env.KUBERNETES_SERVICE_HOST
 HMR = not IN_CLUSTER and process.env.HMR isnt '0'
+BASE_PATH = String(process.env.BASE_PATH or '').trim().replace(/\/+$/, '')
+BASE_PATH = '' if BASE_PATH is '/'
+unless BASE_PATH is '' or BASE_PATH.startsWith '/'
+  throw new Error 'BASE_PATH must be empty or start with /'
+
+AUTH_COOKIE_NAME = process.env.AUTH_COOKIE_NAME or 'sretools_session'
+AUTH_ISSUER = process.env.AUTH_JWT_ISSUER or 'dev-sretools-auth'
+AUTH_AUDIENCE = process.env.AUTH_JWT_AUDIENCE or 'dev-sretools-apps'
+authPublicKey = String(process.env.AUTH_JWT_PUBLIC_KEY or '').trim()
+if not authPublicKey and process.env.AUTH_JWT_PUBLIC_KEY_FILE
+  authPublicKey = String(await Bun.file(process.env.AUTH_JWT_PUBLIC_KEY_FILE).text()).trim()
+authKey = if authPublicKey then await importSPKI(authPublicKey, 'EdDSA') else null
+
+stripBasePath = (pathname) ->
+  return pathname unless BASE_PATH
+  return '/' if pathname is BASE_PATH
+  return pathname.slice(BASE_PATH.length) if pathname.startsWith "#{BASE_PATH}/"
+  null
+
+cookieValue = (req, name) ->
+  for part in String(req.headers.get('cookie') or '').split ';'
+    i = part.indexOf '='
+    continue if i < 0
+    return part.slice(i + 1).trim() if part.slice(0, i).trim() is name
+  ''
+
+requireAuth = (req, originalPath) ->
+  return null unless authKey
+  token = cookieValue req, AUTH_COOKIE_NAME
+  try
+    await jwtVerify token, authKey,
+      issuer: AUTH_ISSUER
+      audience: AUTH_AUDIENCE
+      algorithms: ['EdDSA']
+    null
+  catch
+    acceptsHtml = req.method is 'GET' and String(req.headers.get('accept') or '').includes 'text/html'
+    unless req.headers.get('upgrade') or not acceptsHtml
+      return Response.redirect "/login?redirect=#{encodeURIComponent originalPath}", 302
+    Response.json { error: 'Unauthorized' }, { status: 401 }
 
 app = express()
 app.disable 'x-powered-by'
@@ -284,8 +325,10 @@ app.use '/desktops/:name', (req, res) ->
 
 indexHtml = ->
   html = await Bun.file(resolve PUBLIC_DIR, 'index.html').text()
+  baseHref = "#{BASE_PATH or ''}/"
+  html = html.replace '<!-- base-path -->', "<base href=\"#{baseHref}\">"
   if HMR and not html.includes 'hot-client.js'
-    snippet = '  <script type="module" src="/js/hot-client.js"></script>\n'
+    snippet = '  <script type="module" src="js/hot-client.js"></script>\n'
     html = html.replace '</body>', "#{snippet}</body>"
   html
 
@@ -344,7 +387,15 @@ expressServer = app.listen 0, '127.0.0.1', ->
     idleTimeout: 0
     fetch: (req, server) ->
       url = new URL req.url
-      if url.pathname is '/__m_hmr'
+      originalPath = url.pathname + url.search
+      pathname = stripBasePath url.pathname
+      return new Response 'not found', { status: 404 } unless pathname?
+      if BASE_PATH and url.pathname is BASE_PATH
+        return Response.redirect "#{url.origin}#{BASE_PATH}/", 308
+      unless pathname is '/api/health'
+        authResponse = await requireAuth req, originalPath
+        return authResponse if authResponse
+      if pathname is '/__m_hmr'
         unless HMR
           return new Response 'hmr off', { status: 404 }
         if req.headers.get('upgrade')?.toLowerCase() is 'websocket'
@@ -352,13 +403,13 @@ expressServer = app.listen 0, '127.0.0.1', ->
             return undefined
           return new Response 'upgrade failed', { status: 500 }
         return new Response 'hmr websocket', { status: 426 }
-      logMatch = url.pathname.match /^\/desktops\/([^/]+)\/logs\/?$/
+      logMatch = pathname.match /^\/desktops\/([^/]+)\/logs\/?$/
       if logMatch and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
         name = decodeURIComponent logMatch[1]
         if server.upgrade req, { data: { kind: 'logs', name } }
           return undefined
         return new Response 'upgrade failed', { status: 500 }
-      wsRoom = url.pathname.match /^\/desktops\/([^/]+)\/workspaces\/([^/]+)\/agent\/?$/
+      wsRoom = pathname.match /^\/desktops\/([^/]+)\/workspaces\/([^/]+)\/agent\/?$/
       if wsRoom and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
         name = decodeURIComponent wsRoom[1]
         workspace = decodeURIComponent wsRoom[2]
@@ -370,7 +421,7 @@ expressServer = app.listen 0, '127.0.0.1', ->
         if server.upgrade req, { data: { name, target, kind: 'agent', workspace, queue: [], upstream: null } }
           return undefined
         return new Response 'upgrade failed', { status: 500 }
-      wsMatch = url.pathname.match /^\/desktops\/([^/]+)\/agent\/?$/
+      wsMatch = pathname.match /^\/desktops\/([^/]+)\/agent\/?$/
       if wsMatch and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
         name = decodeURIComponent wsMatch[1]
         try
@@ -384,7 +435,7 @@ expressServer = app.listen 0, '127.0.0.1', ->
       # Selkies opens WebSocket(s) under its subfolder (signaling + media). We do
       # not know the exact suffix, so catch every upgrade under /desktops/<name>/
       # the explicit matchers above did not claim and pipe the WHOLE path to the pod.
-      selkiesMatch = url.pathname.match /^\/desktops\/([^/]+)\/(.+)$/
+      selkiesMatch = pathname.match /^\/desktops\/([^/]+)\/(.+)$/
       if selkiesMatch and req.headers.get('upgrade')?.toLowerCase() is 'websocket'
         name = decodeURIComponent selkiesMatch[1]
         try
@@ -393,7 +444,7 @@ expressServer = app.listen 0, '127.0.0.1', ->
           console.error "[ws] selkies #{name}", err.message
           return new Response err.message, { status: err.status or 502 }
         proto = req.headers.get 'sec-websocket-protocol'
-        data = { name, target, kind: 'selkies', path: url.pathname + url.search, proto, workspace: null, queue: [], upstream: null }
+        data = { name, target, kind: 'selkies', path: pathname + url.search, proto, workspace: null, queue: [], upstream: null }
         upOpts = { data }
         # Echo the negotiated subprotocol so the browser accepts the handshake.
         upOpts.headers = { 'Sec-WebSocket-Protocol': proto.split(',')[0].trim() } if proto
@@ -412,7 +463,7 @@ expressServer = app.listen 0, '127.0.0.1', ->
       unless req.method in ['GET', 'HEAD']
         init.body = req.body
         init.duplex = 'half'
-      globalThis.fetch "http://127.0.0.1:#{inner}#{url.pathname}#{url.search}", init
+      globalThis.fetch "http://127.0.0.1:#{inner}#{pathname}#{url.search}", init
     websocket:
       open: (ws) ->
         if ws.data?.kind is 'hmr'
@@ -476,4 +527,4 @@ expressServer = app.listen 0, '127.0.0.1', ->
         console.error "[ws] client #{ws.data?.name}", err?.message or err
         try ws.data.upstream?.close()
   extra = if HMR then "  hmr ws://127.0.0.1:#{PORT}/__m_hmr" else ''
-  console.log "[control] http://0.0.0.0:#{PORT}  (#{where}, express :#{inner})#{extra}"
+  console.log "[control] http://0.0.0.0:#{PORT}#{BASE_PATH or '/'}  (#{where}, express :#{inner})#{extra}"

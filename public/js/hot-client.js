@@ -6,7 +6,8 @@
  */
 
 const HMR_PROTO = location.protocol === 'https:' ? 'wss' : 'ws';
-const HMR_URL = `${HMR_PROTO}://${location.host}/__m_hmr`;
+const HMR_BASE = new URL(document.baseURI).pathname.replace(/\/$/, '');
+const HMR_URL = `${HMR_PROTO}://${location.host}${HMR_BASE}/__m_hmr`;
 
 /** @type {((path: string) => void|Promise<void>) | null} */
 let customHandler = null;

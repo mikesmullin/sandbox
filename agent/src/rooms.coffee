@@ -8,7 +8,6 @@ import {
   DEFAULT_LUCY_ALLOWLIST,
   ApprovalQueue,
   resolveContextWindow,
-  resolveContextWindowAsync,
 } from 'angela'
 import {
   listWorkspaces, ensureBrowserWindow, closeBrowserTarget,
@@ -23,6 +22,8 @@ DEFAULT_MODEL = process.env.AGENT_MODEL or 'llama-server:default'
 DAD_URL = process.env.DAD_PROXY_URL or process.env.LLAMA_SERVER_BASE_URL or 'https://host.containers.internal:1234'
 DAD_KEY = process.env.DAD_PROXY_API_KEY or process.env.LLM_PROXY_API_KEY or process.env.LLAMA_SERVER_API_KEY or ''
 DAD_CA = process.env.DAD_PROXY_CA_FILE or process.env.LLAMA_SERVER_CA_FILE or '/opt/certs/ca.pem'
+
+streamForModel = (spec) -> spec isnt 'copilot:gpt-5.6-luna'
 
 # Agent.factory({ proxy: 'host:port' }) — every provider:model POSTs here.
 dadProxyHostPort = (url = DAD_URL) ->
@@ -739,7 +740,7 @@ doEnsure = (name) ->
       persistSessions: true
       max_turns: 48
       retain_history: true
-      stream: true
+      stream: streamForModel room.model
       parallel_tools: true
 
   unless room.harness?
@@ -882,22 +883,17 @@ export handleAllowlist = (room, msg, ws) ->
 export handleModel = (room, msg) ->
   spec = String(msg.model or '').trim()
   return unless spec
-  room.model = spec
-  room.createOpts.model = spec if room.createOpts?
-  try
-    liveCw = Number await resolveContextWindowAsync spec, { force: true }
-    if liveCw > 0
-      # keep local copy on the room's opts; global fallback stays for hello of other rooms
-      room.createOpts.contextWindow = liveCw if room.createOpts?
-  catch
-    syncCw = Number(resolveContextWindow(spec) or 0)
-    room.createOpts.contextWindow = syncCw if room.createOpts? and syncCw > 0
   if room.session?.running
     try
       await room.session.abort 'model change'
-  if room.harness?
-    session = await room.harness.session.create { title: room.name }
-    bindSession room, session
+  room.model = spec
+  room.createOpts.model = spec if room.createOpts?
+  room.createOpts.stream = streamForModel spec if room.createOpts?
+  room.createOpts.allowlist = room.allowlistText if room.createOpts?
+  syncCw = Number(resolveContextWindow(spec) or 0)
+  room.createOpts.contextWindow = syncCw if room.createOpts? and syncCw > 0
+  room.harness.setModel spec, { stream: streamForModel spec }
+  await room.session.setModel spec, { stream: streamForModel spec }
   markIdle room
   broadcastRoom room, { type: 'model', model: room.model, contextWindow: cwOf room }
   broadcastRoom room, helloPayload room

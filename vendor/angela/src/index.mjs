@@ -1031,6 +1031,18 @@ class Session {
     return this.#agent;
   }
 
+  /** Rebind this session's existing agent without rebuilding its MCP tools. */
+  async setModel(model, { stream } = {}) {
+    const spec = String(model || '').trim();
+    if (!spec) throw new Error('model is required');
+    const agent = await this.#ensureAgent();
+    if (typeof agent._bindModel !== 'function') {
+      throw new Error('agent does not support model rebinding');
+    }
+    await agent._bindModel(spec);
+    if (stream !== undefined) agent.stream = Boolean(stream);
+  }
+
   /**
    * `/new` (whole prompt): close this session and return a fresh empty one.
    * Callers must switch to `result.session` — this object is the previous session.
@@ -1453,6 +1465,14 @@ export class Angela {
   setSystemPrompt(text) {
     this.#systemBase = text == null ? null : String(text);
     this.#applySystemPrompt();
+  }
+
+  /** Update the model configuration used by subsequently created sessions. */
+  setModel(model, { stream } = {}) {
+    const spec = String(model || '').trim();
+    if (!spec) throw new Error('model is required');
+    this.#config.model = spec;
+    if (stream !== undefined) this.#config.stream = Boolean(stream);
   }
 
   /**

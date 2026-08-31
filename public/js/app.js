@@ -1,5 +1,6 @@
-import M from '/vendor/m.min.js'
+import M from '../vendor/m.min.js'
 import { chat } from './chat.js'
+import { withBase } from './paths.js'
 import {
   telem,
   wantDesktop, wantLog, wantGauges,
@@ -74,7 +75,7 @@ const syncScreens = () => {
 }
 
 const api = async (path, opts) => {
-  const res = await fetch(path, {
+  const res = await fetch(withBase(path), {
     headers: { 'content-type': 'application/json' },
     ...opts,
   })
@@ -239,12 +240,8 @@ const selkiesLock = (win) => {
   const el = inp?.element || win.document.getElementById('overlayInput') || win.document.querySelector('canvas')
   if (!el) return
   try {
-    if (inp && typeof inp._requestPointerLock === 'function') {
-      inp._requestPointerLock(el, () => selkiesLock(win), (e) => console.warn('pointer lock failed', e))
-    } else {
-      el.requestPointerLock?.()
-    }
-    if (inp?.cursorDiv) inp.cursorDiv.style.visibility = 'hidden'
+    const pending = el.requestPointerLock?.()
+    pending?.catch?.((e) => console.warn('pointer lock failed', e))
   } catch (e) { console.warn('capture', e) }
 }
 const selkiesUnlock = (win) => {
@@ -268,18 +265,9 @@ const wireCapture = (win) => {
   if (!win || win.__captureWired) return
   win.__captureWired = true
   try {
-    // A plain left click on the stream captures (matches the old click-to-control
-    // flow). Modified clicks are left to Selkies' own chords (Ctrl+Shift+Click,
-    // gaming mode). Capture-phase, no preventDefault, so Selkies still gets it.
-    win.document.addEventListener('mousedown', (ev) => {
-      if (win.document.pointerLockElement) return
-      if (ev.button !== 0 || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return
-      selkiesLock(win)
-    }, true)
     win.document.addEventListener('pointerlockchange', () => {
       const locked = Boolean(win.document.pointerLockElement)
       if (!locked) {
-        if (win.webrtcInput?.cursorDiv) win.webrtcInput.cursorDiv.style.visibility = ''
         // Also release the guest page's own pointer lock so mouselook stops on
         // the first Esc, not the second.
         releaseGuestPointerLock(win)
@@ -415,14 +403,14 @@ const App = () => ({
     // Per-container Selkies stream. Empty when not in full view so leaving the
     // wall tears the stream (and its audio) down.
     const name = this.full?.name
-    return name ? `/desktops/${encodeURIComponent(name)}/` : ''
+    return name ? withBase(`/desktops/${encodeURIComponent(name)}/`) : ''
   },
   onFrameLoad(ev) {
     const win = ev?.target?.contentWindow
     if (!win) return
     try { win.addEventListener('keydown', onFrameEsc(win)) } catch {}
-    // Focus the stream so its own capture chords (Ctrl+Shift+Click / Ctrl+Shift+X)
-    // reach Selkies, and wire plain-click-to-capture (in-place pointer lock).
+    // Focus the stream for visible absolute-pointer desktop input. Selkies'
+    // explicit Ctrl+Shift+Click / Ctrl+Shift+X gaming locks remain available.
     try { ev.target.focus?.(); win.focus?.() } catch {}
     wireCapture(win)
     // Keep audio muted across reconnects: the core resets its gain node on each
@@ -724,7 +712,7 @@ const App = () => ({
   },
   screenKey(c, ws) { return `${c.name}:${ws.id}` },
   thumbUrl(c, ws) {
-    return `/api/desktops/${encodeURIComponent(c.name)}/workspaces/${encodeURIComponent(ws.id)}/thumb?g=${this.thumbGen}`
+    return withBase(`/api/desktops/${encodeURIComponent(c.name)}/workspaces/${encodeURIComponent(ws.id)}/thumb?g=${this.thumbGen}`)
   },
   thumbOk(c, ws) { return Boolean(this.thumbOkMap?.[`${c.name}:${ws.id}`]) },
   onThumbLoad(c, ws) {
@@ -842,10 +830,10 @@ const App = () => ({
           <button class="btn toggle" type="button" x-show="inFull"
                   :class="captured ? 'on' : 'off'"
                   :aria-pressed="captured ? 'true' : 'false'"
-                  :title="captured ? 'Release mouse (Esc)' : 'Capture mouse — lock the cursor to the stream'"
+              :title="captured ? 'Release mouse lock (Esc)' : 'Lock mouse for relative gaming input (cursor hidden)'"
                   @click="toggleCapture()">
             <i class="ph" :class="captured ? 'ph-mouse' : 'ph-cursor-click'"></i>
-            <span x-text="captured ? 'captured' : 'capture'"></span>
+            <span x-text="captured ? 'locked' : 'mouse lock'"></span>
           </button>
           <button class="btn toggle" type="button" x-show="inFull"
                   :class="muted ? 'on' : 'off'"
@@ -1011,7 +999,7 @@ const App = () => ({
               <span class="meta">
                 <span class="capture-status hint" x-show="!captured">
                   <i class="ph ph-cursor-click"></i>
-                  click stream to capture · <span class="kbd">Ctrl+Shift+X</span> fullscreen · <span class="kbd">Esc</span> wall
+                  click desktop to interact · <span class="kbd">Ctrl+Shift+X</span> gaming mode · <span class="kbd">Esc</span> wall
                 </span>
                 <span class="capture-status" x-show="captured">
                   <i class="ph ph-mouse"></i>
@@ -1021,7 +1009,7 @@ const App = () => ({
             </div>
             <iframe class="selkies-frame" x-show="full"
                     :src="fullFrameSrc()"
-                    allow="pointer-lock; fullscreen; clipboard-read; clipboard-write; gamepad; autoplay"
+                  allow="fullscreen; clipboard-read; clipboard-write; gamepad; autoplay"
                     title="workspace"
                     @load="onFrameLoad($event)"></iframe>
           </article>
@@ -1061,7 +1049,7 @@ const App = () => ({
 })
 
 const boot = async (bust = Date.now()) => {
-  const { registerChat: register } = await import(`/vendor/m-js-cmp-chat/src/index.js?t=${bust}`)
+  const { registerChat: register } = await import(`${withBase('/vendor/m-js-cmp-chat/src/index.js')}?t=${bust}`)
   register(M)
   resetLogClients()
   try { Router.stop() } catch {}

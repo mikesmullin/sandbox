@@ -9,6 +9,7 @@
         "bun-coffeescript": "^1.0.3",
         "express": "^5.1.0",
         "http-proxy": "^1.18.1",
+        "jose": "^6.2.10",
       },
     },
   },
