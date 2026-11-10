@@ -1,0 +1,5 @@
+/target
+# wasm-bindgen CLI, fetched by dev.sh to match the version the kit pins.
+/tools/
+# Build output: the wasm bundle the dev server regenerates on every boot.
+/web/pkg/

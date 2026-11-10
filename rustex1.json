@@ -1,0 +1,15 @@
+{
+  "name": "sbox-a",
+  "port": 3010,
+  "app": {
+    "package": "sbox-a-app",
+    "lib": "sbox_a_app",
+    "profile": "wasm",
+    "watch": ["app", "vendor/rustex1/kit"]
+  },
+  "server": {
+    "package": "sbox-a-server",
+    "watch": ["server", "vendor/rustex1/devserver"]
+  },
+  "static": ["web"]
+}

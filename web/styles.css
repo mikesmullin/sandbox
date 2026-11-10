@@ -1,0 +1,375 @@
+:root {
+  --bg: #0c0e12;
+  --bg-2: #10141b;
+  --panel: #161b24;
+  --line: #262d3a;
+  --line-2: #343d4e;
+  --ink: #e7ecf3;
+  --dim: #8b97a8;
+  --dimmer: #5d6a7c;
+  --live: #3ee0a0;
+  --wait: #ffc861;
+  --down: #ff7a7a;
+  --accent: #7ab0ff;
+  --accent-2: #9ad0ff;
+  --mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #app { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.4;
+  overflow: hidden;
+}
+
+/* ── shell ─────────────────────────────────────────── */
+/* SHELL-ALIGN (2026-10-14): the header row matches the psicom a-ui shells
+   (AJCS/AVCS `.topbar` measures 57.5px: 10px padding + 36.5px content + 1px
+   border). 56px + 32px controls centers the same visual mass. */
+.shell {
+  height: 100%;
+  display: grid;
+  grid-template-rows: 56px 1fr;
+  min-height: 0;
+}
+
+/* ── top bar ───────────────────────────────────────── */
+.top {
+  display: flex;
+  align-items: center;
+  gap: 20px;            /* was 12px — matches .topbar gap */
+  padding: 0 22px;     /* was 0 14px — matches .topbar inset */
+  /* SHELL-ALIGN tone: the shells' bar is DARKER than the page (rgba(11,16,22,.85)
+     + blur over a radially-tinted body) and its divider is #1f2a3a. This app has
+     no page gradient and no scrolling, so the translucent+blur composite lands on
+     the body color exactly — var(--bg) is the honest equivalent, and the lighter
+     --bg-2 band (which read as a raised strip) is retired here. */
+  border-bottom: 1px solid #1f2a3a;   /* was var(--line) #262d3a — the shells' --border */
+  background: var(--bg);              /* was var(--bg-2) */
+}
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 190px;
+  font-size: 15px;     /* was 14px (inherited) — the shells' base scale */
+  color: var(--ink);
+}
+/* logomark — the brand-status span hosts the phosphor cube; its class carries
+   the house state vocabulary (ws-ok/ws-down) colored from THIS app's palette. */
+.brand-status {
+  align-self: center;
+  font-size: 16px;
+  display: inline-flex;
+}
+.ws-ok { color: var(--live); }
+.ws-down { color: var(--down); }
+.brand-name {
+  font-size: 15px;     /* was 13px — AJCS/AVCS brand-name is 15px/700 */
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.brand-sub {
+  font-size: 12px;
+  color: var(--dimmer);
+}
+
+.spacer { flex: 1; }
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line-2);
+  background: var(--panel);
+  color: var(--ink);
+  height: 32px;        /* was 28px — matches .clean-btn / .user-select height */
+  padding: 0 13px;     /* was 0 10px — matches .navlink horizontal padding */
+  border-radius: 8px;  /* was 6px — the shells' control radius */
+  font: 600 12px/1 var(--sans);   /* was 11px */
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent-2); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn.on { border-color: var(--accent); background: rgba(122,176,255,.12); }
+
+/* ── stage ─────────────────────────────────────────── */
+.stage {
+  position: relative;
+  min-height: 0;
+  height: 100%;
+  padding: 12px;
+  overflow: hidden;
+}
+
+/* ── wall (container tiles) ────────────────────────── */
+/* Fill-tiling (TILES-1): the wall ALWAYS fills the stage — 1 tile = full,
+   2 = half/half, 4 = 2×2; cols-<n> from the controller (ceil(sqrt(n)) capped
+   at 4), rows implicit 1fr so every row shares the height equally. No scroll:
+   more tiles subdivide further. */
+.wall {
+  display: grid;
+  grid-auto-rows: 1fr;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.wall.cols-1 { grid-template-columns: 1fr; }
+.wall.cols-2 { grid-template-columns: repeat(2, 1fr); }
+.wall.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.wall.cols-4 { grid-template-columns: repeat(4, 1fr); }
+.wall.detail-wall {
+  display: block;
+  overflow: hidden;
+}
+.wall.detail-wall .tile {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+}
+.wall.detail-wall .tile-head {
+  cursor: default;
+}
+.wall.detail-wall .screen {
+  min-height: 0;
+}
+
+.tile {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  transition: border-color .15s;
+}
+.tile:hover { border-color: var(--line-2); }
+.tile.is-picked { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.tile.is-open { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
+.tile-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  cursor: pointer;
+  user-select: none;
+}
+.tile-head:hover { background: rgba(122,176,255,.06); }
+.tile-head .name {
+  color: var(--ink);
+  font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.badge {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.badge.live { color: var(--live); background: rgba(62,224,160,.12); }
+.badge.wait { color: var(--wait); background: rgba(255,200,97,.12); }
+.badge.down { color: var(--down); background: rgba(255,122,122,.12); }
+
+/* ── run chip (the AJCS backref — reverse link, top-right of the tile) ──
+   Badge idiom: same metrics/palette tints as .badge; right-aligned in the
+   tile-head row via margin-left:auto (the head's click stays beneath it —
+   the chip stops propagation). Neutral = run state unknown (fetch failed
+   or not yet fetched): plain label look, no state color. */
+.run-chip {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 55%;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgba(139,151,168,.08);
+  color: var(--dim);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.run-chip:hover { border-color: var(--accent); color: var(--accent-2); }
+.run-chip .run-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-chip .run-chip-state {
+  display: inline-flex;
+  font-size: 10px;
+}
+.run-chip .ph-spinner { animation: chip-spin 1s linear infinite; }
+@keyframes chip-spin { to { transform: rotate(360deg); } }
+.run-chip.chip-run-queued { color: var(--dim); background: rgba(139,151,168,.16); }
+.run-chip.chip-run-active { color: var(--wait); background: rgba(255,200,97,.12); border-color: rgba(255,200,97,.35); }
+.run-chip.chip-run-success { color: var(--live); background: rgba(62,224,160,.12); border-color: rgba(62,224,160,.35); }
+.run-chip.chip-run-failed { color: var(--down); background: rgba(255,122,122,.12); border-color: rgba(255,122,122,.35); }
+
+.screen {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: #07090d;
+  overflow: hidden;
+}
+.screen iframe { width: 100%; height: 100%; border: 0; }
+/* Keep noVNC's layout viewport stable; the parent clips the wall miniature. */
+.tile-vnc-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.screen iframe.tile-vnc {
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 1280px;
+  height: 1024px;
+  transform-origin: top left;
+}
+
+/* Detail view: iframe fills viewport, no transform — noVNC handles its own canvas sizing. */
+.detail-wall .screen iframe.tile-vnc {
+  width: 100%;
+  height: 100%;
+  transform: none !important;
+}
+
+/* Detail view: iframe fills the viewport, no transform — noVNC resizes natively. */
+.detail-wall .screen iframe.tile-vnc {
+  width: 100%;
+  height: 100%;
+  transform: none !important;
+}
+
+.placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  color: var(--dimmer);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.placeholder i { font-size: 22px; color: var(--line-2); }
+
+/* ── detail view (isolated desktop) ────────────────── */
+.detail-view {
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  z-index: 10;
+}
+.detail-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.btn-back {
+  appearance: none;
+  border: 1px solid var(--line-2);
+  background: var(--panel);
+  color: var(--ink);
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 4px;
+  font: 600 11px/1 var(--sans);
+  cursor: pointer;
+}
+.btn-back:hover { border-color: var(--accent); color: var(--accent-2); }
+.detail-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+}
+.detail-info .name { font-weight: 500; }
+.status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--dim);
+  font-size: 12px;     /* was 11px — the shells' secondary-text size */
+}
+/* (.live-dot rules retired 2026-10-12 — the status dot was removed from the
+   heading; the count text alone carries it now.) */
+.err {
+  color: var(--down);
+  font-size: 11px;
+}
+
+.detail-frame {
+  flex: 1 1 auto;
+  position: relative;
+  min-height: 0;
+  background: #07090d;
+}
+.detail-frame iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* ── intercepting overlay ──────────────────────────── */
+.screen-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  cursor: pointer;
+  background: transparent;
+}
+.screen-overlay:hover { background: rgba(122,176,255,.04); }
+.screen-overlay:active { background: rgba(122,176,255,.1); }
+.detail-overlay { z-index: 11; }
+
+.empty {
+  display: grid;
+  place-content: center;
+  height: 100%;
+  color: var(--dimmer);
+  font-size: 13px;
+}
+.empty h2 { font-size: 15px; color: var(--dim); margin-bottom: 6px; }
+
+/* ── scrollbar ─────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ── responsive ────────────────────────────────────── */
+@media (max-width: 640px) {
+  .brand { min-width: 0; }
+  .brand small { display: none; }
+}

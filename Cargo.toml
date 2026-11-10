@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["app", "server"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+# The wasm frontend's profile. It has to exist at THIS workspace root because
+# the dev server builds the wasm half from here (vendor/rustex1/docs/RUST_M_JS.md).
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+debug = false
+strip = "debuginfo"
+codegen-units = 16
+lto = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.dev]
+opt-level = 1
+debug = 1
