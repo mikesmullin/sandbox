@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use super::container_cli as cli;
-use super::containers::{self, container_token, sandbox_image, GUEST_MCP_PORT, GUEST_QUIC_PORT};
+use super::containers::{self, container_token, GUEST_EXEC_PORT, GUEST_MCP_PORT, GUEST_QUIC_PORT};
+use super::images::Kind;
 use super::orchestration_store::{state_file, Record, Transition};
 use super::orchestration_validate::validate_create;
 use super::orchestration_volumes::{
@@ -34,8 +35,6 @@ use super::orchestration_volumes::{
 use crate::http::{Request, Response};
 use crate::util;
 
-/// execd (guest exec MCP server) inside the sandbox — see docs/execd-contract.md.
-pub const GUEST_EXEC_PORT: u16 = 3213;
 /// Once confirmed-up, trust the probe this long without re-fetching.
 const READY_TTL: Duration = Duration::from_secs(30);
 /// Boot deadline before the pipeline gives up (state → error).
@@ -147,7 +146,14 @@ fn is_aborted(id: &str) -> bool {
 /// Same readiness probe as `containers`: spacesd `/health` → 2xx once serving;
 /// `/mcp` lives behind the same port.
 async fn is_serving(record: &Record) -> bool {
-    if record.mcp_port == 0 {
+    // A headless sandbox has no spacesd: its readiness is execd's /healthz on
+    // the exec port, so probing mcp_port would simply never answer.
+    let port = if record.kind.has_desktop() {
+        record.mcp_port
+    } else {
+        record.exec_port
+    };
+    if port == 0 {
         return false;
     }
     {
@@ -158,7 +164,7 @@ async fn is_serving(record: &Record) -> bool {
             }
         }
     }
-    let serving = containers::probe_serving("127.0.0.1", record.mcp_port).await;
+    let serving = containers::probe_serving("127.0.0.1", port, record.kind).await;
     let mut st = store().lock().unwrap();
     if serving {
         st.known_good.insert(record.id.clone(), Instant::now());
@@ -188,9 +194,10 @@ fn to_list_item(record: &Record) -> Value {
     let mut out = json!({
         "id": record.id,
         "state": record.state,
-        "mcpPort": record.mcp_port,
-        "quicPort": record.quic_port,
-        "mcpUrl": port_url(record.mcp_port),
+        "kind": record.kind.as_str(),
+        "mcpPort": if record.kind.has_desktop() { json!(record.mcp_port) } else { Value::Null },
+        "quicPort": if record.kind.has_desktop() { json!(record.quic_port) } else { Value::Null },
+        "mcpUrl": if record.kind.has_desktop() { port_url(record.mcp_port) } else { Value::Null },
         // pre-execd records have no exec surface
         "execPort": if record.exec_port == 0 { Value::Null } else { json!(record.exec_port) },
         "execUrl": port_url(record.exec_port),
@@ -583,15 +590,18 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
         None => return Ok(()),
     };
 
-    let mut argv: Vec<String> = vec![
-        "create".into(),
-        "-p".into(),
-        format!("{}:{}", record.mcp_port, GUEST_MCP_PORT),
-        "-p".into(),
-        format!("{}:{}/udp", record.quic_port, GUEST_QUIC_PORT),
-        "-p".into(),
-        format!("{}:{}", record.exec_port, GUEST_EXEC_PORT),
-    ];
+    // A headless sandbox binds only execd, so publishing spacesd's TCP port
+    // and its QUIC media port would map host ports at nothing.
+    let mut argv: Vec<String> = vec!["create".into()];
+    if record.kind.has_desktop() {
+        argv.extend([
+            "-p".into(),
+            format!("{}:{}", record.mcp_port, GUEST_MCP_PORT),
+            "-p".into(),
+            format!("{}:{}/udp", record.quic_port, GUEST_QUIC_PORT),
+        ]);
+    }
+    argv.extend(["-p".into(), format!("{}:{}", record.exec_port, GUEST_EXEC_PORT)]);
     // Named volumes → `-v name:mount:mode`; host binds → `--mount
     // type=bind,…`. All of it rides BEFORE the image — OPTIONS-BEFORE-TARGET.
     argv.extend(volume_create_args(&record.volumes));
@@ -707,7 +717,8 @@ async fn handle_create(req: &Request) -> Response {
     let now = util::now_iso();
     let record = Record {
         id: id.clone(),
-        image: sandbox_image(),
+        image: input.kind.image(),
+        kind: input.kind,
         cpus: input.cpus.unwrap_or(4),
         memory: input.memory.unwrap_or_else(|| "2048M".into()),
         volumes: input.volumes,

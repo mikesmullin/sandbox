@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::images::Kind;
 use super::orchestration_volumes::VolumeEntry;
 use crate::util;
 
@@ -62,6 +63,10 @@ pub struct Record {
     #[serde(rename = "createdAt")]
     pub created_at: String,
     pub image: String,
+    /// Which row of the image matrix this sandbox is. Defaults to `headed`,
+    /// so a record written before the matrix existed reads as what it was.
+    #[serde(default)]
+    pub kind: Kind,
     pub cpus: u64,
     pub memory: String,
     #[serde(default)]

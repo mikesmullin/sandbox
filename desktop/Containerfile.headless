@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7
+#
+# sbox headless sandbox — Alpine + execd, no desktop.
+#
+# The small half of the image matrix (SBOX_PLAN1 §4): a shell sandbox that
+# serves the three harness hands — `bash`, `read`, `write` — over MCP, and
+# nothing else. No X server, no window manager, no browser, no audio, no
+# cua-spacesd.
+#
+# What that buys: it boots in about a second instead of thirty, it is ~150MB
+# instead of ~1.5GB, and an agent that only needs a filesystem and a shell
+# does not pay for a desktop it will never look at.
+#
+# Readiness differs from the headed image and the backend knows it: a headed
+# box is ready when spacesd answers /health on 3211, a headless one when
+# execd answers /healthz on 3213. There is no 3211 here at all.
+#
+#   podman build -t alpine-sandbox:headless -f desktop/Containerfile.headless desktop/
+
+FROM alpine:latest
+
+ENV TERM=xterm
+
+# Opt-in local APK mirror, same contract as the headed image — see the note
+# there: off the Apple VM bridge that address is not local and stalls apk.
+ARG APK_CACHE=
+RUN if [ -n "${APK_CACHE}" ]; then \
+      echo "${APK_CACHE}/alpine/v3.22/main" >> /etc/apk/repositories && \
+      echo "${APK_CACHE}/alpine/v3.22/community" >> /etc/apk/repositories; \
+    fi
+
+# The shell sandbox's whole dependency set. `git` and `curl` are here because
+# the orchestration pipeline clones repos into the guest; `su-exec` because
+# the entrypoint drops privileges per-process the same way the headed one does.
+RUN apk add --no-cache \
+    bash \
+    curl \
+    git \
+    openssh-client \
+    sudo \
+    vim \
+    less \
+    jq \
+    ca-certificates \
+    tzdata \
+    su-exec \
+    libstdc++ \
+    libgcc
+
+# Bun runtime — execd is an ES module and runs on bun in the headed image too,
+# so both halves of the matrix execute the same file the same way.
+#
+# libstdc++/libgcc are listed explicitly above because bun links them: the
+# headed image only gets them transitively (chromium, mesa), so dropping the
+# desktop stack silently takes bun's C++ runtime with it and every exec dies
+# with "Error relocating /usr/local/bin/bun: _ZSt15__once_callable".
+RUN mkdir -p /opt/bun && \
+    curl -fsSL --insecure https://bun.sh/install.sh | BUN_INSTALL=/opt/bun bash && \
+    ln -sf /opt/bun/bin/bun /usr/local/bin/bun && \
+    ln -sf /opt/bun/bin/bunx /usr/local/bin/bunx
+
+# Same user, same home, same paths as the headed image: a Jobfile that clones
+# into /home/desktop/repos must not care which image it landed on.
+RUN adduser -D -s /bin/bash desktop && \
+    echo "desktop ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
+    mkdir -p /home/desktop/repos /run/cua && \
+    chown -R desktop:desktop /home/desktop
+
+# ─── execd — guest exec MCP server (bash/read/write; port 3213) ──────────────
+# Read-only image content: the desktop user only runs it.
+COPY execd/index.mjs /opt/execd/index.mjs
+RUN chmod 0755 /opt/execd/index.mjs
+
+COPY entrypoint-headless.sh /usr/local/bin/start-headless
+RUN chmod +x /usr/local/bin/start-headless
+
+EXPOSE 3213
+
+CMD ["/usr/local/bin/start-headless"]

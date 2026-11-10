@@ -10,6 +10,7 @@
 
 use serde_json::{Map, Value};
 
+use super::images::Kind;
 use super::orchestration_volumes::{VolumeEntry, VolumeKind};
 use super::orchestration_store::RepoEntry;
 
@@ -19,6 +20,8 @@ const BACKREF_URL_MAX: usize = 2048;
 
 /// What a create payload becomes once accepted.
 pub struct CreateInput {
+    /// Which row of the image matrix to build from (SBOX_PLAN1 §3.2).
+    pub kind: Kind,
     pub repos: Vec<RepoEntry>,
     pub volumes: Vec<VolumeEntry>,
     pub cpus: Option<u64>,
@@ -438,7 +441,7 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
         Some(o) => o.clone(),
         None => Map::new(),
     };
-    let allowed = ["repos", "volumes", "resources", "backref"];
+    let allowed = ["image", "repos", "volumes", "resources", "backref"];
     let unknown = unknown_fields(&obj, &allowed);
     if !unknown.is_empty() {
         return Err(ValidationError {
@@ -449,6 +452,25 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
     }
 
     let mut problems: Vec<String> = Vec::new();
+    // `image` names a KIND, not an image reference: letting a caller name an
+    // arbitrary image would be a much larger trust decision than picking a
+    // row of a matrix the host built itself.
+    let kind = match obj.get("image") {
+        None | Some(Value::Null) => Kind::default(),
+        Some(Value::String(s)) => match Kind::parse(s) {
+            Some(k) => k,
+            None => {
+                problems.push(format!(
+                    "image must be 'headed' or 'headless' (got {s:?})"
+                ));
+                Kind::default()
+            }
+        },
+        Some(_) => {
+            problems.push("image must be 'headed' or 'headless'".into());
+            Kind::default()
+        }
+    };
     let repos = match obj.get("repos") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => check_repos(v, &mut problems),
@@ -472,6 +494,7 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
         });
     }
     Ok(CreateInput {
+        kind,
         repos,
         volumes,
         cpus,

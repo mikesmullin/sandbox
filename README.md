@@ -1,8 +1,14 @@
 # sbox-b — the sandbox backend
 
-The headless half of **sbox**: it owns the container lifecycle, the AJCS
+The headless half of **sbox**: it owns the sandbox lifecycle, the AJCS
 orchestration API, and the two agent planes. It serves no HTML — the wall UI
 is [`sbox-a`](../sbox-a), which proxies `/api/*` here.
+
+A **sandbox** is a container: an isolated machine with its own filesystem,
+its own ports, and an agent surface on the inside. Which engine actually runs
+it is an implementation detail behind one seam — podman and Apple Containers
+today, room for others later — and nothing above that seam knows which one it
+got.
 
 ![The wall](docs/screenshot.png)
 
@@ -11,8 +17,8 @@ Each tile is a live Alpine desktop streaming H.264 over a WebSocket, served by
 
 ## Stack
 
-| Component | Inside the container | On the host |
-|-----------|----------------------|-------------|
+| Component | Inside the sandbox | Outside |
+|-----------|--------------------|---------|
 | **Display server** | Xvfb (no network listener) | — |
 | **Window manager** | Openbox 3.6 (Turquoise-Nights) | — |
 | **Terminal** | Terminator | — |
@@ -109,24 +115,49 @@ otherwise 404 them.
 
 ## Container runtimes
 
-The code speaks one dialect — Apple Containers' `container` argv — and
-`src/api/container_cli.rs` translates it. `SANDBOX_RUNTIME` forces a choice;
-otherwise it takes the first of `container`, `podman`, `docker` on `PATH`.
+Sandboxes are the portable concept; the engine under them is swappable.
+`src/api/container_cli.rs` is the one seam that knows the difference — every
+other module issues the same calls and never learns which engine answered.
 
-| Apple `container` | podman / docker |
+| Engine | Status | Notes |
+|---|---|---|
+| **podman** | supported | Linux; the development default |
+| **docker** | supported | same adapter as podman |
+| **Apple Containers** (`container`) | supported | macOS; where the project started |
+| others | not yet | the adapter is one `match` arm wide |
+
+`SANDBOX_RUNTIME` forces a choice; otherwise the first of `container`,
+`podman`, `docker` on `PATH` wins.
+
+Internally the modules speak one fixed vocabulary — `ls`, `inspect`, `create
+-p h:g -c N -m MEM --name ID -e K=V IMAGE`, `start|stop|rm`, `volume create`,
+`exec`. It is Apple's argv spelling for historical reasons (that CLI came
+first), and is now simply *the* internal dialect: the adapter translates it
+outward and translates results back, so adding an engine means teaching this
+one file, not auditing the rest.
+
+What the podman/docker arm actually does:
+
+| internal call | becomes |
 |---|---|
 | `ls` (table) | `ps --format json`, re-emitted as that table |
 | `inspect` | `inspect`, reshaped to `[{status.state, configuration.publishedPorts}]` |
 | `-c <n>` | `--cpus <n>` (podman's `-c` is cpu-shares, a different knob) |
-| `-p h:g` | `-p 127.0.0.1:h:g` (Apple publishes on loopback only) |
+| `-p h:g` | `-p 127.0.0.1:h:g` |
 | image `foo:bar` | `localhost/foo:bar`, normalized back |
 
 `create`, `start`, `stop`, `rm`, `exec` and `volume create` are already
 compatible and pass through untouched.
 
-Container eth0 addresses are not routable from the host on either runtime, and
-rootless podman gives the container no host-visible address at all (the wall
-shows `-`). Everything reaches a box through its published loopback ports.
+### One portability rule worth knowing
+
+**A sandbox is reachable only on its published loopback ports.** Container
+addresses are not routable from the host on any engine — Apple Containers
+publishes to `127.0.0.1` only, and rootless podman gives the container no
+host-visible address at all (the wall shows `-`). Everything — the viewer,
+the agent planes, the readiness probe — goes through a published port on
+loopback. Code that reaches for a container IP is code that will not survive
+the next engine.
 
 ## Gotchas
 
@@ -136,9 +167,9 @@ Upstream treats **any musl build as the static headless guest daemon**:
 musl, and the manifest then drops `cua-spacesd-desktop`, `cua-spacesd-doctor`
 and `platform-linux`. An unpatched Alpine build stubs Computer, Windows,
 Accessibility, Stream and Presence: the viewer reports *"this cua-spacesd build
-has no desktop provider"* and `/mcp tools/list` answers 501. This is not
-Linux-specific — an arm64 Alpine build on a Mac is headless the same way.
+has no desktop provider"* and `/mcp tools/list` answers 501.
 
+This bites on every host that builds an Alpine image, Mac included.
 `desktop/build-spacesd.sh` un-gates it, and separately restores the viewer CSP
 relaxation (upstream hardcodes `frame-ancestors 'none'`, which blanks every
 wall tile while a standalone viewer tab renders fine). Both patches fail the
@@ -163,15 +194,16 @@ reloads is unreliable, so the SPA re-mints on READY transitions and tile
 (re)mounts. The browser never sees the env token.
 
 ### The APK cache is opt-in
-`--build-arg APK_CACHE=http://192.168.64.1:3142` points the image build at a
-local Alpine mirror. That address is the host side of the Apple VM bridge; on
-a Linux host it routes out the default gateway and stalls every apk index
-fetch until it times out, so it is off by default.
+`--build-arg APK_CACHE=<base-url>` points the image build at a local Alpine
+mirror. It is off by default because a mirror address is host-specific: the
+usual value, `http://192.168.64.1:3142`, is the host side of the Apple VM
+bridge and on any other host routes out the default gateway, stalling every
+apk index fetch until it times out.
 
 ### Named volumes mount root-owned
-A fresh `container volume create` volume is owned by root, and the guest
-session runs as `desktop` — so a sandbox cannot write to its own mount until
-something chowns it. Pre-existing behaviour, not runtime-specific.
+A fresh named volume is owned by root while the guest session runs as
+`desktop`, so a sandbox cannot write to its own mount until something chowns
+it. True on every engine.
 
 ### machine-id is baked into the image
 spacesd's machine identity comes from `/etc/machine-id`, generated once at

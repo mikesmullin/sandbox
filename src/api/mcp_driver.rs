@@ -25,6 +25,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use super::containers::container_token;
+use super::images::Kind;
 use super::orchestration_store::{state_file, Record};
 use crate::http::{client, Request, Response};
 use crate::util;
@@ -57,6 +58,15 @@ impl Surface {
         match self {
             Surface::Gui => record.mcp_port,
             Surface::Exec => record.exec_port,
+        }
+    }
+
+    /// The port whose daemon answers a liveness probe for this record.
+    fn health_port(record: &Record) -> u16 {
+        if record.kind.has_desktop() {
+            record.mcp_port
+        } else {
+            record.exec_port
         }
     }
 }
@@ -95,8 +105,9 @@ fn load_record(id: &str) -> Option<Record> {
 }
 
 /// spacesd `/health` → 2xx once serving.
-async fn probe_health(port: u16) -> bool {
-    client::request("127.0.0.1", port, "GET", "/health", &[], None, HEALTH_TIMEOUT)
+async fn probe_health(port: u16, kind: Kind) -> bool {
+    let path = if kind.has_desktop() { "/health" } else { "/healthz" };
+    client::request("127.0.0.1", port, "GET", path, &[], None, HEALTH_TIMEOUT)
         .await
         .map(|r| r.ok())
         .unwrap_or(false)
@@ -107,7 +118,7 @@ async fn probe_health(port: u16) -> bool {
 fn gate_core(id: &str) -> Result<Record, Response> {
     let record = load_record(id)
         .ok_or_else(|| fail(404, "not_found", &format!("No such sandbox: {id}"), None))?;
-    if record.state != "ready" || record.mcp_port == 0 {
+    if record.state != "ready" || Surface::health_port(&record) == 0 {
         return Err(fail(
             409,
             "sandbox_not_ready",
@@ -120,7 +131,7 @@ fn gate_core(id: &str) -> Result<Record, Response> {
 
 /// A ready-recorded sandbox must still answer /health (stale record check).
 async fn gate_health(id: &str, record: Record) -> Result<Record, Response> {
-    if probe_health(record.mcp_port).await {
+    if probe_health(Surface::health_port(&record), record.kind).await {
         return Ok(record);
     }
     Err(fail(
@@ -133,9 +144,28 @@ async fn gate_health(id: &str, record: Record) -> Result<Record, Response> {
     ))
 }
 
-/// GUI facade gate: readiness + liveness (spacesd /health).
+/// GUI facade gate: the sandbox must HAVE a desktop, then be ready and live.
+///
+/// A headless sandbox refuses here with a typed 409 rather than being dialled
+/// on a port nothing is listening on — the caller gets "this kind has no GUI"
+/// instead of a 30s timeout it has to interpret.
 async fn gate_sandbox(id: &str) -> Result<Record, Response> {
     let record = gate_core(id)?;
+    if !record.kind.has_desktop() {
+        return Err(fail(
+            409,
+            "not_applicable",
+            &format!(
+                "Sandbox {id} is a '{}' sandbox and has no GUI plane (no desktop, no spacesd)",
+                record.kind.as_str()
+            ),
+            Some(serde_json::json!({
+                "sandboxId": id,
+                "kind": record.kind.as_str(),
+                "guiUnavailable": true,
+            })),
+        ));
+    }
     gate_health(id, record).await
 }
 

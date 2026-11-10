@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use super::container_cli as cli;
+use super::images;
 use super::orchestration_store;
 use super::spacesd;
 use crate::http::client;
@@ -23,18 +24,23 @@ use crate::util;
 pub const GUEST_MCP_PORT: u16 = 3211;
 /// Spacesd QUIC media port inside the guest (UDP).
 pub const GUEST_QUIC_PORT: u16 = 3212;
+/// execd (guest exec MCP server) — the only daemon a headless sandbox runs.
+pub const GUEST_EXEC_PORT: u16 = 3213;
 
 /// Path served by spacesd once the desktop is actually up. Used to distinguish
 /// a "port is published" container from one whose daemon is genuinely serving.
 const HEALTH_PATH: &str = "/health";
+/// execd's equivalent, for headless sandboxes (docs/execd-contract.md).
+const EXEC_HEALTH_PATH: &str = "/healthz";
 /// Max time to wait for a probe to respond before treating it as down.
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Once confirmed-up, trust the probe for this long without re-fetching.
 const KNOWN_GOOD_TTL: Duration = Duration::from_secs(30);
 
-/// Sandbox image to filter by — configurable via SANDBOX_IMAGE.
+/// The default sandbox image — the headed one, which is what the wall's
+/// "+ new box" creates. `images::all_images()` is the set the wall *lists*.
 pub fn sandbox_image() -> String {
-    std::env::var("SANDBOX_IMAGE").unwrap_or_else(|_| "alpine-desktop:spacesd".into())
+    images::Kind::Headed.image()
 }
 
 // ── tokens ──────────────────────────────────────────────────────────────────
@@ -115,7 +121,7 @@ pub async fn inspect_container(id_or_name: &str) -> Result<Value, String> {
     serde_json::from_str(&out.stdout).map_err(|e| format!("inspect: unparsable output: {e}"))
 }
 
-async fn published_mcp_port(id: &str) -> Option<u16> {
+async fn published_port(id: &str, guest_port: u16) -> Option<u16> {
     let inspected = match inspect_container(id).await {
         Ok(v) => v,
         Err(e) => {
@@ -131,7 +137,7 @@ async fn published_mcp_port(id: &str) -> Option<u16> {
     ports.iter().find_map(|entry| {
         let container_port = entry.get("containerPort")?.as_u64()?;
         let proto = entry.get("proto")?.as_str()?;
-        if container_port == GUEST_MCP_PORT as u64 && proto == "tcp" {
+        if container_port == guest_port as u64 && proto == "tcp" {
             entry.get("hostPort")?.as_u64().map(|p| p as u16)
         } else {
             None
@@ -146,9 +152,17 @@ fn known_good() -> &'static Mutex<HashMap<String, Instant>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Probe whether a container's spacesd is actually serving (`/health` → 2xx).
-pub async fn probe_serving(host: &str, port: u16) -> bool {
-    client::request(host, port, "GET", HEALTH_PATH, &[], None, HEALTH_TIMEOUT)
+/// Probe whether a sandbox's agent daemon is actually serving.
+///
+/// The path differs by kind because the daemon does: spacesd answers
+/// `/health`, execd answers `/healthz`.
+pub async fn probe_serving(host: &str, port: u16, kind: images::Kind) -> bool {
+    let path = if kind.has_desktop() {
+        HEALTH_PATH
+    } else {
+        EXEC_HEALTH_PATH
+    };
+    client::request(host, port, "GET", path, &[], None, HEALTH_TIMEOUT)
         .await
         .map(|r| r.ok())
         .unwrap_or(false)
@@ -156,7 +170,7 @@ pub async fn probe_serving(host: &str, port: u16) -> bool {
 
 /// Read-only "is spacesd serving" check, with a short TTL so an already-booted
 /// container is not hammered on every poll.
-pub async fn is_serving(container_id: &str, host: &str, port: u16) -> bool {
+pub async fn is_serving(container_id: &str, host: &str, port: u16, kind: images::Kind) -> bool {
     if let Ok(map) = known_good().lock() {
         if let Some(at) = map.get(container_id) {
             if at.elapsed() < KNOWN_GOOD_TTL {
@@ -164,7 +178,7 @@ pub async fn is_serving(container_id: &str, host: &str, port: u16) -> bool {
             }
         }
     }
-    let serving = probe_serving(host, port).await;
+    let serving = probe_serving(host, port, kind).await;
     if let Ok(mut map) = known_good().lock() {
         if serving {
             map.insert(container_id.to_string(), Instant::now());
@@ -186,20 +200,30 @@ pub fn forget_readiness(container_id: &str) {
 // ── the wall's view ─────────────────────────────────────────────────────────
 
 pub async fn get_container_list() -> Result<Vec<Value>, String> {
-    let image = sandbox_image();
+    // Both rows of the image matrix belong on the wall; a headless box is
+    // still a sandbox, it just has nothing to show in its tile.
+    let images = images::all_images();
     let rows: Vec<Row> = list_containers()
         .await?
         .into_iter()
-        .filter(|c| c.image == image)
+        .filter(|c| images.iter().any(|i| *i == c.image))
         .collect();
 
     let mut out = Vec::with_capacity(rows.len());
     for c in rows {
-        let mcp_port = published_mcp_port(&c.id).await;
+        let kind = images::Kind::of_image(&c.image);
+        // A headless box never binds 3211; its readiness (and its only agent
+        // plane) lives on the exec port instead.
+        let probe_guest_port = if kind.has_desktop() {
+            GUEST_MCP_PORT
+        } else {
+            GUEST_EXEC_PORT
+        };
+        let mcp_port = published_port(&c.id, probe_guest_port).await;
         let mcp_host = mcp_port.map(|_| "127.0.0.1");
         let running_with_port = c.state == "running" && mcp_port.is_some();
         let ready = match (running_with_port, mcp_host, mcp_port) {
-            (true, Some(h), Some(p)) => is_serving(&c.id, h, p).await,
+            (true, Some(h), Some(p)) => is_serving(&c.id, h, p, kind).await,
             _ => false,
         };
         // Orchestration-tracked boxes carry their caller's backref (non-secret
@@ -215,6 +239,7 @@ pub async fn get_container_list() -> Result<Vec<Value>, String> {
             "mcpHost": mcp_host,
             "mcpPort": mcp_port,
             "ready": ready,
+            "kind": kind.as_str(),
         });
         if let Some(b) = backref {
             entry["backref"] = b;
