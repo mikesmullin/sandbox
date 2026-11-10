@@ -64,6 +64,19 @@ two bridge files the rustex1 kit provides (`app.mjs` boots the wasm,
 `hot.mjs` speaks the hot-reload protocol) plus the m-js bundle doing the
 rendering.
 
+## The tool-call log
+
+The pane behind the list button in the header is the operator's answer to
+*"what did the agent just do on my machine"* (SBOX_PLAN1 §3.3): every host
+MCP call, from every client, against every sandbox — tool, arguments,
+output, duration, timestamp. Failures carry a red rail and red output.
+
+It is sticky-scrolled: pinned to the newest entry until you scroll up to read
+something, and re-pinned when you scroll back down. It polls
+`GET /api/journal?after=<seq>` only while open, appends rather than replaces
+(a full re-render every second would fight the scroll position you are
+holding), and keeps the newest 500 entries client-side.
+
 ## The UI contract
 
 - The **tile head** selects — it builds the batch for *− remove*, and never
@@ -75,6 +88,10 @@ rendering.
   the box disappears.
 - A box without a `backref` renders **no** run chip, not a placeholder.
 - The logomark is the health indicator: it goes red when polls stop landing.
+- Exactly one tile carries the **active** badge — the sandbox the host MCP
+  `read`/`write`/`bash` act on when a client names none.
+- A `headless` tile shows what it is ("shell only") rather than a black
+  rectangle, and never asks the backend to mint a viewer it has no daemon for.
 
 Tiles are fill-tiled at `ceil(sqrt(n))` columns, capped at 4.
 

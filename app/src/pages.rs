@@ -70,6 +70,14 @@ fn top_bar() -> Node {
             .show(&format!("$store.{STORE}.error"))
             .text(&format!("$store.{STORE}.error")),
         m("div").class("actions").kids(vec![
+            // The tool-call feed: always reachable, on every view.
+            m("button")
+                .class("btn ghost log-toggle")
+                .attr("type", "button")
+                .bind("class", &format!("{{ 'is-on': $store.{STORE}.logOpen }}"))
+                .attr("title", "Tool-call log — what every client did")
+                .on("click", &format!("$store.{STORE}.toggleLog()"))
+                .kids(vec![Node::icon("list-dashes")]),
             // Wall, nothing picked → create.
             m("button")
                 .class("btn")
@@ -114,7 +122,57 @@ fn stage() -> Node {
     m("main")
         .class("stage")
         .on("click", &format!("$store.{STORE}.onStageBlank($event)"))
-        .kids(vec![wall(), empty_state()])
+        .kids(vec![wall(), empty_state(), journal()])
+}
+
+/// The sticky tool-call log (SBOX_PLAN1 §3.3).
+///
+/// Every host MCP call, from every client, against every sandbox — the
+/// operator's answer to "what did the agent just do on my machine". It is a
+/// panel rather than a page because it is meant to be watched WHILE the
+/// desktops are visible, not instead of them.
+fn journal() -> Node {
+    m("aside")
+        .class("journal")
+        .show(&format!("$store.{STORE}.logOpen"))
+        .kids(vec![
+            m("header").class("journal-head").kids(vec![
+                Node::icon("list-dashes"),
+                m("span").class("journal-title").child(lit("tool calls")),
+                m("span")
+                    .class("journal-count")
+                    .text(&format!("$store.{STORE}.journal.length")),
+                m("button")
+                    .class("journal-close")
+                    .attr("type", "button")
+                    .on("click", &format!("$store.{STORE}.toggleLog()"))
+                    .child(Node::icon("x")),
+            ]),
+            m("div")
+                .class("journal-body")
+                .on("scroll", &format!("$store.{STORE}.onLogScroll($event)"))
+                .kids(vec![
+                    m("div")
+                        .class("journal-empty")
+                        .show(&format!("!$store.{STORE}.journal.length"))
+                        .child(lit("No tool calls yet.")),
+                    m("article")
+                        .bind("class", &format!("$store.{STORE}.entryClass(e)"))
+                        .for_each(&format!("e in $store.{STORE}.journal"))
+                        .key("e.seq")
+                        .kids(vec![
+                            m("div").class("jr-head").kids(vec![
+                                m("span").class("jr-tool").text("e.tool"),
+                                m("span").class("jr-ms").text("e.durationMs + 'ms'"),
+                                m("span").class("jr-at").text("e.at.slice(11, 19)"),
+                            ]),
+                            m("pre")
+                                .class("jr-args")
+                                .text(&format!("$store.{STORE}.argsOf(e)")),
+                            m("pre").class("jr-out").text("e.summary"),
+                        ]),
+                ]),
+        ])
 }
 
 fn wall() -> Node {
@@ -157,6 +215,14 @@ fn tile_head() -> Node {
                 .class("badge")
                 .bind("class", &format!("$store.{STORE}.badgeClass(c)"))
                 .text(&format!("$store.{STORE}.badgeText(c)")),
+            // The ACTIVE sandbox: the one the host MCP tools act on when a
+            // client names none. Absent on every other tile, not greyed out —
+            // there is exactly one, and it should be findable at a glance.
+            m("span")
+                .class("badge active-badge")
+                .iff("c.active")
+                .attr("title", "Active sandbox — host MCP read/write/bash act here")
+                .child(lit("active")),
             run_chip(),
         ])
 }
@@ -184,9 +250,12 @@ fn run_chip() -> Node {
 
 fn tile_screen() -> Node {
     m("div").class("screen").kids(vec![
+        // Only a headed sandbox has a viewer. Gating on kind as well as
+        // readiness stops a headless tile from asking the backend to mint a
+        // viewer ticket, once per render, against a daemon that is not there.
         m("div")
             .class("tile-vnc-viewport")
-            .show("c.ready")
+            .show("c.ready && c.kind !== 'headless'")
             .child(
                 m("iframe")
                     .class("tile-vnc")
@@ -206,6 +275,16 @@ fn tile_screen() -> Node {
             .kids(vec![
                 m("i").class("ph ph-circle-notch ph-spinner"),
                 m("span").child(lit("waiting for box")),
+            ]),
+        // A headless sandbox is working fine; it simply has no screen. Saying
+        // so beats a black rectangle that reads as a broken viewer.
+        m("div")
+            .class("placeholder headless-note")
+            .show("c.ready && c.kind === 'headless'")
+            .kids(vec![
+                Node::icon("terminal-window"),
+                m("span").child(lit("headless — shell only")),
+                m("small").child(lit("read · write · bash over MCP")),
             ]),
     ])
 }

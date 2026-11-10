@@ -48,6 +48,9 @@ impl App for Sbox {
         let mut pending = pending;
         rt.every(POLL_MS, move || {
             store::refresh();
+            // The journal only polls while the pane is open — a closed log
+            // should cost nothing.
+            store::refresh_journal();
             if !pending.is_empty() && store::apply_permalink(&pending) {
                 pending.clear();
             }

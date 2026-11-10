@@ -41,7 +41,17 @@ pub fn register() {
         .val("viewerUrls", &js::new_object().into())
         .val("viewerFetching", &js::new_object().into())
         // AJCS run state per backref id (backref.id -> 'queued'|'running'|…).
-        .val("runStates", &js::new_object().into());
+        .val("runStates", &js::new_object().into())
+        // ── the tool-call journal (SBOX_PLAN1 §3.3) ──────────────────────
+        // Every host MCP call any client made, oldest first. The operator's
+        // single source of truth for what an agent did on this machine.
+        .val("journal", &js::new_array().into())
+        // Tail cursor: the highest seq already pulled.
+        .num("journalSeq", 0.0)
+        .bool("logOpen", false)
+        // Sticky scroll: stay pinned to the newest entry unless the operator
+        // has scrolled up to read something, which un-sticks it.
+        .bool("logStick", true);
 
     getters(&mut d);
     methods(&mut d);
@@ -137,6 +147,41 @@ fn getters(d: &mut Def) {
 // ── actions the template calls ──────────────────────────────────────────────
 
 fn methods(d: &mut Def) {
+    d.method("toggleLog", |_this, _args| {
+        let s = store_ref();
+        let open = !js::get_bool(&s, "logOpen");
+        js::set_bool(&s, "logOpen", open);
+        if open {
+            js::set_bool(&s, "logStick", true);
+        }
+        mjs::redraw();
+        JsValue::UNDEFINED
+    })
+    // Un-stick as soon as the operator scrolls away from the bottom, and
+    // re-stick when they come back — the behaviour a log pane should have.
+    .method("onLogScroll", |_this, args| {
+        let el = js::get(&js::arg(&args, 0), "target");
+        if el.is_falsy() {
+            return JsValue::UNDEFINED;
+        }
+        let top = js::get_num(&el, "scrollTop");
+        let height = js::get_num(&el, "scrollHeight");
+        let view = js::get_num(&el, "clientHeight");
+        let at_bottom = height - (top + view) < 24.0;
+        js::set_bool(&store_ref(), "logStick", at_bottom);
+        JsValue::UNDEFINED
+    })
+    .method("entryClass", |_this, args| {
+        let e = js::arg(&args, 0);
+        JsValue::from_str(if js::get_bool(&e, "ok") { "jr ok" } else { "jr bad" })
+    })
+    .method("argsOf", |_this, args| {
+        let e = js::arg(&args, 0);
+        let json = js::call_global("JSON", &[]);
+        let _ = json;
+        JsValue::from_str(&stringify(&js::get(&e, "args")))
+    });
+
     d.method("isSelected", |_this, args| {
         let id = js::arg_str(&args, 0);
         JsValue::from_bool(has_id(&selected_ids(), &id))
@@ -390,6 +435,57 @@ fn fit_frame(frame: &JsValue, screen: &JsValue) {
     }
     let scale = (sw / fw).max(sh / fh).max(0.01);
     js::set_str(&style, "transform", &format!("scale({scale})"));
+}
+
+fn stringify(v: &JsValue) -> String {
+    let global = js::global();
+    let json = js::get(&global, "JSON");
+    js::call(&json, "stringify", &[v.clone()])
+        .as_string()
+        .unwrap_or_default()
+}
+
+/// Pull journal entries newer than the cursor and append them.
+///
+/// Append rather than replace: the feed is a log, and re-rendering the whole
+/// list every second would fight the scroll position the operator is holding.
+pub fn refresh_journal() {
+    let s = store_ref();
+    if !js::get_bool(&s, "logOpen") {
+        return;
+    }
+    let after = js::get_num(&s, "journalSeq") as u64;
+    api::get(&format!("/api/journal?after={after}"), None, move |v| {
+        let s = store_ref();
+        let incoming = Array::from(&js::get(&v, "entries"));
+        if incoming.length() == 0 {
+            return;
+        }
+        let existing = Array::from(&js::get(&s, "journal"));
+        for e in incoming.iter() {
+            existing.push(&e);
+        }
+        // Bounded on the client too — a long session should not grow the DOM
+        // without limit.
+        while existing.length() > 500 {
+            existing.shift();
+        }
+        js::set(&s, "journal", &existing.clone().into());
+        let head = js::get_num(&v, "head");
+        js::set_num(&s, "journalSeq", head);
+        mjs::redraw();
+        if js::get_bool(&s, "logStick") {
+            scroll_log_to_bottom();
+        }
+    });
+}
+
+/// Pin the feed to the newest entry after a render.
+fn scroll_log_to_bottom() {
+    if let Some(el) = js::query(".journal-body") {
+        let height = js::get_num(&el, "scrollHeight");
+        js::set_num(&el, "scrollTop", height);
+    }
 }
 
 // ── fetches ─────────────────────────────────────────────────────────────────
