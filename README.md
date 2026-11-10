@@ -12,8 +12,9 @@ got.
 
 ![The wall](docs/screenshot.png)
 
-Each tile is a live Alpine desktop streaming H.264 over a WebSocket, served by
-`cua-spacesd` inside the container.
+Two sandboxes: a `headless` shell box on the left, a `headed` desktop on the
+right streaming H.264 over a WebSocket. The right one is **active** — the one
+the host MCP tools act on when a client names none.
 
 ## Stack
 
@@ -71,6 +72,28 @@ ready`, persisted to `tmp/orchestration-state.json` and reconciled against the
 container CLI on every read — the CLI is the source of truth for whether a
 sandbox still exists.
 
+### Host MCP plane — `POST /mcp`
+
+One Streamable-HTTP MCP endpoint that manages the pool and puts the three
+harness hands inside the active sandbox. This is the surface a `claude` or
+`codex` CLI on another machine attaches to.
+
+| tool | acts on |
+|---|---|
+| `sandbox_create` | the pool — builds and boots, **blocks until ready** |
+| `sandbox_list` | the pool |
+| `sandbox_use` | the pool — moves the active cursor |
+| `sandbox_destroy` | the pool |
+| `sandbox_screenshot` | a sandbox desktop (headed only) |
+| `read` / `write` / `bash` | the **active** sandbox, through execd |
+
+Every call requires `Authorization: Bearer <token>`, including on loopback.
+The token is generated once into `.sbox-lan-token` (0600, gitignored) and
+printed on creation.
+
+`GET /api/journal?after=<seq>` tails the tool-call log: every call, from every
+client, with arguments, outcome and duration. The wall's log pane reads it.
+
 ### Agent planes (`docs/mcp-driver-contract.md`, `docs/execd-contract.md`)
 
 ```
@@ -86,6 +109,43 @@ One HTTP request = one MCP request. The driver holds no session state: the
 initialize handshake runs per request, and the per-sandbox bearer token is
 recomputed as `HMAC-SHA256(.cua-secret, containerId)` — never persisted,
 never echoed.
+
+## The image matrix
+
+| kind | contents | ready when | size | boot |
+|---|---|---|---|---|
+| `headed` | Xvfb, Openbox, Chromium, PipeWire, cua-spacesd, execd | spacesd `/health` on 3211 | ~2.0 GB | ~20-30s |
+| `headless` | shell + execd. No X, no browser, no audio, no spacesd | execd `/healthz` on 3213 | ~167 MB | ~1s |
+
+`image` on a create names a **kind**, not an image reference — letting a caller
+name an arbitrary image is a much larger trust decision than picking a row of
+a matrix the host built itself, and this plane faces the LAN.
+
+```bash
+podman build -t alpine-desktop:spacesd  -f desktop/Containerfile          desktop/
+podman build -t alpine-sandbox:headless -f desktop/Containerfile.headless desktop/
+```
+
+`SANDBOX_IMAGE` and `SANDBOX_IMAGE_HEADLESS` override the two tags.
+
+## Exposing it to the network
+
+`sbox-lan` is the gateway: it publishes **exactly `POST /mcp`** and nothing
+else, so the backend's unauthenticated `/api/*` surface stays on loopback.
+
+```bash
+./target/debug/sbox-lan            # 127.0.0.1:7777 (default)
+./target/debug/sbox-lan --lan      # 0.0.0.0:7777
+```
+
+It is a separate binary because it is a separate trust boundary. Binding the
+backend wider instead would publish the whole REST API alongside the
+authenticated MCP endpoint.
+
+The posture this is built for: the host never dials out and never echoes a
+shell. It listens for an ordinary HTTP application protocol — the same
+artifact class as any other MCP server — and every side effect lands inside a
+container whose reachability into the host is a mount declared at create.
 
 ## Layout
 
@@ -103,7 +163,11 @@ sbox-b/
 │       ├── orchestration*.rs     AJCS lifecycle, validation, volumes, store
 │       ├── mcp_driver.rs         the two agent facades
 │       ├── spacesd.rs            gRPC-Web + hand-rolled protobuf (viewer tickets)
+│       ├── mcp_server.rs         THE HOST MCP TOOL SERVER (pool + hands)
+│       ├── journal.rs            the tool-call feed the wall tails
+│       ├── images.rs             the headed/headless matrix
 │       └── snapshots.rs          best-effort desktop PNG capture
+├── src/bin/sbox-lan.rs           the LAN gateway (only POST /mcp)
 ├── desktop/                      the guest image (Containerfile + assets)
 ├── docs/                         the three API contracts
 └── spike/                        upstream reference material — see spike/README.md
@@ -218,3 +282,23 @@ ever matters.
   the predecessor: a feature-dense multi-pod K8s sandbox with tiled desktop
   streaming, GitLab, GPU passthrough and an MCP host-coordinator. sbox trades
   that density for one container runtime and a viewer that looks right.
+
+### `network: false` is refused, not honoured
+
+The field is accepted and the value is rejected. Disabling the container
+network also disables **published ports** (verified: `--network none` with
+`-p` yields no listener), and the agent plane is reached through a published
+port — so the sandbox would boot fine and then time out at readiness.
+Unreachable is not isolated.
+
+The real implementation is execd's stdio transport (`docs/execd-contract.md`):
+drive the guest over `container exec` instead of TCP and the network becomes
+genuinely optional. Until the driver speaks that transport, refusing beats
+shipping an option that silently breaks.
+
+### spacesd has no tool called `screenshot`
+
+The capture primitive is `get_desktop_state` — *"Capture the full display in
+the desktop action coordinate frame … use the returned PNG directly as the
+coordinate source for actions"*. `sandbox_screenshot` calls that, so the frame
+it returns is the one a click would be aimed against.

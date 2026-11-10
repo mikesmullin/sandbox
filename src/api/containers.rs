@@ -209,6 +209,9 @@ pub async fn get_container_list() -> Result<Vec<Value>, String> {
         .filter(|c| images.iter().any(|i| *i == c.image))
         .collect();
 
+    // The wall marks the active sandbox — the one the host MCP tools act on
+    // when a client names none.
+    let active = super::orchestration::active_id();
     let mut out = Vec::with_capacity(rows.len());
     for c in rows {
         let kind = images::Kind::of_image(&c.image);
@@ -240,6 +243,7 @@ pub async fn get_container_list() -> Result<Vec<Value>, String> {
             "mcpPort": mcp_port,
             "ready": ready,
             "kind": kind.as_str(),
+            "active": active.as_deref() == Some(c.id.as_str()),
         });
         if let Some(b) = backref {
             entry["backref"] = b;
