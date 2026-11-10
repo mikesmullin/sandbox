@@ -1,0 +1,336 @@
+//! Container lifecycle — all `container` invocations go through container_cli.
+//!
+//! Desktops are cua-spacesd images: :3211 (gRPC/MCP/viewer) + :3212/udp (QUIC).
+//! The argv built here is always the Apple `container` dialect; container_cli
+//! owns the runtime port (real `container` on macOS, podman/docker elsewhere)
+//! and re-shapes `ls`/`inspect` output back into what this file parses.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::Sha256;
+
+use super::container_cli as cli;
+use super::orchestration_store;
+use super::spacesd;
+use crate::http::client;
+use crate::util;
+
+/// Spacesd port inside the guest (gRPC + gRPC-Web + /mcp + /media + /viewer).
+pub const GUEST_MCP_PORT: u16 = 3211;
+/// Spacesd QUIC media port inside the guest (UDP).
+pub const GUEST_QUIC_PORT: u16 = 3212;
+
+/// Path served by spacesd once the desktop is actually up. Used to distinguish
+/// a "port is published" container from one whose daemon is genuinely serving.
+const HEALTH_PATH: &str = "/health";
+/// Max time to wait for a probe to respond before treating it as down.
+const HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Once confirmed-up, trust the probe for this long without re-fetching.
+const KNOWN_GOOD_TTL: Duration = Duration::from_secs(30);
+
+/// Sandbox image to filter by — configurable via SANDBOX_IMAGE.
+pub fn sandbox_image() -> String {
+    std::env::var("SANDBOX_IMAGE").unwrap_or_else(|_| "alpine-desktop:spacesd".into())
+}
+
+// ── tokens ──────────────────────────────────────────────────────────────────
+
+/// Per-container spacesd token: HMAC(server secret, container id). The secret
+/// is generated once and persisted at `.cua-secret` (or CUA_TOKEN_SECRET).
+/// Deterministic so tokens survive server restarts without a store.
+pub fn container_token(container_id: &str) -> String {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(token_secret().as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(container_id.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn token_secret() -> String {
+    if let Ok(s) = std::env::var("CUA_TOKEN_SECRET") {
+        return s;
+    }
+    let path = util::project_root().join(".cua-secret");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let secret = util::random_hex(32);
+    util::write_private(&path, &format!("{secret}\n"));
+    secret
+}
+
+// ── listing ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub id: String,
+    pub image: String,
+    pub state: String,
+    pub ip: String,
+}
+
+/// Parse `container ls` into rows. Mirrors the column discipline the Node
+/// parser used: a row needs at least 9 whitespace-separated fields, and the
+/// columns read are 0=id, 1=image, 4=state, 5=addr.
+pub fn parse_ls(stdout: &str) -> Vec<Row> {
+    stdout
+        .split('\n')
+        .skip(1) // header
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.trim().split_whitespace().collect();
+            if parts.len() < 9 {
+                return None;
+            }
+            Some(Row {
+                id: parts[0].to_string(),
+                image: parts[1].to_string(),
+                state: parts[4].to_string(),
+                ip: parts[5].to_string(),
+            })
+        })
+        .collect()
+}
+
+pub async fn list_containers() -> Result<Vec<Row>, String> {
+    let out = cli::run_str(&["ls"]).await?;
+    if out.failed() {
+        return Err(format!("container ls failed: {}", out.message()));
+    }
+    Ok(parse_ls(&out.stdout))
+}
+
+/// Get container details via `container inspect` (already normalized by the
+/// runtime port into `[{ configuration, status }]`).
+pub async fn inspect_container(id_or_name: &str) -> Result<Value, String> {
+    let out = cli::run_str(&["inspect", id_or_name]).await?;
+    if out.failed() {
+        return Err(format!("container inspect failed: {}", out.message()));
+    }
+    serde_json::from_str(&out.stdout).map_err(|e| format!("inspect: unparsable output: {e}"))
+}
+
+async fn published_mcp_port(id: &str) -> Option<u16> {
+    let inspected = match inspect_container(id).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[containers] inspect {id}: {e}");
+            return None;
+        }
+    };
+    let ports = inspected
+        .get(0)?
+        .pointer("/configuration/publishedPorts")?
+        .as_array()?
+        .clone();
+    ports.iter().find_map(|entry| {
+        let container_port = entry.get("containerPort")?.as_u64()?;
+        let proto = entry.get("proto")?.as_str()?;
+        if container_port == GUEST_MCP_PORT as u64 && proto == "tcp" {
+            entry.get("hostPort")?.as_u64().map(|p| p as u16)
+        } else {
+            None
+        }
+    })
+}
+
+// ── readiness ───────────────────────────────────────────────────────────────
+
+fn known_good() -> &'static Mutex<HashMap<String, Instant>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Probe whether a container's spacesd is actually serving (`/health` → 2xx).
+pub async fn probe_serving(host: &str, port: u16) -> bool {
+    client::request(host, port, "GET", HEALTH_PATH, &[], None, HEALTH_TIMEOUT)
+        .await
+        .map(|r| r.ok())
+        .unwrap_or(false)
+}
+
+/// Read-only "is spacesd serving" check, with a short TTL so an already-booted
+/// container is not hammered on every poll.
+pub async fn is_serving(container_id: &str, host: &str, port: u16) -> bool {
+    if let Ok(map) = known_good().lock() {
+        if let Some(at) = map.get(container_id) {
+            if at.elapsed() < KNOWN_GOOD_TTL {
+                return true;
+            }
+        }
+    }
+    let serving = probe_serving(host, port).await;
+    if let Ok(mut map) = known_good().lock() {
+        if serving {
+            map.insert(container_id.to_string(), Instant::now());
+        } else {
+            map.remove(container_id);
+        }
+    }
+    serving
+}
+
+/// Forget a container's cached readiness (used on delete so a recycled name
+/// cannot inherit the previous container's "known good" stamp).
+pub fn forget_readiness(container_id: &str) {
+    if let Ok(mut map) = known_good().lock() {
+        map.remove(container_id);
+    }
+}
+
+// ── the wall's view ─────────────────────────────────────────────────────────
+
+pub async fn get_container_list() -> Result<Vec<Value>, String> {
+    let image = sandbox_image();
+    let rows: Vec<Row> = list_containers()
+        .await?
+        .into_iter()
+        .filter(|c| c.image == image)
+        .collect();
+
+    let mut out = Vec::with_capacity(rows.len());
+    for c in rows {
+        let mcp_port = published_mcp_port(&c.id).await;
+        let mcp_host = mcp_port.map(|_| "127.0.0.1");
+        let running_with_port = c.state == "running" && mcp_port.is_some();
+        let ready = match (running_with_port, mcp_host, mcp_port) {
+            (true, Some(h), Some(p)) => is_serving(&c.id, h, p).await,
+            _ => false,
+        };
+        // Orchestration-tracked boxes carry their caller's backref (non-secret
+        // label, verbatim); CLI-derived boxes with no record have no key.
+        let backref = orchestration_store::backref_for(&c.id);
+        let short_id: String = c.id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+        let mut entry = json!({
+            "id": c.id,
+            "shortId": short_id,
+            "image": c.image,
+            "state": c.state,
+            "ip": c.ip,
+            "mcpHost": mcp_host,
+            "mcpPort": mcp_port,
+            "ready": ready,
+        });
+        if let Some(b) = backref {
+            entry["backref"] = b;
+        }
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+// ── lifecycle ───────────────────────────────────────────────────────────────
+
+pub struct Created {
+    pub id: String,
+    pub mcp_port: u16,
+    pub quic_port: u16,
+}
+
+/// Create a new desktop container with spacesd ports published and the
+/// per-container token injected (the daemon refuses non-loopback binds without
+/// it; Apple publishes ports on host loopback only).
+pub async fn create_container(opts: &Value) -> Result<Created, String> {
+    let cpus = opts.get("cpus").and_then(Value::as_u64).unwrap_or(4);
+    let memory = opts
+        .get("memory")
+        .and_then(Value::as_str)
+        .unwrap_or("2048M")
+        .to_string();
+    let image = opts
+        .get("image")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(sandbox_image);
+
+    let container_id = format!("sandbox2-desktop-{}", util::random_hex(3));
+    let mcp_port = util::allocate_host_port()?;
+    let quic_port = util::allocate_host_port()?;
+
+    let argv: Vec<String> = vec![
+        "create".into(),
+        "-p".into(),
+        format!("{mcp_port}:{GUEST_MCP_PORT}"),
+        "-p".into(),
+        format!("{quic_port}:{GUEST_QUIC_PORT}/udp"),
+        "-c".into(),
+        cpus.to_string(),
+        "-m".into(),
+        memory,
+        "--name".into(),
+        container_id.clone(),
+        "-e".into(),
+        format!("CUA_ENV_TOKEN={}", container_token(&container_id)),
+        image,
+    ];
+
+    let created = cli::run(&argv).await?;
+    if created.failed() {
+        return Err(format!("container create failed: {}", created.message()));
+    }
+
+    // Start immediately after creation; on failure leave no dead container.
+    if let Err(e) = start_container(&container_id).await {
+        if let Err(cleanup) = delete_container(&container_id).await {
+            eprintln!("[containers] cleanup after start failure: {cleanup}");
+        }
+        return Err(e);
+    }
+
+    Ok(Created {
+        id: container_id,
+        mcp_port,
+        quic_port,
+    })
+}
+
+pub async fn start_container(id_or_name: &str) -> Result<(), String> {
+    let out = cli::run_str(&["start", id_or_name]).await?;
+    if out.failed() {
+        return Err(format!("container start failed: {}", out.message()));
+    }
+    Ok(())
+}
+
+pub async fn stop_container(id_or_name: &str) -> Result<(), String> {
+    let out = cli::run_str(&["stop", id_or_name]).await?;
+    if out.failed() {
+        return Err(format!("container stop failed: {}", out.message()));
+    }
+    Ok(())
+}
+
+pub async fn delete_container(id_or_name: &str) -> Result<(), String> {
+    let out = cli::run_str(&["rm", id_or_name]).await?;
+    forget_readiness(id_or_name);
+    if out.failed() {
+        return Err(format!("container delete failed: {}", out.message()));
+    }
+    Ok(())
+}
+
+/// Mint a fresh viewer ticket for a container and return the full viewer URL
+/// for a browser iframe. Mint a new one per tile load — tickets are short-lived
+/// and single-flow; reuse across rapid reloads is unreliable.
+pub async fn mint_viewer_url(id: &str) -> Result<String, String> {
+    let containers = get_container_list().await?;
+    let found = containers
+        .iter()
+        .find(|c| c.get("id").and_then(Value::as_str) == Some(id));
+    let container = match found {
+        Some(c) if c.get("ready").and_then(Value::as_bool) == Some(true) => c,
+        _ => return Err(format!("container unavailable: {id}")),
+    };
+    let port = container
+        .get("mcpPort")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("container unavailable: {id}"))? as u16;
+
+    let ticket = spacesd::mint_viewer_ticket(port, &container_token(id), None).await?;
+    Ok(format!("http://127.0.0.1:{port}{}", ticket.viewer_path))
+}

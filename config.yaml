@@ -1,0 +1,10 @@
+# Sandbox2 app configuration.
+#
+# Read by the server at startup (web/server.mjs) via src/config.mjs and served
+# to the SPA over GET /api/config.
+
+# ── cua viewer (spacesd /viewer) ────────────────────────────────────
+# The viewer manages its own connection + reconnects; the SPA only re-mints
+# viewer URLs (server-side) when a container transitions to READY. Knobs here
+# are reserved for future use.
+viewer:

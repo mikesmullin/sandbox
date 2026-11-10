@@ -1,0 +1,312 @@
+# syntax=docker/dockerfile:1.7
+#
+# sandbox2 desktop — Alpine + Openbox (Turquoise-Nights) + cua-spacesd (musl).
+#
+# Replaces the noVNC/Xvnc stack with cua-spacesd:
+#   - Xvfb owns the display (no network listener at all)
+#   - cua-spacesd (:3211) serves MCP /media /viewer, gRPC-Web; QUIC on :3212/udp
+#   - agent surface: POST /mcp with Bearer token (CUA_ENV_TOKEN)
+#   - human surface: /viewer/#ticket=… (ticket minted by the host app)
+#
+# The spacesd binary is built from source on musl (see build-spacesd.sh) and
+# vendored at dist/cua-spacesd (built from public source — see desktop/build-spacesd.sh)
+
+FROM alpine:latest
+
+ENV TERM=xterm
+
+# Local APK mirror for fast builds — OPT-IN via --build-arg APK_CACHE=<base-url>
+# (e.g. http://192.168.64.1:3142 on the Apple-Containers host, where that
+# address is the host side of the VM bridge). Left empty the image builds
+# against the official mirrors only.
+#
+# It must stay opt-in: off the Apple VM bridge, 192.168.64.1 is not a local
+# address at all — on a Linux host it routes out the default gateway and every
+# apk index fetch blocks until it times out, which stalls the whole build
+# rather than "falling back harmlessly".
+ARG APK_CACHE=
+RUN if [ -n "${APK_CACHE}" ]; then \
+      echo "${APK_CACHE}/alpine/v3.22/main" >> /etc/apk/repositories && \
+      echo "${APK_CACHE}/alpine/v3.22/community" >> /etc/apk/repositories && \
+      echo "${APK_CACHE}/alpine/edge/community" >> /etc/apk/repositories && \
+      echo "${APK_CACHE}/alpine/edge/main" >> /etc/apk/repositories; \
+    fi
+
+# Desktop + spacesd runtime deps.
+#   xvfb          — the X server (XTEST input, MIT-SHM/DAMAGE capture, RANDR)
+#   su-exec       — drop privileges to the desktop user per-process
+#   libx11/xi/xtst/xext/xkbcommon/xcb, libopus — cua-spacesd dynamic deps
+RUN apk add --no-cache \
+    bash \
+    curl \
+    git \
+    sudo \
+    vim \
+    less \
+    ca-certificates \
+    tzdata \
+    openbox \
+    udev \
+    dbus \
+    dbus-x11 \
+    xdotool \
+    xclip \
+    at-spi2-core \
+    libdrm \
+    mesa-gbm \
+    mesa-gl \
+    mesa-dri-gallium \
+    xrandr \
+    fontconfig \
+    freetype \
+    ttf-dejavu \
+    terminator \
+    font-jetbrains-mono \
+    feh \
+    xvfb \
+    su-exec \
+    pipewire \
+    pipewire-pulse \
+    wireplumber \
+    pulseaudio-utils \
+    ffmpeg \
+    libx11 \
+    libxi \
+    libxtst \
+    libxext \
+    libxkbcommon \
+    libxcb \
+    opus
+
+# Chromium (browser driven by cua-driver over CDP when wired)
+RUN apk add --no-cache chromium
+
+# Chromium GPU+shm wrapper — two flags the cua-driver's browser launches omit:
+#   --disable-gpu            → ANGLE-Vulkan hard-aborts in the container (verified:
+#                              without the flag the process is a zombie in <1s).
+#   --disable-dev-shm-usage  → /dev/shm is a 64MB tmpfs in these guests; once the
+#                              prewarmed desktop browser fills it (~48MB), any
+#                              second WINDOWED chromium dies for lack of shared
+#                              memory (verified: windowed+flag = alive, without =
+#                              dead; headless masked it). Inject at the real
+#                              binary so BOTH the chromium-launcher path and
+#                              direct execs get the flags. (The cua-driver
+#                              resolves the browser itself and bypasses
+#                              /usr/local/bin PATH wrappers —
+#                              /usr/lib/chromium/chromium is the only reliable
+#                              injection point.)
+COPY chromium-wrapper.sh /tmp/chromium-wrapper.sh
+RUN mv /usr/lib/chromium/chromium /usr/lib/chromium/chromium.real && \
+    install -m 0755 /tmp/chromium-wrapper.sh /usr/lib/chromium/chromium && \
+    rm /tmp/chromium-wrapper.sh
+
+# Managed Chromium policy (reference image parity: no first-run noise, no
+# sign-in, no password saving; the "unsupported flag" bar stays off).
+RUN mkdir -p /etc/chromium/policies/managed && \
+    printf '%s\n' '{"BrowserSignin":0,"SyncDisabled":true,"PasswordManagerEnabled":false,' \
+      '"PromotionsEnabled":false,"DefaultBrowserSettingEnabled":false,"MetricsReportingEnabled":false,' \
+      '"PrivacySandboxPromptEnabled":false,"TranslateEnabled":false,' \
+      '"CommandLineFlagSecurityWarningsEnabled":false}' \
+      >/etc/chromium/policies/managed/sandbox2.json
+
+# Bun runtime
+RUN mkdir -p /opt/bun && \
+    curl -fsSL --insecure https://bun.sh/install.sh | BUN_INSTALL=/opt/bun bash && \
+    ln -sf /opt/bun/bin/bun /usr/local/bin/bun && \
+    ln -sf /opt/bun/bin/bunx /usr/local/bin/bunx
+
+# Non-root desktop user
+RUN adduser -D -s /bin/bash desktop && \
+    echo "desktop ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# Config directories
+RUN mkdir -p /home/desktop/.config/openbox \
+    /home/desktop/.config/chromium/Default \
+    /home/desktop/.config/gtk-3.0 \
+    /home/desktop/.config/terminator \
+    /home/desktop/.icons/default \
+    /home/desktop/.local/share/themes \
+    /home/desktop/Pictures \
+    /run/cua
+
+# ─── Optional corporate CA trust (configurable) ──────────────────────────────
+# Default (TRUST_CORP_CA=0): image trusts only the public bundle — works
+# without the work VPN and without any certificate in the repo. With
+# TRUST_CORP_CA=1 and a user-supplied, never-committed corp-ca.crt in the
+# build context, it is appended to the system bundle and the desktop NSS db.
+# No certificate is referenced by name; nothing is committed to this repo.
+ARG TRUST_CORP_CA=0
+COPY . /build-ctx
+RUN if [ "${TRUST_CORP_CA:-0}" != "0" ] && [ -f /build-ctx/corp-ca.crt ]; then \
+      cp /build-ctx/corp-ca.crt /usr/local/share/ca-certificates/corp-ca.crt \
+      && cat /usr/local/share/ca-certificates/corp-ca.crt >> /etc/ssl/certs/ca-certificates.crt \
+      && update-ca-certificates >/dev/null 2>&1 || true; \
+    fi
+RUN if [ "${TRUST_CORP_CA:-0}" != "0" ] && [ -f /build-ctx/corp-ca.crt ]; then \
+      apk add --no-cache nss-tools \
+      && mkdir -p /home/desktop/.pki/nssdb \
+      && chown desktop:desktop /home/desktop/.pki /home/desktop/.pki/nssdb \
+      && su desktop -s /bin/sh -c 'export HOME=/home/desktop; certutil -N -d sql:/home/desktop/.pki/nssdb --empty-password' \
+      && awk -v src=/usr/local/share/ca-certificates/corp-ca.crt \
+           '/^-----BEGIN CERT/{n++; f="/tmp/corpca-" n ".pem"} {print > f} /^-----END CERT/{close(f)}' src \
+      && for f in /tmp/corpca-*.pem; do \
+           su desktop -s /bin/sh -c "export HOME=/home/desktop; certutil -A -d sql:/home/desktop/.pki/nssdb -t 'C,,' -n $(basename $f) -i $f"; \
+         done \
+      && chown -R desktop:desktop /home/desktop/.pki \
+      && rm -f /tmp/corpca-*.pem; \
+    fi
+
+# ─── Openbox autostart: export-only (terminator is launched by the entrypoint) ───
+RUN printf '#!/bin/bash\nexport DISPLAY=:1\n' > /home/desktop/.config/openbox/autostart && \
+    chmod +x /home/desktop/.config/openbox/autostart && \
+    chown desktop:desktop /home/desktop/.config/openbox/autostart
+
+# ─── Welcome page (chromium prewarm start page; also the browser-tool smoke target) ───
+RUN printf '%s\n' \
+      '<!doctype html>' \
+      '<html><head><meta charset="utf-8"><title>PSICOM Sandbox Desktop</title>' \
+      '<style>body{font-family:sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#1f2937}' \
+      'h1{color:#0e7490}code{background:#f1f5f9;padding:0 .3rem;border-radius:4px}</style></head>' \
+      '<body>' \
+      '<h1>PSICOM sandbox desktop</h1>' \
+      '<p>This browser was prewarmed by the image entrypoint so a window exists' \
+      'when an agent session wakes. The cua-driver can bind this tab over CDP.</p>' \
+      '<ul>' \
+      '<li>Guest hostname: <code>__HOSTNAME__</code></li>' \
+      '<li>Display: Xvfb :1 (1280x800), window manager: openbox</li>' \
+      '</ul>' \
+      '<p><button id="smoke-button">Agent clicked me</button> <span id="smoke-status"></span></p>' \
+      '<p><input id="smoke-input" placeholder="type here"></p>' \
+      '</body></html>' \
+      > /home/desktop/welcome.html && \
+    chown desktop:desktop /home/desktop/welcome.html
+
+# ─── Guest-loopback static server (serve.mjs on :8080) ───
+# The cua-driver's browser_navigate refuses file:// URLs (http/https/about
+# only), so local content must ride HTTP. This tiny bun static server serves
+# /home/desktop over 127.0.0.1:8080 — the prewarm browser opens
+# http://127.0.0.1:8080/welcome.html, and agents can navigate any local file
+# the same way (e.g. mounted evidence bundles copied/readable under /home).
+RUN printf '%s\n' \
+      'const fs = require("fs"), path = require("path");' \
+      'const ROOT = "/home/desktop";' \
+      'Bun.serve({' \
+      '  port: 8080,' \
+      '  fetch(req) {' \
+      '    const rel = path.normalize(decodeURIComponent(new URL(req.url).pathname)).split("/").filter(Boolean).join("/");' \
+      '    const f = path.join(ROOT, rel || "welcome.html");' \
+      '    if (!f.startsWith(ROOT) || !fs.existsSync(f) || fs.statSync(f).isDirectory())' \
+      '      return new Response("not found", { status: 404 });' \
+      '    const ext = { ".html": "text/html", ".md": "text/markdown", ".json": "application/json", ".txt": "text/plain" }[path.extname(f)] ?? "application/octet-stream";' \
+      '    return new Response(fs.readFileSync(f), { headers: { "content-type": ext } });' \
+      '  },' \
+      '});' \
+      > /home/desktop/serve.mjs && \
+    chown desktop:desktop /home/desktop/serve.mjs
+
+# ─── Pre-seed Chromium profile ───
+COPY chromium-profile.tar.gz /tmp/chromium-profile.tar.gz
+RUN tar xzf /tmp/chromium-profile.tar.gz -C /home/desktop/.config/chromium && \
+    chown -R desktop:desktop /home/desktop/.config/chromium && \
+    rm /tmp/chromium-profile.tar.gz
+
+# ─── Openbox menu ───
+RUN echo '<?xml version="1.0" encoding="UTF-8"?>' > /home/desktop/.config/openbox/menu.xml && \
+    echo '<openbox_menu xmlns="http://openbox.org/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://openbox.org/menu">' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '  <menu id="root-menu" label="Openbox 3">' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '    <item label="Terminal">' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '      <action name="Execute"><command>terminator --no-dbus</command></action>' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '    </item>' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '    <item label="Chromium">' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '      <action name="Execute"><command>chromium --no-sandbox --disable-gpu --no-first-run --no-default-browser-check --disable-search-engine-choice-screen</command></action>' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '    </item>' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '    <item label="Logout"><action name="Execute"><command>exit</command></action></item>' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '  </menu>' >> /home/desktop/.config/openbox/menu.xml && \
+    echo '</openbox_menu>' >> /home/desktop/.config/openbox/menu.xml && \
+    chown desktop:desktop /home/desktop/.config/openbox/menu.xml
+
+# ─── Terminator config ───
+COPY terminator.conf /home/desktop/.config/terminator/config
+RUN chown -R desktop:desktop /home/desktop/.config/terminator
+
+# ─── GTK cursor/theme setting ───
+COPY gtk-cursor.conf /home/desktop/.config/gtk-3.0/settings.ini
+RUN chown -R desktop:desktop /home/desktop/.config/gtk-3.0
+
+# ─── Openbox theme + custom button icons ───
+COPY Turquoise-Nights /tmp/turquoise-theme/
+COPY close.xbm /tmp/close.xbm
+COPY max.xbm /tmp/max.xbm
+COPY iconify.xbm /tmp/iconify.xbm
+RUN mkdir -p /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3 && \
+    cp /tmp/turquoise-theme/themerc /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3/ && \
+    cp /tmp/turquoise-theme/bullet.xbm /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3/ && \
+    cp /tmp/close.xbm /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3/close.xbm && \
+    cp /tmp/max.xbm /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3/max.xbm && \
+    cp /tmp/iconify.xbm /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3/iconify.xbm && \
+    cp /tmp/turquoise-theme/*.png /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3/ && \
+    cp /tmp/turquoise-theme/theme /home/desktop/.local/share/themes/Turquoise-Nights/openbox-3/ && \
+    chown -R desktop:desktop /home/desktop/.local/share/themes/Turquoise-Nights && \
+    rm -rf /tmp/turquoise-theme /tmp/close.xbm /tmp/max.xbm /tmp/iconify.xbm
+
+# ─── rc.xml: theme name ───
+RUN sed 's/<name>.*<\/name>/<name>Turquoise-Nights<\/name>/' /etc/xdg/openbox/rc.xml \
+    > /home/desktop/.config/openbox/rc.xml && \
+    chown desktop:desktop /home/desktop/.config/openbox/rc.xml
+
+# ─── Icon theme: Papirus + terminator→terminal icon swap ───
+RUN apk add --no-cache papirus-icon-theme && \
+    for theme in Papirus Papirus-Dark Papirus-Light; do \
+      for size in 16x16 16x16@2x 22x22 22x22@2x 24x24 24x24@2x 32x32 32x32@2x 48x48 48x48@2x 64x64 64x64@2x 96x96 128x128; do \
+        if [ -f /usr/share/icons/$theme/$size/apps/terminal.svg ]; then \
+          cp /usr/share/icons/$theme/$size/apps/terminal.svg /usr/share/icons/$theme/$size/apps/terminator.svg; \
+        fi; \
+      done; \
+    done
+
+# ─── Cursor theme: Bibata-Modern-Classic ───
+COPY icon-theme.conf /home/desktop/.icons/default/index.theme
+RUN mkdir -p /usr/share/icons && \
+    curl -fsSL --insecure -o /tmp/bibata.tar.xz https://github.com/ful1e5/Bibata_Cursor/releases/download/v2.0.7/Bibata-Modern-Classic.tar.xz && \
+    tar -xJf /tmp/bibata.tar.xz -C /usr/share/icons && \
+    rm /tmp/bibata.tar.xz && \
+    chown -R desktop:desktop /home/desktop/.icons
+
+# ─── Wallpaper ───
+COPY wallhaven-l8olgq.png /home/desktop/Pictures/wallpaper.png
+
+# ─── Headless PipeWire (virtual devices; cua-spacesd desktop audio) ───
+COPY pipewire/10-cua-virtual-devices.conf /etc/pipewire/pipewire.conf.d/10-cua-virtual-devices.conf
+COPY start-audio.sh /usr/local/bin/start-audio
+RUN chmod +x /usr/local/bin/start-audio
+
+# ─── cua-spacesd (musl binary — see build-spacesd.sh / spike/README.md) ───
+COPY dist/cua-spacesd /usr/local/bin/cua-spacesd
+RUN chmod +x /usr/local/bin/cua-spacesd
+
+# ─── desktop-env helper (run commands inside the session env via container exec) ───
+RUN printf '#!/bin/bash\n[ "$(id -u)" = 0 ] && exec su-exec desktop "$0" "$@"\nENV_FILE=/tmp/runtime-desktop/desktop.env\n[ -r "$ENV_FILE" ] && . "$ENV_FILE"\nexport HOME=/home/desktop\n[ "$#" -gt 0 ] || set -- bash -l\nexec "$@"\n' > /usr/local/bin/desktop-env && \
+    chmod +x /usr/local/bin/desktop-env
+
+# ─── execd — guest exec MCP server (ONE bash tool, pi semantics; port 3213) ──
+# Bearer-tokened Streamable-HTTP JSON-RPC at POST /mcp (contract:
+# web/docs/execd-contract.md); started by the entrypoint as the desktop user
+# with the session env. Read-only image content — the desktop user only runs it.
+COPY execd/index.mjs /opt/execd/index.mjs
+RUN chmod 0755 /opt/execd/index.mjs
+
+# ─── Entrypoint ───
+COPY entrypoint.sh /usr/local/bin/start-desktop
+RUN chmod +x /usr/local/bin/start-desktop && \
+    chown desktop:desktop /home/desktop/Pictures/wallpaper.png
+
+RUN find /home/desktop -name '._*' -delete 2>/dev/null; true
+RUN chown -R desktop:desktop /home/desktop/.config
+
+# cua-spacesd: gRPC + gRPC-Web + /mcp + /media + /viewer on 3211; QUIC on 3212/udp.
+EXPOSE 3211
+EXPOSE 3212/udp
+
+# Entrypoint runs as root (token materialization, system bus) and drops to
+# `desktop` per-process via su-exec.
+CMD ["/usr/local/bin/start-desktop"]

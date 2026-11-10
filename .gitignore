@@ -1,0 +1,8 @@
+/target
+# The musl cua-spacesd binary is built by desktop/build-spacesd.sh, not committed
+# (it is ~60-125MB and arch-specific — rebuild it for the host you image on).
+/desktop/dist/
+# Per-install HMAC secret for the sandbox tokens — never commit.
+/.cua-secret
+# Runtime state: the orchestration store is rebuilt from the container CLI.
+/tmp/
