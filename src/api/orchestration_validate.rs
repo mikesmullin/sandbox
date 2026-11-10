@@ -26,6 +26,9 @@ pub struct CreateInput {
     pub volumes: Vec<VolumeEntry>,
     pub cpus: Option<u64>,
     pub memory: Option<String>,
+    /// Container network connectivity (SBOX_PLAN1 §3.1). Default on; `false`
+    /// creates the sandbox with no network at all.
+    pub network: bool,
     pub backref: Option<Map<String, Value>>,
 }
 
@@ -441,7 +444,7 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
         Some(o) => o.clone(),
         None => Map::new(),
     };
-    let allowed = ["image", "repos", "volumes", "resources", "backref"];
+    let allowed = ["image", "repos", "volumes", "resources", "backref", "network"];
     let unknown = unknown_fields(&obj, &allowed);
     if !unknown.is_empty() {
         return Err(ValidationError {
@@ -481,6 +484,34 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
     };
     check_volume_uniqueness(&volumes, &mut problems);
     let (cpus, memory) = check_resources(&obj, &mut problems);
+    // `network: false` is accepted as a field but refused as a value, on
+    // purpose. Disabling the container network also disables PUBLISHED PORTS
+    // (verified: `--network none` + `-p` yields no listener), and the agent
+    // plane — execd, and spacesd on a headed box — is reached exactly through
+    // a published port. A no-network sandbox created this way is not isolated,
+    // it is unreachable: it would boot fine and then time out at readiness.
+    //
+    // The real implementation is execd's stdio transport (0.2,
+    // docs/execd-contract.md): drive the guest over `container exec` instead
+    // of TCP, and the network becomes genuinely optional. Until the driver
+    // speaks that transport, refusing is better than handing back a sandbox
+    // that looks created and answers nothing.
+    let network = match obj.get("network") {
+        None | Some(Value::Null) | Some(Value::Bool(true)) => true,
+        Some(Value::Bool(false)) => {
+            problems.push(
+                "network: false is not supported yet — disabling the container network also \
+                 disables the published ports the agent plane is reached through, so the \
+                 sandbox would be unreachable rather than isolated"
+                    .into(),
+            );
+            true
+        }
+        Some(_) => {
+            problems.push("network must be a boolean".into());
+            true
+        }
+    };
     let backref = match obj.get("backref") {
         None | Some(Value::Null) => None,
         Some(v) => check_backref(v, &mut problems),
@@ -499,6 +530,7 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
         volumes,
         cpus,
         memory,
+        network,
         backref,
     })
 }

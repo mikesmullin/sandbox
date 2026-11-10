@@ -10,6 +10,12 @@ description = "sbox B-SIDE — the headless backend: container orchestration, th
 name = "sbox-b"
 path = "src/main.rs"
 
+# The LAN gateway: exposes only POST /mcp, so the backend's REST surface can
+# stay on loopback. Separate binary because it is a separate trust boundary.
+[[bin]]
+name = "sbox-lan"
+path = "src/bin/sbox-lan.rs"
+
 [dependencies]
 # Everything this process talks to is loopback HTTP (podman's CLI, spacesd on
 # 127.0.0.1, execd in the guest), so there is no TLS and no need for a full

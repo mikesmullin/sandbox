@@ -28,7 +28,7 @@ use super::container_cli as cli;
 use super::containers::{self, container_token, GUEST_EXEC_PORT, GUEST_MCP_PORT, GUEST_QUIC_PORT};
 use super::images::Kind;
 use super::orchestration_store::{state_file, Record, Transition};
-use super::orchestration_validate::validate_create;
+use super::orchestration_validate::{validate_create, CreateInput};
 use super::orchestration_volumes::{
     to_volume_after_delete, to_volume_detail, volume_create_args, VolumeKind,
 };
@@ -61,6 +61,11 @@ struct Store {
     aborted: HashSet<String>,
     /// id → last confirmed-good readiness probe.
     known_good: HashMap<String, Instant>,
+    /// The ACTIVE sandbox: the one `read`/`write`/`bash`/`screenshot` act on
+    /// when the caller names none (SBOX_PLAN1 §3.1). Global and persisted, not
+    /// per-connection, so every harness that attaches sees the same cursor —
+    /// which is the point: the operator watches one box, not one per client.
+    active_id: Option<String>,
     loaded: bool,
 }
 
@@ -91,6 +96,11 @@ fn ensure_loaded(st: &mut Store) {
             }
         }
     }
+    st.active_id = doc
+        .get("activeId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|id| st.records.contains_key(id));
 }
 
 fn save(st: &Store) {
@@ -103,7 +113,11 @@ fn save(st: &Store) {
         .iter()
         .filter_map(|(id, r)| serde_json::to_value(r).ok().map(|v| (id.clone(), v)))
         .collect();
-    let body = json!({ "version": 1, "sandboxes": Value::Object(sandboxes) });
+    let body = json!({
+        "version": 1,
+        "sandboxes": Value::Object(sandboxes),
+        "activeId": st.active_id,
+    });
     if let Ok(text) = serde_json::to_string_pretty(&body) {
         std::fs::write(&path, text).ok();
     }
@@ -139,6 +153,38 @@ fn get_record(id: &str) -> Option<Record> {
 
 fn is_aborted(id: &str) -> bool {
     store().lock().unwrap().aborted.contains(id)
+}
+
+// ── the active sandbox ──────────────────────────────────────────────────────
+
+/// The active sandbox id, if one is set and still tracked.
+pub fn active_id() -> Option<String> {
+    let mut st = store().lock().unwrap();
+    ensure_loaded(&mut st);
+    st.active_id
+        .clone()
+        .filter(|id| st.records.contains_key(id))
+}
+
+/// Point the cursor at a sandbox. Errors when the id is not tracked, so
+/// `sandbox_use` of a typo is a refusal rather than a silent dead cursor.
+pub fn set_active(id: &str) -> Result<(), String> {
+    let mut st = store().lock().unwrap();
+    ensure_loaded(&mut st);
+    if !st.records.contains_key(id) {
+        return Err(format!("No such sandbox: {id}"));
+    }
+    st.active_id = Some(id.to_string());
+    save(&st);
+    Ok(())
+}
+
+/// Drop the cursor if it points at `id` — called on delete so the next tool
+/// call says "no active sandbox" instead of dialling a container that is gone.
+fn clear_active_if(st: &mut Store, id: &str) {
+    if st.active_id.as_deref() == Some(id) {
+        st.active_id = None;
+    }
 }
 
 // ── readiness ───────────────────────────────────────────────────────────────
@@ -303,6 +349,7 @@ async fn reconcile_row(record: &Record, rows: Option<&Vec<containers::Row>>) -> 
     let mut st = store().lock().unwrap();
     ensure_loaded(&mut st);
     st.records.remove(&record.id);
+    clear_active_if(&mut st, &record.id);
     save(&st);
     None
 }
@@ -602,6 +649,11 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
         ]);
     }
     argv.extend(["-p".into(), format!("{}:{}", record.exec_port, GUEST_EXEC_PORT)]);
+    if !record.network {
+        // An air-gapped sandbox: no DNS, no egress, no clone. The published
+        // ports still work — they are host-side plumbing, not container network.
+        argv.extend(["--network".into(), "none".into()]);
+    }
     // Named volumes → `-v name:mount:mode`; host binds → `--mount
     // type=bind,…`. All of it rides BEFORE the image — OPTIONS-BEFORE-TARGET.
     argv.extend(volume_create_args(&record.volumes));
@@ -675,23 +727,12 @@ fn fail_with(status: u16, code: &str, message: &str, details: Value) -> Response
     )
 }
 
-async fn handle_create(req: &Request) -> Response {
-    let body: Value = if req.body.is_empty() {
-        json!({}) // empty body = defaults
-    } else {
-        match serde_json::from_slice(&req.body) {
-            Ok(v) => v,
-            Err(_) => return fail(400, "invalid_json", "Request body must be valid JSON"),
-        }
-    };
-    if !body.is_object() {
-        return fail(400, "invalid_body", "Request body must be a JSON object");
-    }
-    let input = match validate_create(&body) {
-        Ok(v) => v,
-        Err(e) => return fail_with(400, e.code, &e.message, e.details),
-    };
-
+/// Start a sandbox: allocate ports, persist the record, launch the pipeline.
+///
+/// Shared by the REST route and the host MCP tool, so the two cannot drift
+/// into creating subtly different sandboxes. Returns the record as it looked
+/// the moment it was registered (state `creating`).
+pub fn start_create(input: CreateInput) -> Result<Record, String> {
     let id = fresh_id();
     // Registered before any await — a concurrent GET must not reconcile-prune
     // a half-created record.
@@ -710,7 +751,7 @@ async fn handle_create(req: &Request) -> Response {
         (Ok(a), Ok(b), Ok(c)) => (a, b, c),
         _ => {
             store().lock().unwrap().in_flight.remove(&id);
-            return fail(500, "internal_error", "could not allocate host ports");
+            return Err("could not allocate host ports".into());
         }
     };
 
@@ -724,6 +765,7 @@ async fn handle_create(req: &Request) -> Response {
         volumes: input.volumes,
         repos: input.repos,
         backref: input.backref,
+        network: input.network,
         mcp_port,
         quic_port,
         exec_port,
@@ -738,15 +780,98 @@ async fn handle_create(req: &Request) -> Response {
         aborted: false,
     };
 
-    let detail = to_detail(&record);
     {
         let mut st = store().lock().unwrap();
-        st.records.insert(id.clone(), record);
+        st.records.insert(id.clone(), record.clone());
         save(&st);
     }
 
     tokio::spawn(run_pipeline(id));
-    Response::json(202, detail)
+    Ok(record)
+}
+
+/// Wait for a sandbox to leave `creating`/`starting`/`cloning`.
+///
+/// Returns the settled record, or `None` on deadline. The caller decides what
+/// a timeout means — the host MCP tool reports it with the id attached, so an
+/// agent can still list or destroy a sandbox that booted slowly.
+pub async fn wait_until_settled(id: &str, timeout: Duration) -> Option<Record> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let record = get_record(id)?;
+        match record.state.as_str() {
+            "ready" | "error" | "stopped" => return Some(record),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(BOOT_POLL).await;
+    }
+}
+
+/// One tracked record, unreconciled — the cheap lookup the host MCP tools use
+/// before dialling a sandbox.
+pub fn record_of(id: &str) -> Option<Record> {
+    get_record(id)
+}
+
+/// Stop and delete a sandbox. Returns the volume projections the REST route
+/// also reports (named volumes persist; host binds were never ours).
+pub async fn destroy(id: &str) -> Result<Vec<Value>, String> {
+    let record = get_record(id).ok_or_else(|| format!("No such sandbox: {id}"))?;
+    match handle_delete(id).await {
+        res if res.status == 200 => Ok(record
+            .volumes
+            .iter()
+            .map(to_volume_after_delete)
+            .collect()),
+        res => {
+            let body: Value = serde_json::from_slice(&res.body).unwrap_or(Value::Null);
+            Err(body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("delete failed")
+                .to_string())
+        }
+    }
+}
+
+/// Every tracked record, reconciled — the host MCP `sandbox_list` view.
+pub async fn list_records() -> Vec<Record> {
+    reconcile_all().await
+}
+
+/// The public projection of a record (same shape the REST detail returns).
+pub fn detail_of(record: &Record) -> Value {
+    to_detail(record)
+}
+
+pub fn list_item_of(record: &Record) -> Value {
+    to_list_item(record)
+}
+
+async fn handle_create(req: &Request) -> Response {
+    let body: Value = if req.body.is_empty() {
+        json!({}) // empty body = defaults
+    } else {
+        match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(_) => return fail(400, "invalid_json", "Request body must be valid JSON"),
+        }
+    };
+    if !body.is_object() {
+        return fail(400, "invalid_body", "Request body must be a JSON object");
+    }
+    let input = match validate_create(&body) {
+        Ok(v) => v,
+        Err(e) => return fail_with(400, e.code, &e.message, e.details),
+    };
+
+    match start_create(input) {
+        Ok(record) => Response::json(202, to_detail(&record)),
+        Err(e) => fail(500, "internal_error", &e),
+    }
 }
 
 async fn handle_list() -> Response {
@@ -807,6 +932,7 @@ async fn handle_delete(id: &str) -> Response {
         st.records.remove(id);
         st.known_good.remove(id);
         st.aborted.remove(id);
+        clear_active_if(&mut st, id);
         save(&st);
     }
     containers::forget_readiness(id);

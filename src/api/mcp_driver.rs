@@ -679,6 +679,59 @@ async fn gate(id: &str, is_exec: bool) -> Result<Record, Response> {
     }
 }
 
+/// Call one spacesd (GUI) tool in a sandbox and return its MCP result verbatim.
+pub async fn call_gui_tool(record: &Record, name: &str, arguments: Value) -> Result<Value, String> {
+    let reply = run_operation(
+        record,
+        "tools/call",
+        json!({ "name": name, "arguments": arguments }),
+        Surface::Gui,
+    )
+    .await
+    .map_err(|e| match e {
+        UpstreamError::Timeout(m) => m,
+        UpstreamError::Error(m) => m,
+    })?;
+    let message = reply.message.unwrap_or(Value::Null);
+    if let Some(err) = non_null(message.get("error")) {
+        return Err(format!(
+            "spacesd rejected {name}: {}",
+            err.get("message").and_then(Value::as_str).unwrap_or("unknown")
+        ));
+    }
+    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Call one execd tool in a sandbox and return its MCP result verbatim.
+///
+/// The host MCP server's `read`/`write`/`bash` are this function: the names
+/// and argument shapes are execd's own, so the tool an agent calls on the host
+/// is the tool that runs in the guest, with no translation layer to drift.
+pub async fn call_exec_tool(record: &Record, name: &str, arguments: Value) -> Result<Value, String> {
+    let reply = run_operation(
+        record,
+        "tools/call",
+        json!({ "name": name, "arguments": arguments }),
+        Surface::Exec,
+    )
+    .await
+    .map_err(|e| match e {
+        UpstreamError::Timeout(m) => {
+            format!("{m} (the tool may still have executed; outcome unknown)")
+        }
+        UpstreamError::Error(m) => m,
+    })?;
+
+    let message = reply.message.unwrap_or(Value::Null);
+    if let Some(err) = non_null(message.get("error")) {
+        return Err(format!(
+            "execd rejected {name}: {}",
+            err.get("message").and_then(Value::as_str).unwrap_or("unknown")
+        ));
+    }
+    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+}
+
 // ── validation (polite: every problem reported in one response) ─────────────
 
 fn parse_body(req: &Request) -> Result<Value, Response> {

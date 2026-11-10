@@ -7,6 +7,7 @@
 
 mod api;
 mod config;
+mod lan_token;
 mod http;
 mod util;
 
@@ -26,7 +27,13 @@ async fn main() {
         Ok(rt) => format!("{} ({:?})", rt.bin, rt.kind),
         Err(e) => format!("none — {e}"),
     };
-    println!("sbox-b  image={}  runtime={runtime}", api::containers::sandbox_image());
+    println!(
+        "sbox-b  images=[{}]  runtime={runtime}",
+        api::images::all_images().join(", ")
+    );
+    // Touch the token once at boot so a fresh install prints it here rather
+    // than on whichever request happens to be first.
+    let _ = lan_token::token();
 
     // Dispatch is in registration order, so the two orchestration entries must
     // precede the `/api/` catch-all — the catch-all would otherwise 404 them.
@@ -46,6 +53,22 @@ async fn main() {
         })
         .route("/api/orchestration", |req: Request| async move {
             api::orchestration::handle(req).await
+        })
+        // The host-level MCP tool server (SBOX_PLAN1 §3.1). Bearer-token
+        // authenticated on every call, including loopback — this is the plane
+        // that creates containers with host mounts and runs shell in them.
+        .route("/mcp", |req: Request| async move { api::mcp_server::handle(req).await })
+        // The tool-call journal the wall tails: ?after=<seq> for the tail.
+        .route("/api/journal", |req: Request| async move {
+            let after = req
+                .query
+                .get("after")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            Response::ok(serde_json::json!({
+                "entries": api::journal::since(after, 500),
+                "head": api::journal::head(),
+            }))
         })
         .route("/api/", |req: Request| async move { api::handlers::handle(req).await });
 

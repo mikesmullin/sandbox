@@ -69,6 +69,10 @@ pub struct Record {
     pub kind: Kind,
     pub cpus: u64,
     pub memory: String,
+    /// Container network connectivity. Defaults true so records written before
+    /// the flag existed keep the behaviour they were created with.
+    #[serde(default = "default_true")]
+    pub network: bool,
     #[serde(default)]
     pub transitions: Vec<Transition>,
     #[serde(rename = "updatedAt")]
@@ -84,6 +88,10 @@ pub struct Record {
     /// as meaningful state across a restart.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub aborted: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The caller-owned backref for a persisted sandbox id, or `None` when the

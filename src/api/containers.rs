@@ -359,3 +359,36 @@ pub async fn mint_viewer_url(id: &str) -> Result<String, String> {
     let ticket = spacesd::mint_viewer_ticket(port, &container_token(id), None).await?;
     Ok(format!("http://127.0.0.1:{port}{}", ticket.viewer_path))
 }
+
+/// Capture the sandbox desktop as a base64 PNG.
+///
+/// Goes through spacesd rather than shelling into the guest: spacesd already
+/// owns the X display and returns an encoded frame, so there is no ImageMagick
+/// dependency and no binary riding back through a CLI pipe.
+///
+/// The tool is `get_desktop_state` — spacesd exposes no tool called
+/// "screenshot". It is the capture primitive agents are meant to use ("Capture
+/// the full display in the desktop action coordinate frame … use the returned
+/// PNG directly as the coordinate source for actions"), so the frame it
+/// returns is the one a click would be aimed against.
+pub async fn capture_screen(record: &crate::api::orchestration_store::Record) -> Result<String, String> {
+    let reply = super::mcp_driver::call_gui_tool(
+        record,
+        "get_desktop_state",
+        serde_json::json!({ "max_image_dimension": 1600 }),
+    )
+    .await?;
+    // The tool answers an MCP image content block; pull the base64 payload out.
+    let blocks = reply
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "spacesd screenshot returned no content".to_string())?;
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("image") {
+            if let Some(data) = block.get("data").and_then(Value::as_str) {
+                return Ok(data.to_string());
+            }
+        }
+    }
+    Err("spacesd screenshot returned no image block".into())
+}
