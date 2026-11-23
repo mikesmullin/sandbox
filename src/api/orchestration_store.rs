@@ -73,6 +73,11 @@ pub struct Record {
     /// the flag existed keep the behaviour they were created with.
     #[serde(default = "default_true")]
     pub network: bool,
+    /// Per-sandbox GPU device passthrough (PLAN55 D8/D12): podman `--device`
+    /// specs echoed to the container. Absent on records written before this
+    /// field; `default` keeps older state files deserializing cleanly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
     #[serde(default)]
     pub transitions: Vec<Transition>,
     #[serde(rename = "updatedAt")]

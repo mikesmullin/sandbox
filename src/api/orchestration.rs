@@ -26,7 +26,6 @@ use serde_json::{json, Map, Value};
 
 use super::container_cli as cli;
 use super::containers::{self, container_token, GUEST_EXEC_PORT, GUEST_MCP_PORT, GUEST_QUIC_PORT};
-use super::images::Kind;
 use super::orchestration_store::{state_file, Record, Transition};
 use super::orchestration_validate::{validate_create, CreateInput};
 use super::orchestration_volumes::{
@@ -247,6 +246,10 @@ fn to_list_item(record: &Record) -> Value {
         // pre-execd records have no exec surface
         "execPort": if record.exec_port == 0 { Value::Null } else { json!(record.exec_port) },
         "execUrl": port_url(record.exec_port),
+        // image is the actual reference (a matrix row for built boxes, or a
+        // free admin reference such as sbox-video:latest). Chat's sandboxes
+        // menu (PLAN55 D6) groups live sandboxes by it.
+        "image": record.image.clone(),
         "repos": repos,
         // Volumes ride list items too (RCA-1): bind entries must be visible
         // without a detail round-trip — additive, contract §15.
@@ -397,9 +400,12 @@ struct PipelineError {
     message: String,
 }
 
+/// The identity is the container's, full stop (PLAN55 D3/D10): a bare
+/// 12-hex id shaped like a container short-hash — no service prefix, no
+/// friendly name. The id doubles as the container's `--name`.
 fn fresh_id() -> String {
     loop {
-        let id = format!("sandbox2-{}", util::random_hex(4));
+        let id = util::random_hex(6);
         let taken = {
             let mut st = store().lock().unwrap();
             ensure_loaded(&mut st);
@@ -657,6 +663,13 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
     // Named volumes → `-v name:mount:mode`; host binds → `--mount
     // type=bind,…`. All of it rides BEFORE the image — OPTIONS-BEFORE-TARGET.
     argv.extend(volume_create_args(&record.volumes));
+    // GPU passthrough (PLAN55 D8/D12): each stored device spec becomes a
+    // `--device` flag, still before the image. `nvidia.com/gpu` asks the
+    // nvidia-driver to grant the whole device; a specific `/dev/nvidia*` is
+    // passed through to the runtime, which maps it into the guest.
+    for dev in &record.devices {
+        argv.extend(["--device".into(), dev.clone()]);
+    }
     argv.extend([
         "-c".into(),
         record.cpus.to_string(),
@@ -758,13 +771,14 @@ pub fn start_create(input: CreateInput) -> Result<Record, String> {
     let now = util::now_iso();
     let record = Record {
         id: id.clone(),
-        image: input.kind.image(),
+        image: input.image,
         kind: input.kind,
         cpus: input.cpus.unwrap_or(4),
         memory: input.memory.unwrap_or_else(|| "2048M".into()),
         volumes: input.volumes,
         repos: input.repos,
         backref: input.backref,
+        devices: input.devices,
         network: input.network,
         mcp_port,
         quic_port,
@@ -917,8 +931,11 @@ async fn handle_delete(id: &str) -> Response {
         Ok(out) => out,
         Err(e) => return fail(502, "upstream_error", &util::first_line(&e)),
     };
-    // "not found" = already gone (deleted via CLI / legacy route) — success.
-    if removed.failed() && !removed.stderr.to_lowercase().contains("not found") {
+    let removed_stderr = removed.stderr.to_lowercase();
+    // "not found" / "no such container" = already gone (deleted via CLI / a
+    // legacy route, or the container never came up, e.g. a boot failure) —
+    // treat as a clean delete rather than surfacing an upstream error.
+    if removed.failed() && !removed_stderr.contains("not found") && !removed_stderr.contains("no such container") {
         let msg = if removed.stderr.is_empty() {
             "container rm failed".to_string()
         } else {

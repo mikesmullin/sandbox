@@ -19,9 +19,16 @@ pub const MAX_VOLUMES: usize = 16;
 const BACKREF_URL_MAX: usize = 2048;
 
 /// What a create payload becomes once accepted.
+///
+/// `image` and `devices` (PLAN55): a kind name resolves to a matrix row and its
+/// built reference; a free admin reference is used verbatim. `devices` is a
+/// list of podman `--device` specs for GPU passthrough.
 pub struct CreateInput {
-    /// Which row of the image matrix to build from (SBOX_PLAN1 §3.2).
+    /// Which row of the image matrix a kind-named payload selects, or the kind
+    /// (always `Headless` for a free admin reference) the record will classify.
     pub kind: Kind,
+    /// The actual image reference used to `container create`.
+    pub image: String,
     pub repos: Vec<RepoEntry>,
     pub volumes: Vec<VolumeEntry>,
     pub cpus: Option<u64>,
@@ -29,6 +36,9 @@ pub struct CreateInput {
     /// Container network connectivity (SBOX_PLAN1 §3.1). Default on; `false`
     /// creates the sandbox with no network at all.
     pub network: bool,
+    /// Per-sandbox GPU device passthrough: podman `--device` specs
+    /// (e.g. `nvidia.com/gpu`). Empty = no device.
+    pub devices: Vec<String>,
     pub backref: Option<Map<String, Value>>,
 }
 
@@ -444,7 +454,7 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
         Some(o) => o.clone(),
         None => Map::new(),
     };
-    let allowed = ["image", "repos", "volumes", "resources", "backref", "network"];
+    let allowed = ["image", "repos", "volumes", "resources", "backref", "network", "devices"];
     let unknown = unknown_fields(&obj, &allowed);
     if !unknown.is_empty() {
         return Err(ValidationError {
@@ -455,23 +465,22 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
     }
 
     let mut problems: Vec<String> = Vec::new();
-    // `image` names a KIND, not an image reference: letting a caller name an
-    // arbitrary image would be a much larger trust decision than picking a
-    // row of a matrix the host built itself.
-    let kind = match obj.get("image") {
-        None | Some(Value::Null) => Kind::default(),
-        Some(Value::String(s)) => match Kind::parse(s) {
-            Some(k) => k,
-            None => {
-                problems.push(format!(
-                    "image must be 'headed' or 'headless' (got {s:?})"
-                ));
-                Kind::default()
+    // `image` names the sandbox's image. A kind name (headed|headless) still
+    // selects a row of the host-built matrix; any other well-formed local
+    // reference (sbox-video:latest) is an admin-built image chat names, and
+    // is used verbatim (it classifies headless — see images::Kind::parse_ref).
+    let (kind, image_ref) = match obj.get("image") {
+        None | Some(Value::Null) => (Kind::default(), Kind::default().image()),
+        Some(Value::String(s)) => match Kind::parse_ref(s) {
+            Ok(pr) => pr,
+            Err(e) => {
+                problems.push(e);
+                (Kind::default(), Kind::default().image())
             }
         },
         Some(_) => {
-            problems.push("image must be 'headed' or 'headless'".into());
-            Kind::default()
+            problems.push("image must be a string".into());
+            (Kind::default(), Kind::default().image())
         }
     };
     let repos = match obj.get("repos") {
@@ -512,6 +521,32 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
             true
         }
     };
+    // PLAN55 D8/D12: optional `devices` array of podman `--device` specs for
+    // GPU passthrough (e.g. `nvidia.com/gpu`). Each entry must be a non-empty
+    // string without whitespace or commas (the CLI separates args on whitespace
+    // and commas break the `--mount`-style field).
+    let devices = match obj.get("devices") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) if let Some(arr) = v.as_array() => arr
+            .iter()
+            .filter_map(|d|
+                d.as_str()
+                    .and_then(|s| {
+                        let t = s.trim();
+                        if t.is_empty()
+                            || t.contains([' ', '\t', '\n', ',', ':'])
+                        {
+                            return None;
+                        }
+                        Some(t.to_string())
+                    })
+            )
+            .collect(),
+        Some(_) => {
+            problems.push("devices must be an array of strings".into());
+            Vec::new()
+        }
+    };
     let backref = match obj.get("backref") {
         None | Some(Value::Null) => None,
         Some(v) => check_backref(v, &mut problems),
@@ -526,11 +561,13 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
     }
     Ok(CreateInput {
         kind,
+        image: image_ref,
         repos,
         volumes,
         cpus,
         memory,
         network,
+        devices,
         backref,
     })
 }
