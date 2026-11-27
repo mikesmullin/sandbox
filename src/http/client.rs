@@ -1,13 +1,3 @@
-//! A minimal HTTP/1.1 client for the loopback services this backend calls:
-//! spacesd's gRPC-Web endpoint, its `/health`, its `/mcp`, and execd's `/mcp`.
-//!
-//! All of those are `http://127.0.0.1:<port>`, so there is no TLS, no redirect
-//! following and no connection pooling here — one connection per call, closed
-//! after the response. What it does need, and does handle, is **chunked**
-//! responses (spacesd answers `/mcp` with `transfer-encoding: chunked`, often
-//! as `text/event-stream`), which is the one place a naive client would read a
-//! truncated body and report a parse error instead of the real answer.
-
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -37,10 +27,6 @@ impl ClientResponse {
     }
 }
 
-/// One request/response against `host:port`.
-///
-/// `path` is sent verbatim — callers that interpolate an id into it are
-/// responsible for encoding it.
 pub async fn request(
     host: &str,
     port: u16,
@@ -147,7 +133,6 @@ async fn read_response(reader: &mut BufReader<TcpStream>) -> std::io::Result<Cli
         reader.read_exact(&mut buf).await?;
         buf
     } else {
-        // No framing at all: `connection: close` means read to EOF.
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await?;
         buf
@@ -160,8 +145,6 @@ async fn read_response(reader: &mut BufReader<TcpStream>) -> std::io::Result<Cli
     })
 }
 
-/// RFC 7230 chunked decoding: `<hex-size>[;ext]CRLF <data> CRLF`, ending at a
-/// zero-size chunk. Trailers after it are read and dropped.
 async fn read_chunked(reader: &mut BufReader<TcpStream>) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -174,7 +157,6 @@ async fn read_chunked(reader: &mut BufReader<TcpStream>) -> std::io::Result<Vec<
             )
         })?;
         if size == 0 {
-            // Consume trailers up to the terminating blank line.
             loop {
                 let t = read_line(reader).await?;
                 if t.is_empty() {
@@ -216,7 +198,6 @@ async fn read_line(reader: &mut BufReader<TcpStream>) -> std::io::Result<String>
     Ok(String::from_utf8_lossy(&line).to_string())
 }
 
-/// Build `path?k=v&…` with values encoded. Used when forwarding a query.
 pub fn with_query(path: &str, query: &HashMap<String, String>) -> String {
     if query.is_empty() {
         return path.to_string();
@@ -228,7 +209,6 @@ pub fn with_query(path: &str, query: &HashMap<String, String>) -> String {
     format!("{path}?{}", pairs.join("&"))
 }
 
-/// Re-exported so callers that parse upstream URLs share one decoder.
 pub fn decode(s: &str) -> String {
     percent_decode(s)
 }

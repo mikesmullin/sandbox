@@ -1,28 +1,5 @@
 #!/usr/bin/env bun
-/**
- * execd live smoke — plain bun script (NEVER inside bun test: busy-wait open
- * issue in web/docs/mcp-driver-contract.md).
- *
- * Discovery mode (mcp-driver.test.mjs skip pattern): NO sandbox is created
- * here. The script lists existing sandboxes via the orchestration API and,
- * when a READY one with an exec surface is reachable, probes its guest execd
- * directly (published execPort when available, else in-guest loopback via
- * `container exec … curl` — same guest server either way):
- *
- *   initialize → notifications/initialized → tools/list (exactly [bash, read, write])
- *   bash probes (date/$DISPLAY/repos → git identity → truncation)
- *   read+write round: write a uniquely-named file → read back (full +
- *   offset/limit window) → bash cat cross-check → bash rm (own file only)
- *
- * The gated browser tool table is probed SELF-CONTAINED (no sandbox): a
- * stdio-mode child with CUA_BROWSER_TOOLS=1 answers tools/list with exactly
- * 18 tools (bash/read/write + the 15 browser tools) and a bogus browser_act is
- * rejected with -32602.
- *
- * When nothing is reachable: prints a skip line and exits 0. Teardown deletes
- * NOTHING (the sandbox is not ours; only the smoke's own probe file is
- * removed in-guest).
- */
+
 import { spawn } from 'node:child_process';
 
 const API = process.env.SMOKE_API || 'http://127.0.0.1:3000';
@@ -50,10 +27,10 @@ async function fetchJson(url, init = {}, timeoutMs = 30000) {
   return { status: res.status, body };
 }
 
-/** One JSON-RPC POST against the guest execd, via the best available route. */
+
 function makeGuestDriver(detail) {
   const token = detail.token;
-  const auth = `Bearer ${token}`; // fetch path: header VALUE only — the smoke's host-direct route sent the full 'Authorization: Bearer …' line as the value (wire header 'authorization: Authorization: …') → execd 401 'missing or invalid bearer token' → JSON.parse('missing…') died before any probe; live-fixed 2026-10-12 (the curl fallback's -H form was always correct)
+  const auth = `Bearer ${token}`;
   const authHeader = `Authorization: ${auth}`;
   if (detail.execPort) {
     const url = `http://127.0.0.1:${detail.execPort}/mcp`;
@@ -69,8 +46,6 @@ function makeGuestDriver(detail) {
       return { status: res.status, body: text ? JSON.parse(text) : null };
     };
   }
-  // Fallback: in-guest loopback (execd binds 0.0.0.0:3213 inside the guest).
-  // `container exec [<options>] <id> <args…>` — run from this worktree's CLI.
   const containerId = detail.id;
   console.log('  route: orchestration API does not publish execPort yet — in-guest loopback via container exec curl');
   return (message) => new Promise((resolve, reject) => {
@@ -88,7 +63,7 @@ function makeGuestDriver(detail) {
     proc.on('close', () => {
       clearTimeout(timer);
       const lines = out.split('\n');
-      const statusLine = lines.pop(); // -w appends the HTTP status as the last line
+      const statusLine = lines.pop();
       const payload = lines.join('\n');
       let body = null;
       try { body = payload ? JSON.parse(payload) : null; } catch { body = { _raw: payload.slice(0, 300) }; }
@@ -97,7 +72,7 @@ function makeGuestDriver(detail) {
   });
 }
 
-/** One stdio-line pump over `bun index.mjs --stdio` (no sandbox needed). */
+
 function spawnStdio() {
   const child = spawn(process.execPath, [INDEX_PATH, '--stdio'], {
     env: { ...process.env, CUA_BROWSER_TOOLS: '1' },
@@ -130,7 +105,7 @@ function spawnStdio() {
   return { child, nextLine, send };
 }
 
-/** The gated browser table: CUA_BROWSER_TOOLS=1 → 18 tools + -32602 validation. */
+
 async function gatedStdioProbe() {
   console.log('  gated probe: CUA_BROWSER_TOOLS=1 bun index.mjs --stdio');
   let id = 1;
@@ -158,14 +133,10 @@ async function gatedStdioProbe() {
 }
 
 async function main() {
-  // ── gated browser tool table (self-contained: no sandbox needed) ──────────
   await gatedStdioProbe();
 
-  // ── discovery: an existing ready sandbox with an exec surface ─────────────
   const list = await fetchJson(`${API}/api/orchestration/sandboxes`);
   const items = Array.isArray(list.body?.sandboxes) ? list.body.sandboxes : [];
-  // The token only rides DETAIL responses — fetch details for ready items in
-  // order until one has an exec surface + token.
   let detail = null;
   for (const item of items.filter((s) => s?.state === 'ready')) {
     const d = await fetchJson(`${API}/api/orchestration/sandboxes/${item.id}`);
@@ -178,7 +149,6 @@ async function main() {
   }
   console.log(`  probing existing sandbox ${detail.id} (state ${detail.state}, execPort ${detail.execPort ?? 'n/a'}) — NOT created or deleted here`);
 
-  // ── guest-facing probes ───────────────────────────────────────────────────
   const rpc = await makeGuestDriver(detail);
   let id = 1;
   const init = await rpc({ jsonrpc: '2.0', id: id++, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'execd-smoke' } } });
@@ -203,7 +173,6 @@ async function main() {
     jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name, arguments: args },
   });
 
-  // ── bash probes (unchanged surface) ───────────────────────────────────────
   const probe = await bashCall('date -u && echo $DISPLAY && ls /home/desktop/repos');
   const pRes = probe.body?.result;
   ok('bash date probe answers', probe.status === 200 && pRes && pRes.isError === false,
@@ -231,7 +200,6 @@ async function main() {
     && fileBytes === Buffer.byteLength(tRes.structuredContent.output, 'utf8'),
     `file ${fileBytes} vs output ${Buffer.byteLength(tRes.structuredContent.output, 'utf8')}`);
 
-  // ── read+write round (execd 0.2) ──────────────────────────────────────────
   const probeFile = `/home/desktop/execd-smoke-${Date.now().toString(36)}.txt`;
   const content = 'smoke-line-1\nsmoke-line-2\nsmoke-line-3\nsmoke-line-4';
   const wRes = (await callTool('write', { path: probeFile, content })).body?.result;

@@ -1,32 +1,3 @@
-//! The host-level MCP tool server — the forward-facing replacement for a
-//! remote shell (SBOX_PLAN1 §3.1).
-//!
-//! One Streamable-HTTP MCP endpoint at `POST /mcp`, exposing a pool of
-//! sandboxes and the three harness hands that act inside the active one:
-//!
-//! | tool | acts on |
-//! |---|---|
-//! | `sandbox_create` | the pool — builds and boots, blocks until ready |
-//! | `sandbox_list` | the pool |
-//! | `sandbox_use` | the pool — moves the active cursor |
-//! | `sandbox_destroy` | the pool |
-//! | `sandbox_screenshot` | a sandbox's desktop (headed only) |
-//! | `read` / `write` / `bash` | the ACTIVE sandbox, through execd |
-//!
-//! This is deliberately the opposite shape to a remote shell: the host never
-//! accepts a control channel and never echoes a shell. It serves an ordinary
-//! application protocol, and every side effect lands inside a container whose
-//! reachability into the host is a mount the operator declared at create.
-//!
-//! **Auth.** Every call requires `Authorization: Bearer <token>` against the
-//! LAN token, including on loopback. The control plane can create containers
-//! with host mounts and run shell commands in them; that is not something to
-//! leave open because the socket happens to be local today.
-//!
-//! Tool calls are journalled (see `journal`) so the web UI can show the
-//! operator exactly what each client did, which is the whole point of putting
-//! an agent's hands on your work laptop.
-
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -45,8 +16,6 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 const SERVER_NAME: &str = "sbox";
 const SERVER_VERSION: &str = "1.0.0";
 
-/// How long `sandbox_create` waits for a sandbox to settle before giving up.
-/// A headed box boots in ~20-30s; a headless one in about one.
 fn create_timeout() -> Duration {
     std::env::var("SBOX_CREATE_TIMEOUT_MS")
         .ok()
@@ -56,7 +25,6 @@ fn create_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(150))
 }
 
-// ── transport ───────────────────────────────────────────────────────────────
 
 pub async fn handle(req: Request) -> Response {
     if req.method != "POST" {
@@ -67,8 +35,6 @@ pub async fn handle(req: Request) -> Response {
         .with_header("allow", "POST");
     }
 
-    // Auth before parsing: an unauthenticated caller learns nothing about the
-    // protocol, not even whether its JSON was well-formed.
     if let Err(res) = authorize(&req) {
         return res;
     }
@@ -92,7 +58,6 @@ pub async fn handle(req: Request) -> Response {
                 "instructions": INSTRUCTIONS,
             }),
         ),
-        // Notifications carry no id and get an empty 202.
         m if m.starts_with("notifications/") => Response::bytes(202, "application/json", Vec::new()),
         "ping" => rpc_ok(id, json!({})),
         "tools/list" => rpc_ok(id, json!({ "tools": tool_schemas() })),
@@ -108,8 +73,6 @@ pub async fn handle(req: Request) -> Response {
             match outcome {
                 Ok(result) => rpc_ok(id, result),
                 Err(ToolError::Protocol { code, message }) => rpc_error(id, code, &message),
-                // A TOOL that failed is a successful CALL carrying isError —
-                // the model should see the error text, not a transport fault.
                 Err(ToolError::Tool(text)) => rpc_ok(
                     id,
                     json!({
@@ -161,12 +124,9 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Response {
     }))
 }
 
-// ── tool outcomes ───────────────────────────────────────────────────────────
 
 pub enum ToolError {
-    /// The request was malformed — a JSON-RPC error.
     Protocol { code: i64, message: String },
-    /// The tool ran and failed — `isError: true` with text for the model.
     Tool(String),
 }
 
@@ -179,8 +139,6 @@ fn invalid(message: impl Into<String>) -> ToolError {
 
 type ToolResult = Result<Value, ToolError>;
 
-/// `{ content: [{type:"text", text}], structuredContent }` — the shape every
-/// MCP client knows how to render, with the machine-readable copy beside it.
 fn ok_text(text: impl Into<String>, structured: Value) -> Value {
     json!({
         "content": [{ "type": "text", "text": text.into() }],
@@ -189,7 +147,6 @@ fn ok_text(text: impl Into<String>, structured: Value) -> Value {
     })
 }
 
-// ── schemas ─────────────────────────────────────────────────────────────────
 
 fn tool_schemas() -> Value {
     json!([
@@ -304,7 +261,6 @@ fn tool_schemas() -> Value {
     ])
 }
 
-// ── dispatch ────────────────────────────────────────────────────────────────
 
 async fn call_tool(name: &str, args: &Value) -> ToolResult {
     match name {
@@ -318,8 +274,6 @@ async fn call_tool(name: &str, args: &Value) -> ToolResult {
     }
 }
 
-/// Translate the MCP-facing create payload into the orchestration one and
-/// reuse its validator — one set of rules for both front doors.
 fn to_create_payload(args: &Value) -> Result<Value, ToolError> {
     let obj = args.as_object().cloned().unwrap_or_default();
     let mut payload = Map::new();
@@ -332,7 +286,6 @@ fn to_create_payload(args: &Value) -> Result<Value, ToolError> {
     if let Some(repos) = obj.get("repos") {
         payload.insert("repos".into(), repos.clone());
     }
-    // `mounts` is the ergonomic spelling of a host bind volume.
     if let Some(mounts) = obj.get("mounts") {
         let list = mounts
             .as_array()
@@ -360,7 +313,6 @@ fn to_create_payload(args: &Value) -> Result<Value, ToolError> {
 async fn sandbox_create(args: &Value) -> ToolResult {
     let payload = to_create_payload(args)?;
     let input = validate_create(&payload).map_err(|e| {
-        // Report every problem at once — the agent fixes its call in one turn.
         let detail = e
             .details
             .get("errors")
@@ -381,7 +333,6 @@ async fn sandbox_create(args: &Value) -> ToolResult {
 
     match orchestration::wait_until_settled(&id, create_timeout()).await {
         Some(settled) if settled.state == "ready" => {
-            // Creating a sandbox is how you start working in one.
             let _ = orchestration::set_active(&id);
             Ok(ok_text(
                 format!(
@@ -480,7 +431,6 @@ async fn sandbox_screenshot(args: &Value) -> ToolResult {
     let png = containers::capture_screen(&record)
         .await
         .map_err(ToolError::Tool)?;
-    // An image content block: the model sees the screen, not a file path.
     Ok(json!({
         "content": [{
             "type": "image",
@@ -491,9 +441,6 @@ async fn sandbox_screenshot(args: &Value) -> ToolResult {
     }))
 }
 
-/// `read` / `write` / `bash` — forwarded verbatim to execd in the active
-/// sandbox. The names and argument shapes are execd's own, so the tool an
-/// agent calls here is the tool that runs in there.
 async fn guest_tool(name: &str, args: &Value) -> ToolResult {
     let id = orchestration::active_id().ok_or_else(|| {
         ToolError::Tool(
@@ -513,8 +460,6 @@ async fn guest_tool(name: &str, args: &Value) -> ToolResult {
         .await
         .map_err(ToolError::Tool)?;
 
-    // execd already answers in MCP's content shape; pass it through so the
-    // model sees exactly what the guest produced, truncation markers and all.
     Ok(reply)
 }
 
@@ -535,7 +480,6 @@ fn require_record(id: &str) -> Result<Record, ToolError> {
         .ok_or_else(|| ToolError::Tool(format!("No such sandbox: {id}")))
 }
 
-/// Which `Kind` an image name maps to — re-exported for the journal's labels.
 pub fn kind_name(record: &Record) -> &'static str {
     Kind::as_str(record.kind)
 }

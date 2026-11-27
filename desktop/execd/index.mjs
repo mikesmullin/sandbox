@@ -1,38 +1,5 @@
 #!/usr/bin/env bun
-/**
- * execd — guest exec MCP server for sandbox2 (contract: web/docs/execd-contract.md).
- *
- * THREE tools — `bash`, `read`, `write` — with pi-harness semantics
- * (pi-coding-agent dist/core/tools/{bash,read,write}.js — semantics copied,
- * not code), plus — gated on CUA_BROWSER_TOOLS=1 — the 15 browser tools that
- * wrap spacesd's raw GUI tools (see the browser section below). TWO transports,
- * one dispatch (contract: web/docs/execd-contract.md):
- *
- * Streamable-HTTP (default): JSON-RPC at POST /mcp, plain-JSON responses,
- * stateless (no session ids):
- *
- *   initialize                   → protocolVersion 2025-03-26, serverInfo execd 0.2.0
- *   notifications/initialized    → 202, empty
- *   tools/list                   → [bash, read, write] (+ the 15 browser tools when gated on)
- *   tools/call                   → tool result (or JSON-RPC error, see below)
- *   GET /healthz                 → 200 {ok:true,service:'execd'}
- *
- * stdio (0.2 — `--stdio` flag or EXECD_TRANSPORT=stdio): the SAME dispatch
- * over newline-delimited JSON-RPC on stdin/stdout (one COMPLETE line in, one
- * JSON.stringify(body)+'\n' line out, notifications silent, ≤8 in flight with
- * a FIFO queue, no auth — the pipe is the trust boundary, EOF → stop → exit 0,
- * logs on stderr only). Lets the HOST spawn execd as its own child for HOST
- * agent stages — no ports, no token, no daemon lifecycle.
- *
- * Auth: Authorization: Bearer <CUA_ENV_TOKEN> — 401 "missing or invalid bearer
- * token" otherwise (fail-closed: no token configured → every /mcp request
- * 401s). JSON-RPC level: unknown tool → -32601, missing/malformed params →
- * -32602, everything else answers as a result — every request answers, never
- * hangs. Transport-level: GET /mcp → 405 (POST-only), unknown path → 404.
- *
- * Bound 0.0.0.0:3213 in-guest (PORT env override for tests). Started by
- * desktop/entrypoint.sh as the `desktop` user with the session env.
- */
+
 import { constants } from 'node:fs';
 import { createWriteStream } from 'node:fs';
 import { access, mkdir, open as fsOpen, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
@@ -47,17 +14,13 @@ const SERVER_INFO = { name: 'execd', version: '0.2.0' };
 const DEFAULT_GUEST_PORT = 3213;
 const DEFAULT_CWD = '/home/desktop';
 
-// pi bash parity: MAX_TIMEOUT_MS = 2^31-1 (setTimeout ceiling).
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000; // 2147483.647
 
-// pi truncate.js defaults: whichever limit is hit first wins.
 const MAX_LINES = 2000;
-const MAX_BYTES = 50 * 1024; // 50KB
-// structuredContent.output budget for programmatic callers (pi STRUCTURED_OUTPUT_MAX_BYTES).
+const MAX_BYTES = 50 * 1024;
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 
-// JSON-RPC 2.0 error codes.
 const PARSE_ERROR = -32700;
 const INVALID_REQUEST = -32600;
 const METHOD_NOT_FOUND = -32601;
@@ -66,7 +29,6 @@ const INTERNAL_ERROR = -32603;
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
-// ── Small JSON helpers ───────────────────────────────────────────────────────
 
 function byteLength(text) {
   return Buffer.byteLength(text, 'utf8');
@@ -87,9 +49,8 @@ function rpcError(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
-// ── pi truncate.js semantics (ported: behavior, not code) ────────────────────
 
-/** pi splitLinesForCounting: a trailing newline does not start a new line. */
+
 function splitLinesForCounting(content) {
   if (content.length === 0) return [];
   const lines = content.split('\n');
@@ -97,19 +58,14 @@ function splitLinesForCounting(content) {
   return lines;
 }
 
-/** pi truncate.js formatSize: bytes → "N B"/"N.NKB"/"N.NMB". */
+
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-/**
- * pi truncateHead: keep the FIRST N lines/bytes (file reads — you want the
- * beginning). Never returns partial lines; if the first line alone exceeds the
- * byte limit, returns empty content with firstLineExceedsLimit=true (the read
- * tool points the model at a bash fallback instead).
- */
+
 function truncateHead(content, { maxLines = MAX_LINES, maxBytes = MAX_BYTES } = {}) {
   const totalBytes = Buffer.byteLength(content, 'utf-8');
   const lines = splitLinesForCounting(content);
@@ -132,7 +88,7 @@ function truncateHead(content, { maxLines = MAX_LINES, maxBytes = MAX_BYTES } = 
   let truncatedBy = 'lines';
   for (let i = 0; i < lines.length && i < maxLines; i++) {
     const line = lines[i];
-    const lineBytes = Buffer.byteLength(line, 'utf-8') + (i > 0 ? 1 : 0); // +1 for newline
+    const lineBytes = Buffer.byteLength(line, 'utf-8') + (i > 0 ? 1 : 0);
     if (outputBytesCount + lineBytes > maxBytes) {
       truncatedBy = 'bytes';
       break;
@@ -140,7 +96,6 @@ function truncateHead(content, { maxLines = MAX_LINES, maxBytes = MAX_BYTES } = 
     outputLinesArr.push(line);
     outputBytesCount += lineBytes;
   }
-  // If we exited due to line limit
   if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) truncatedBy = 'lines';
   const outputContent = outputLinesArr.join('\n');
   return {
@@ -150,18 +105,11 @@ function truncateHead(content, { maxLines = MAX_LINES, maxBytes = MAX_BYTES } = 
   };
 }
 
-// ── pi path-utils.js semantics (ported: behavior, not code) ─────────────────
 
-// pi paths.js UNICODE_SPACES: non-breaking + typographic spaces normalize to a plain space.
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const NARROW_NO_BREAK_SPACE = '\u202F';
 
-/**
- * pi resolveToCwd: unicode-space normalize, @-prefix strip, ~ / ~/… expansion
- * (the execd process's homedir — the desktop user in-guest), file:// URL
- * conversion, then resolve against the base dir. NO realpath (resolved ≠
- * physical). Windows drive-path rewriting is n/a (guest is linux).
- */
+
 function resolveToCwd(filePath, cwd) {
   let normalized = filePath.replace(UNICODE_SPACES, ' ');
   if (normalized.startsWith('@')) normalized = normalized.slice(1);
@@ -181,7 +129,6 @@ async function pathExists(filePath) {
   }
 }
 
-// macOS read-variant fallbacks (pi path-utils.js, in pi's order).
 function tryMacOSScreenshotPath(filePath) {
   return filePath.replace(/ (AM|PM)\./gi, `${NARROW_NO_BREAK_SPACE}$1.`);
 }
@@ -192,11 +139,7 @@ function tryCurlyQuoteVariant(filePath) {
   return filePath.replace(/'/g, '\u2019');
 }
 
-/**
- * pi resolveReadPathAsync: resolved path first; when missing, the macOS
- * variants in pi's order (AM/PM narrow-no-break-space, NFD, curly quote,
- * NFD+curly); else the resolved path (the eventual error names it).
- */
+
 async function resolveReadPath(filePath, cwd) {
   const resolved = resolveToCwd(filePath, cwd);
   if (await pathExists(resolved)) return resolved;
@@ -211,13 +154,8 @@ async function resolveReadPath(filePath, cwd) {
   return resolved;
 }
 
-// ── Image magic detection (v0: pi mime.js signatures, magic bytes only) ─────
 
-/**
- * Magic-byte sniff of a buffer head. v0 skips pi's fuller validations (IHDR
- * chunk checks, BMP header fields, APNG acTL scan): a text file beginning
- * "BM" is misdetected as image/bmp — documented contract cost.
- */
+
 function detectImageMimeType(buffer) {
   if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
   if (buffer.length >= 4 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return 'image/png';
@@ -227,11 +165,7 @@ function detectImageMimeType(buffer) {
   return null;
 }
 
-/**
- * pi truncateMiddle: keep head+tail halves of `maxBytes` each around a
- * `…N chars truncated…` elision marker. Cuts only at UTF-8 character
- * boundaries. N counts characters (code units) of the elided middle.
- */
+
 function truncateMiddle(content, maxBytes) {
   const buf = Buffer.from(content, 'utf8');
   if (buf.length <= maxBytes) return { content, removedChars: 0 };
@@ -246,14 +180,8 @@ function truncateMiddle(content, maxBytes) {
   return { content: `${head}…${removedChars} chars truncated…${tail}`, removedChars };
 }
 
-// ── Output accumulator (pi output-accumulator.js semantics, bounded memory) ─
 
-/**
- * Tracks combined stdout+stderr in arrival order. Keeps a bounded decoded tail
- * window for the display view; the FULL raw byte stream spills to a temp file
- * as soon as any display limit is exceeded (pi parity), so nothing outlives
- * memory that the caller cannot recover from disk.
- */
+
 class OutputAccumulator {
   constructor({ tempFilePrefix, tempDir, maxLines = MAX_LINES, maxBytes = MAX_BYTES }) {
     this.maxLines = maxLines;
@@ -270,14 +198,14 @@ class OutputAccumulator {
     this.completedLines = 0;
     this.currentLineBytes = 0;
     this.hasOpenLine = false;
-    this.droppedHeadChars = 0; // chars lost off the front by rolling-window trims
+    this.droppedHeadChars = 0;
     this.finished = false;
     this.tempFilePath = null;
     this.tempFileStream = null;
   }
 
   append(data) {
-    if (this.finished) return; // defensive: late chunks after finalize are dropped
+    if (this.finished) return;
     this.totalRawBytes += data.length;
     this.appendDecoded(this.decoder.decode(data, { stream: true }));
     if (this.tempFileStream || this.shouldUseTempFile()) this.ensureTempFile();
@@ -288,7 +216,7 @@ class OutputAccumulator {
   finish() {
     if (this.finished) return;
     this.finished = true;
-    this.appendDecoded(this.decoder.decode()); // flush the streaming decoder
+    this.appendDecoded(this.decoder.decode());
     if (this.shouldUseTempFile()) this.ensureTempFile();
   }
 
@@ -315,7 +243,7 @@ class OutputAccumulator {
     }
   }
 
-  /** Drop the head of the tail window at a UTF-8 boundary, counting what went. */
+
   trimTail() {
     const buffer = Buffer.from(this.tailText, 'utf8');
     if (buffer.length <= this.maxRollingBytes) return;
@@ -331,14 +259,14 @@ class OutputAccumulator {
     return this.completedLines + (this.hasOpenLine ? 1 : 0);
   }
 
-  /** Tail window aligned to a line boundary (drop a torn first line). */
+
   snapshotText() {
     if (this.tailStartsAtLineBoundary) return this.tailText;
     const firstNewline = this.tailText.indexOf('\n');
     return firstNewline === -1 ? this.tailText : this.tailText.slice(firstNewline + 1);
   }
 
-  /** Display truncation = either pi limit hit (drives `truncated`/full_output_path). */
+
   truncated() {
     return this.totalLines > this.maxLines || this.totalDecodedBytes > this.maxBytes;
   }
@@ -352,7 +280,7 @@ class OutputAccumulator {
     if (this.tempFilePath) return;
     this.tempFilePath = `${this.tempDir}/${this.tempFilePrefix}-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}.txt`;
     this.tempFileStream = createWriteStream(this.tempFilePath, { flags: 'w' });
-    this.tempFileStream.on('error', () => {}); // best-effort: never crash the server on fs errors
+    this.tempFileStream.on('error', () => {});
     for (const chunk of this.rawChunks) this.tempFileStream.write(chunk);
     this.rawChunks = [];
   }
@@ -368,11 +296,7 @@ class OutputAccumulator {
     });
   }
 
-  /**
-   * Full output for programmatic callers (pi readFullOutput semantics): whole
-   * content up to `maxBytes`; beyond that head+tail halves around a
-   * `[... N bytes omitted ...]` marker.
-   */
+
   async readFullOutput(maxBytes) {
     if (!this.tempFilePath) {
       return { content: Buffer.concat(this.rawChunks).toString('utf8'), truncated: false };
@@ -426,17 +350,10 @@ function buildView(acc) {
   return { content: prefix + content, truncated: true };
 }
 
-// ── Child-process wait (pi waitForChildProcess semantics, adapted) ───────────
 
 const EXIT_STDIO_GRACE_MS = 100;
 
-/**
- * Wait for the child to terminate AND its pipes to fall idle, without hanging
- * on stdio handles inherited by detached descendants (pi #5303): after `exit`
- * the pipes are drained until they end or go quiet for the grace period; then
- * streams are destroyed. A spawn-level failure resolves (never rejects) so the
- * HTTP request always answers.
- */
+
 function waitForChild(child) {
   return new Promise((resolve) => {
     let settled = false;
@@ -471,7 +388,7 @@ function waitForChild(child) {
       postExitTimer = setTimeout(finalize, EXIT_STDIO_GRACE_MS);
     };
     const onData = () => {
-      if (exited && !settled) armIdleTimer(); // a descendant is still writing — keep draining
+      if (exited && !settled) armIdleTimer();
     };
     const onStdoutEnd = () => { stdoutEnded = true; maybeFinalizeAfterExit(); };
     const onStderrEnd = () => { stderrEnded = true; maybeFinalizeAfterExit(); };
@@ -493,7 +410,7 @@ function waitForChild(child) {
   });
 }
 
-/** SIGKILL the child's whole process group (pi killProcessTree, unix branch). */
+
 function killProcessGroup(pid) {
   try {
     process.kill(-pid, 'SIGKILL');
@@ -501,12 +418,10 @@ function killProcessGroup(pid) {
     try {
       process.kill(pid, 'SIGKILL');
     } catch {
-      // already dead
     }
   }
 }
 
-// ── The bash tool (pi parity) ───────────────────────────────────────────────
 
 const BASH_TOOL = {
   name: 'bash',
@@ -526,27 +441,17 @@ const BASH_TOOL = {
 };
 
 function toolResult(text, structured, isError, extraContent) {
-  // Content: extra blocks first (e.g. image payloads passed through verbatim),
-  // then the summary text block — matches the raw spacesd ordering.
   const result = { content: [...(extraContent ?? []), { type: 'text', text }], structuredContent: structured, isError };
   if (structured === null || structured === undefined) delete result.structuredContent;
   return result;
 }
 
-/**
- * Default cwd chain (0.2): args.cwd → EXECD_DEFAULT_CWD → os.homedir() →
- * /home/desktop. Host-honest: AJCS sets EXECD_DEFAULT_CWD; a bare
- * host-spawned stdio process falls back to the spawning user's home. In the
- * guest the homedir rung IS /home/desktop — guest behavior unchanged.
- */
+
 function resolveCwd(args) {
   return args.cwd ?? (process.env.EXECD_DEFAULT_CWD || homedir() || DEFAULT_CWD);
 }
 
-/**
- * Validate bash args (missing/malformed → -32602, pi's messages where they
- * overlap). Returns {args} or {code, message}.
- */
+
 function validateBashArgs(args) {
   if (typeof args.command !== 'string') {
     return { code: INVALID_PARAMS, message: 'Invalid params: "command" is required and must be a string' };
@@ -565,19 +470,14 @@ function validateBashArgs(args) {
   return { args: { command: args.command, timeout: args.timeout, cwd: args.cwd } };
 }
 
-/** Base tool registry: name → validator + runner. Browser tools (gated) are
- * merged in below. */
+
 const BASE_TOOL_REGISTRY = {
   bash: { validate: validateBashArgs, run: (args, trackChild) => runBash(args, trackChild) },
   read: { validate: validateReadArgs, run: (args) => runRead(args) },
   write: { validate: validateWriteArgs, run: (args) => runWrite(args) },
 };
 
-/**
- * Validate tools/call params (missing/malformed → -32602, unknown tool →
- * -32601 via {unknownTool}). Returns {name, args} or {code, message} or
- * {unknownTool}.
- */
+
 function validateToolCallParams(params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) {
     return { code: INVALID_PARAMS, message: 'Invalid params: params must be an object' };
@@ -597,11 +497,7 @@ function validateToolCallParams(params) {
   return { name, args: checked.args };
 }
 
-/**
- * Execute one bash command with pi semantics: one-shot spawn, detached group
- * leader, optional per-call timeout (group SIGKILL on expiry), interleaved
- * output, bounded view + full temp file, verbatim exit codes (128+sig).
- */
+
 async function runBash(args, trackChild) {
   const cwd = resolveCwd(args);
   try {
@@ -616,7 +512,7 @@ async function runBash(args, trackChild) {
   let timeoutHandle;
   const child = spawn('bash', ['-c', args.command], {
     cwd,
-    detached: true, // child leads its own process group — the whole group is killable
+    detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (child.pid) trackChild(child.pid);
@@ -647,7 +543,6 @@ async function runBash(args, trackChild) {
   }
 
   await acc.closeTempFile();
-  // Killed by a signal (timeout SIGKILL or self-kill): shell convention 128+signal.
   const exitCode = exit.code ?? (exit.signal ? 128 + (osConstants.signals[exit.signal] ?? 0) : 1);
 
   const view = buildView(acc);
@@ -667,7 +562,6 @@ async function runBash(args, trackChild) {
   return { isError: timedOut || exitCode !== 0, text, structured };
 }
 
-// ── The read tool (pi parity) ────────────────────────────────────────────━
 
 const READ_TOOL = {
   name: 'read',
@@ -685,9 +579,9 @@ const READ_TOOL = {
   },
 };
 
-/** pi read.js text path: offset/limit window → truncateHead → continuation notices. */
+
 async function runRead(args) {
-  const cwd = resolveCwd({}); // read/write have no cwd arg — the bash default-cwd rule applies
+  const cwd = resolveCwd({});
   const absolutePath = await resolveReadPath(args.path, cwd);
   try {
     await access(absolutePath, constants.R_OK);
@@ -695,7 +589,6 @@ async function runRead(args) {
     const size = buffer.length;
     const mimeType = detectImageMimeType(buffer);
     if (mimeType) {
-      // v0: NO image processing (no photon in execd) — text note only.
       return {
         isError: false,
         text: `Read image file [${mimeType}] — binary image preview not supported by execd read v0 `
@@ -704,7 +597,7 @@ async function runRead(args) {
       };
     }
     const textContent = buffer.toString('utf-8');
-    const allLines = textContent.split('\n'); // pi arithmetic: a trailing newline adds a phantom last element
+    const allLines = textContent.split('\n');
     const totalFileLines = allLines.length;
     const startLine = args.offset ? Math.max(0, args.offset - 1) : 0;
     const startLineDisplay = startLine + 1;
@@ -713,7 +606,6 @@ async function runRead(args) {
     }
     let selectedContent;
     let userLimitedLines;
-    // User limit is honored first; otherwise truncateHead decides.
     if (args.limit !== undefined) {
       const endLine = Math.min(startLine + args.limit, allLines.length);
       selectedContent = allLines.slice(startLine, endLine).join('\n');
@@ -724,7 +616,6 @@ async function runRead(args) {
     const truncation = truncateHead(selectedContent);
     let outputText;
     if (truncation.firstLineExceedsLimit) {
-      // First line alone exceeds the byte limit — point the model at a bash fallback.
       const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], 'utf-8'));
       outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(MAX_BYTES)} limit. `
         + `Use bash: sed -n '${startLineDisplay}p' ${args.path} | head -c ${MAX_BYTES}]`;
@@ -740,7 +631,6 @@ async function runRead(args) {
           + `(${formatSize(MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
       }
     } else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
-      // User-specified limit stopped early, but the file still has more content.
       const remaining = allLines.length - (startLine + userLimitedLines);
       const nextOffset = startLine + userLimitedLines + 1;
       outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
@@ -753,12 +643,11 @@ async function runRead(args) {
       structured: { path: absolutePath, total_lines: totalFileLines, truncated: truncation.truncated, size_bytes: size },
     };
   } catch (err) {
-    // Contract: failures carry the RAW error message, no structuredContent.
     return { isError: true, text: String(err?.message ?? err) };
   }
 }
 
-/** Validate read args (missing/malformed → -32602). */
+
 function validateReadArgs(args) {
   if (typeof args.path !== 'string') {
     return { code: INVALID_PARAMS, message: 'Invalid params: "path" is required and must be a string' };
@@ -772,7 +661,6 @@ function validateReadArgs(args) {
   return { args: { path: args.path, offset: args.offset, limit: args.limit } };
 }
 
-// ── The write tool (pi parity) ───────────────────────────────────────────────
 
 const WRITE_TOOL = {
   name: 'write',
@@ -788,7 +676,6 @@ const WRITE_TOOL = {
   },
 };
 
-// ── Per-path mutation queue (pi file-mutation-queue.js semantics) ────────────
 
 const fileMutationQueues = new Map();
 let registrationQueue = Promise.resolve();
@@ -798,7 +685,7 @@ function isMissingPathError(error) {
     && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
 }
 
-/** Queue key: the physical path when it exists, else the resolved path. */
+
 async function getMutationQueueKey(filePath) {
   try {
     return await realpath(filePath);
@@ -808,11 +695,7 @@ async function getMutationQueueKey(filePath) {
   }
 }
 
-/**
- * Serialize file mutations targeting the same file; different files run in
- * parallel. Registrations themselves are serialized (global registration
- * queue) so queue chaining is race-free; a failing fn releases the queue.
- */
+
 async function withFileMutationQueue(filePath, fn) {
   const registration = registrationQueue.then(async () => {
     const key = await getMutationQueueKey(filePath);
@@ -834,20 +717,17 @@ async function withFileMutationQueue(filePath, fn) {
   }
 }
 
-/**
- * pi write.js semantics: resolveToCwd (NO read variants), mkdir -p parent,
- * overwrite always, same-path writes serialized by the mutation queue.
- */
+
 async function runWrite(args) {
-  const cwd = resolveCwd({}); // write has no cwd arg — the bash default-cwd rule applies
+  const cwd = resolveCwd({});
   const absolutePath = resolveToCwd(args.path, cwd);
   const dir = dirname(absolutePath);
   return withFileMutationQueue(absolutePath, async () => {
-    const createdDirs = await mkdir(dir, { recursive: true }); // first created path, or undefined if it existed
+    const createdDirs = await mkdir(dir, { recursive: true });
     await writeFile(absolutePath, args.content, 'utf-8');
     return {
       isError: false,
-      text: `Successfully wrote to ${args.path}`, // pi wording: the ORIGINAL path arg
+      text: `Successfully wrote to ${args.path}`,
       structured: {
         path: absolutePath,
         bytes_written: Buffer.byteLength(args.content, 'utf-8'),
@@ -857,7 +737,7 @@ async function runWrite(args) {
   }).catch((err) => ({ isError: true, text: String(err?.message ?? err) }));
 }
 
-/** Validate write args (missing/malformed → -32602). */
+
 function validateWriteArgs(args) {
   if (typeof args.path !== 'string') {
     return { code: INVALID_PARAMS, message: 'Invalid params: "path" is required and must be a string' };
@@ -868,20 +748,6 @@ function validateWriteArgs(args) {
   return { args: { path: args.path, content: args.content } };
 }
 
-// ── Gated browser tool table (CUA_BROWSER_TOOLS=1) ──────────────────────────
-// Wraps spacesd's raw GUI tools with t3code-shaped contract tools (15). The gate
-// is OFF by default → tools/list is byte-identical to the 3-tool surface;
-// tools/call only exposes the gated tools when enabled.
-//
-// One persistent spacesd session per execd process: initialize once, capture the
-// mcp-session-id response header, and send it on every later request (the
-// connections can drop/reconnect — the header is what matters). The named
-// lifecycle session 'agent' is created lazily on the first browser call and
-// passed as session:"agent" on every spacesd call that accepts a session param.
-// A tool call that answers a refusal with structuredContent.refusal.code
-// "session_ended" is retried ONCE after re-issuing start_session.
-// One promise-queue mutex serializes every browser tool call (the harness can
-// call tools in parallel; spacesd state is shared).
 
 const BROWSER_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.CUA_BROWSER_TOOLS ?? '').trim());
 const BROWSER_SESSION = 'agent';
@@ -889,11 +755,9 @@ const SPACESD_URL = process.env.CUA_SPACESD_URL || 'http://127.0.0.1:3211/mcp';
 const SPACESD_TOKEN = process.env.CUA_ENV_TOKEN ?? '';
 const BROWSER_REQUEST_TIMEOUT_MS = 180000;
 
-// Module browser state — set by browser_open/auto-bind, cleared by browser_close.
-// Also holds the recording bookkeeping (recordingPid/ffmpegPid/…).
 const browserState = {
   targetId: null, tabId: null, pid: null, windowId: null, url: null,
-  recording: null, // { id, outputDir, finalPath, tabId, url, createdAt, ffmpegPid, ffmpegChild }
+  recording: null,
 };
 
 async function ensureBrowserLease() {
@@ -915,22 +779,18 @@ async function ensureBrowserLease() {
   const sessionId = init.headers.get('mcp-session-id');
   if (!sessionId) throw new Error('spacesd did not issue an mcp-session-id — cannot keep a browser lease');
   browserLease = { sessionId };
-  // notifications/initialized — best-effort, never awaited for correctness.
   try {
     await fetch(SPACESD_URL, {
       method: 'POST', headers: { ...headers },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
       signal: AbortSignal.timeout(10000),
     });
-  } catch { /* connection may drop mid-flight — the header is what matters */ }
+  } catch { }
   return browserLease;
 }
 
-// One shared lease per execd process (created lazily on the first browser call).
 let browserLease = null;
-// Whether the named 'agent' session is alive on the lease (re-armed by the retry rule).
 let browserSessionActive = false;
-// ONE promise-queue mutex — all browser tool calls run through this.
 const browserQueue = { tail: Promise.resolve() };
 
 function enqueueBrowser(fn) {
@@ -950,8 +810,6 @@ function isSessionEndedRefusal(res) {
 }
 
 async function callSpacesdTool(toolName, args) {
-  // Args must be spacesd-style (snake_case). The session param is owned here —
-  // every spacesd call that accepts a session param gets session:'agent'.
   const lease = await ensureBrowserLease();
   const res = await fetch(SPACESD_URL, {
     method: 'POST',
@@ -968,7 +826,7 @@ async function callSpacesdTool(toolName, args) {
     signal: AbortSignal.timeout(BROWSER_REQUEST_TIMEOUT_MS),
   });
   let body = null;
-  try { body = await res.json(); } catch { /* not JSON */ }
+  try { body = await res.json(); } catch { }
   if (!res.ok) {
     return { isError: true, text: `spacesd answered HTTP ${res.status}`, structuredContent: null, content: [] };
   }
@@ -987,10 +845,7 @@ async function callSpacesdTool(toolName, args) {
   };
 }
 
-/**
- * Lazily ensure the named session is alive, call the tool, and honor the
- * single-retry-on-session_ended rule (re-issue start_session, retry ONCE).
- */
+
 async function withNamedSession(toolName, args, { retryOnce = true } = {}) {
   if (!browserSessionActive) {
     const started = await callSpacesdTool('start_session', {});
@@ -1019,7 +874,7 @@ function browserError(text) {
   return { text, structured: null, isError: true };
 }
 
-/** Default-cwd-ish scratch for guest bash commands (execd's resolution chain). */
+
 function shQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
@@ -1039,12 +894,7 @@ function sideNote(result) {
   return result.text || JSON.stringify(result.structuredContent ?? {}) || 'unknown error';
 }
 
-/**
- * Auto-bind: the module browser state (pid/windowId) when it is in a live
- * browser (checked against the process), otherwise the running Chromium window
- * (steps 2-4 of browser_open). Returns {pid, windowId, targetId, tabId, url,
- * tabs} or {error}.
- */
+
 async function requireBoundBrowser() {
   try {
     if (browserState.pid !== null && !isProcessAlive(browserState.pid)) {
@@ -1124,7 +974,6 @@ async function runBrowserStatus(_args, _trackChild) {
 
 async function runBrowserOpen(args, _trackChild) {
   try {
-    // (1) launch a driver-owned isolated Chromium (allow_launch)
     const launched = await withNamedSession('browser_prepare', {
       allow_launch: true,
       profile: { mode: 'isolated_new' },
@@ -1133,7 +982,6 @@ async function runBrowserOpen(args, _trackChild) {
     const preparedPid = launched.structuredContent?.prepared_pid ?? null;
     if (preparedPid === null) return browserError('could not launch a browser: spacesd did not report prepared_pid');
     browserState.pid = preparedPid;
-    // (2) poll list_windows (~250ms, ≤15s) for a Chromium window
     const deadline = Date.now() + 15000;
     let chromium = null;
     while (Date.now() < deadline) {
@@ -1149,12 +997,10 @@ async function runBrowserOpen(args, _trackChild) {
     const windowId = chromium.window_id;
     browserState.windowId = windowId;
     browserState.pid = chromium.pid ?? preparedPid;
-    // (3) attach: existing_profile
     const prepared = await withNamedSession('browser_prepare', {
       pid: browserState.pid, window_id: windowId, strategy: { kind: 'existing_profile' },
     });
     if (prepared.isError) return browserError(`could not attach to the browser: ${prepared.text || 'unknown error'}`);
-    // (4) bind: get_browser_state → target_id + tabs[0]
     const state4 = await withNamedSession('get_browser_state', { pid: browserState.pid, window_id: windowId });
     if (state4.isError) return browserError(`could not read browser state: ${state4.text || 'unknown error'}`);
     const targetId = state4.structuredContent?.target_id ?? null;
@@ -1165,7 +1011,6 @@ async function runBrowserOpen(args, _trackChild) {
     browserState.targetId = targetId;
     browserState.tabId = tabId;
     browserState.url = tab0?.url ?? null;
-    // (5) navigate when a URL was given
     if (args.url) {
       const nav = await withNamedSession('browser_navigate', { target_id: targetId, tab_id: tabId, url: args.url });
       if (nav.isError) return browserError(`browser opened but navigation failed: ${nav.text || 'unknown error'}`);
@@ -1231,7 +1076,7 @@ async function runBrowserResize(args, trackChild) {
   try {
     const size = await withNamedSession('get_screen_size', {});
     if (!size.isError) screen = viewportFromStructured(size.structuredContent);
-  } catch { /* screen confirm is best-effort */ }
+  } catch { }
   return browserResult(`desktop resolution set to ${width}x${height}${preset ? ` (preset ${preset})` : ''}`, {
     mode: args.mode, width, height, preset, screen,
   });
@@ -1275,7 +1120,6 @@ async function runBrowserSnapshot(args, _trackChild) {
   };
 }
 
-// Per-action fan-out for browser_act.
 function buildBrowserActCall(action, args, bound) {
   switch (action) {
     case 'click':
@@ -1305,8 +1149,6 @@ function buildBrowserActCall(action, args, bound) {
       } };
     case 'hover':
     case 'point':
-      // point is the narration aid: the cursor moves to the spot (the agent
-      // cursor glides there on screen) but nothing is clicked.
       return { name: 'browser_pointer', args: {
         target_id: bound.targetId, tab_id: bound.tabId, action: 'hover', ref: args.ref, x: args.x, y: args.y,
         delivery_mode: 'foreground',
@@ -1342,7 +1184,6 @@ async function runBrowserAct(args, _trackChild) {
   if (bound.error) return browserError(bound.error);
   const call = buildBrowserActCall(args.action, args, bound);
   if (!call) return browserError(`unsupported action: ${args.action}`);
-  // Strip undefined params (spacesd expects clean args)
   const params = Object.fromEntries(Object.entries(call.args).filter(([, v]) => v !== undefined));
   const res = await withNamedSession(call.name, params);
   if (res.isError) return browserError(`${args.action} failed: ${res.text || 'unknown error'}`);
@@ -1352,11 +1193,6 @@ async function runBrowserAct(args, _trackChild) {
 async function runBrowserEvaluate(args, _trackChild) {
     const bound = await requireBoundBrowser();
     if (bound.error) return browserError(bound.error);
-    // Direct CDP, not spacesd's legacy `page` tool: that one demands a
-    // fixed `--remote-debugging-port` plus a matching daemon env, while
-    // every real launch path uses the dynamic port the cua-driver's
-    // discovery depends on. The endpoint is one HTTP read away
-    // (DevToolsActivePort), so this speaks the protocol itself.
     try {
         const out = await cdpEvaluate(bound.pid, args.expression, !!args.awaitPromise);
         const text = typeof out === "string" ? out : JSON.stringify(out);
@@ -1366,9 +1202,6 @@ async function runBrowserEvaluate(args, _trackChild) {
     }
 }
 
-/// `Runtime.evaluate` over the browser's own CDP WebSocket. The endpoint
-/// file can lag the launch by a few seconds — only the DISCOVERY polls, so
-/// a side-effecting expression is never evaluated twice.
 async function cdpEvaluate(pid, expression, awaitPromise) {
     let port = null;
     for (let i = 0; i < 20 && !port; i++) {
@@ -1376,10 +1209,6 @@ async function cdpEvaluate(pid, expression, awaitPromise) {
         if (!port) await new Promise((r) => setTimeout(r, 500));
     }
     if (!port) throw new Error(`no CDP endpoint found for pid ${pid}`);
-    // Runtime.evaluate is a PAGE-target domain: the /json/version socket is
-    // the browser target (no Runtime), so pick the page target's socket.
-    // The driver's launch opens about:blank alongside the navigated tab —
-    // prefer a real page over it.
     const res = await fetch(`http://127.0.0.1:${port}/json/list`);
     if (!res.ok) throw new Error(`CDP endpoint ${port} did not answer`);
     const targets = await res.json();
@@ -1392,7 +1221,7 @@ async function cdpEvaluate(pid, expression, awaitPromise) {
     return await new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl);
         const timer = setTimeout(() => {
-            try { ws.close(); } catch { /* already gone */ }
+            try { ws.close(); } catch { }
             reject(new Error("CDP evaluate timed out"));
         }, 30000);
         ws.addEventListener("open", () => {
@@ -1424,15 +1253,7 @@ async function cdpEvaluate(pid, expression, awaitPromise) {
     });
 }
 
-/// The CDP port a browser process is serving: `--user-data-dir` off its
-/// cmdline, then the DevToolsActivePort file the browser writes there.
-/// Returns null when either step fails — the caller then lets spacesd try
-/// its own discovery and reports its error unchanged.
 async function discoverCdpPort(pid) {
-  // Route 1: the driver-owned profile dir. One browser per sandbox, so the
-  // newest isolated profile's DevToolsActivePort names the live endpoint.
-  // More robust than /proc parsing (bun's readFile truncates procfs), and
-  // it survives the process having been re-parented.
   try {
     const root = join(homedir(), '.local/share/cua-driver-profiles');
     const names = await readdir(root);
@@ -1446,17 +1267,14 @@ async function discoverCdpPort(pid) {
           bestMtime = st.mtimeMs;
           best = p;
         }
-      } catch { /* not this profile */ }
+      } catch { }
     }
     if (best) {
       const first = (await readFile(best, 'utf8')).split('\n')[0].trim();
       const port = parseInt(first, 10);
       if (Number.isInteger(port) && port > 0 && port < 65536) return port;
     }
-  } catch { /* no profiles yet */ }
-  // Route 2: the process's own --user-data-dir. /proc/<pid>/cmdline is
-  // NUL-separated and reads short through bun's readFile, so it is drained
-  // through a FileHandle instead.
+  } catch { }
   try {
     const raw = await readProcCmdline(pid);
     const udd = raw.find((a) => a.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length);
@@ -1469,7 +1287,6 @@ async function discoverCdpPort(pid) {
   }
 }
 
-/// Drain /proc/<pid>/cmdline to its EOF and split the NUL-separated argv.
 async function readProcCmdline(pid) {
   const fh = await fsOpen(`/proc/${pid}/cmdline`, 'r');
   try {
@@ -1497,13 +1314,7 @@ async function runBrowserWaitFor(args, _trackChild) {
 }
 
 async function runBrowserRecordingStart(args, trackChild) {
-  // No bound browser needed — recording is the desktop via spacesd.
   try {
-    // `path` is the FINAL destination: the finished mp4 lands exactly
-    // there (muxed at stop), so no follow-up copy exists. It must live
-    // under /work — the mounted checkout is the only place the recording
-    // survives the sandbox — and an existing file is never overwritten: a
-    // numeric suffix is added instead.
     const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
     let finalPath = (args.path ?? '').trim() || `/work/demo-${ts}.mp4`;
     if (!finalPath.startsWith('/')) {
@@ -1531,11 +1342,10 @@ async function runBrowserRecordingStart(args, trackChild) {
         '-i', 'cua_desktop.monitor', '-c:a', 'aac', narrationPath], { stdio: 'ignore', detached: false });
     } catch (err) {
       ffmpegChild = null;
-      // honest cleanup: stop the recording we already started
-      try { await withNamedSession('stop_recording', {}); } catch { /* best-effort */ }
+      try { await withNamedSession('stop_recording', {}); } catch { }
       return browserError(`could not start audio capture (ffmpeg): ${String(err?.message ?? err)}`);
     }
-    ffmpegChild.once('error', () => {}); // async spawn failure is surfaced at stop; never crash
+    ffmpegChild.once('error', () => {});
     const id = `rec-${randomBytes(6).toString('hex')}`;
     const recording = {
       id, outputDir: outDir, finalPath, tabId: browserState.tabId, url: browserState.url,
@@ -1550,8 +1360,6 @@ async function runBrowserRecordingStart(args, trackChild) {
   }
 }
 
-/// `demo.mp4` → `demo-1.mp4` → `demo-2.mp4` … — a recording never
-/// overwrites a previous one.
 async function uniquePath(p) {
   const m = p.match(/^(.*?)(\.mp4)?$/);
   const base = m[1];
@@ -1574,9 +1382,8 @@ async function runBrowserRecordingStop(_args, trackChild) {
   let stopRes = null;
   try { stopRes = await withNamedSession('stop_recording', {}); }
   catch (err) { stopRes = { isError: true, text: String(err?.message ?? err), structuredContent: null, content: [] }; }
-  // SIGINT the audio capture regardless of the spacesd outcome
   if (recording.ffmpegPid) {
-    try { process.kill(recording.ffmpegPid, 'SIGINT'); } catch { /* already dead */ }
+    try { process.kill(recording.ffmpegPid, 'SIGINT'); } catch { }
     try {
       await Promise.race([
         new Promise(r => {
@@ -1585,14 +1392,13 @@ async function runBrowserRecordingStop(_args, trackChild) {
         }),
         new Promise(r => setTimeout(r, 5000)),
       ]);
-    } catch { /* best-effort */ }
+    } catch { }
   }
   if (stopRes.isError) {
     return browserError(`recording stop failed: ${stopRes.text || 'unknown error'} — audio capture was killed, the video path is unknown`);
   }
   const lastVideo = stopRes.structuredContent?.last_video_path ?? null;
   if (!lastVideo) return browserError('recording stopped but spacesd did not report last_video_path');
-  // Mux the narration audio when the audio capture produced a real audio stream
   const narrationPath = join(recording.outputDir, 'narration.m4a');
   let audioOk = false;
   try {
@@ -1608,8 +1414,6 @@ async function runBrowserRecordingStop(_args, trackChild) {
   } catch { audioOk = false; }
   let path = lastVideo;
   let muxed = false;
-  // The finished video goes straight to the path the caller reserved at
-  // start — muxed with narration when there is any, copied otherwise.
   const finalPath = recording.finalPath ?? lastVideo;
   await mkdir(dirname(finalPath), { recursive: true }).catch(() => {});
   if (audioOk) {
@@ -1673,22 +1477,20 @@ async function runBrowserFullscreen(_args, trackChild) {
       const win = windows.find(w => w.window_id === winId);
       if (win) bounds = win.bounds ?? { x: win.x ?? null, y: win.y ?? null, width: win.width ?? null, height: win.height ?? null };
     }
-  } catch { /* bounds read is best-effort */ }
+  } catch { }
   return browserResult(`browser window full-screened (${method})${bounds ? `: ${bounds.width}x${bounds.height}@${bounds.x},${bounds.y}` : ''}`, {
     method, windowId: winId, bounds,
   });
 }
 
 async function runBrowserNarrate(args, _trackChild) {
-  // Spawn the in-image voice client and WAIT for it to exit — narration must
-  // be sequenced (it blocks on playback). Presets: /usr/local/bin/voice.
   return new Promise((resolve) => {
     let settled = false;
     const finish = (out) => { if (settled) return; settled = true; clearTimeout(timer); resolve(out); };
     const child = spawn('/usr/local/bin/voice', ['say', ...(args.voice ? ['--voice', args.voice] : []), args.text], { stdio: ['ignore', 'ignore', 'pipe'], detached: false });
     let stderr = '';
     const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* best-effort */ }
+      try { child.kill('SIGKILL'); } catch { }
       finish(browserError('voice timed out after 180s'));
     }, 180000);
     if (timer.unref) timer.unref();
@@ -1703,7 +1505,7 @@ async function runBrowserNarrate(args, _trackChild) {
   });
 }
 
-/** Validate a browser-act arg set after the shared per-action rules. */
+
 function validateBrowserActArgs(args) {
   const action = args.action;
   const ACTIONS = ['click', 'point', 'double_click', 'right_click', 'type', 'select', 'hover', 'drag', 'scroll', 'press_key', 'set_input_files'];
@@ -2116,7 +1918,6 @@ const TOOL_REGISTRY = {
 const BASE_TOOLS = [BASH_TOOL, READ_TOOL, WRITE_TOOL];
 
 
-// ── JSON-RPC dispatch ────────────────────────────────────────────────────────
 
 function handleInitialize() {
   return rpcResult(null, {
@@ -2130,21 +1931,16 @@ function handleInitialize() {
   }).result;
 }
 
-/**
- * Handle one decoded JSON-RPC message. Returns {status, body} where body null
- * means an empty 202 (notifications). Every request answers.
- */
+
 async function dispatchRpc(message, trackChild) {
   if (!message || typeof message !== 'object' || Array.isArray(message) || message.jsonrpc !== '2.0'
     || typeof message.method !== 'string') {
     return { status: 200, body: rpcError(null, INVALID_REQUEST, 'Invalid JSON-RPC request') };
   }
   const { id, method, params } = message;
-  if (id === null || id === undefined) return { status: 202, body: null }; // notification → 202 empty
+  if (id === null || id === undefined) return { status: 202, body: null };
   switch (method) {
     case 'initialize':
-      // Stateless per-request handshake: always answer, never wedge (params are
-      // the caller's affair — we advertise our own protocol version).
       return { status: 200, body: rpcResult(id, handleInitialize()) };
     case 'notifications/initialized':
       return { status: 202, body: null };
@@ -2164,7 +1960,6 @@ async function dispatchRpc(message, trackChild) {
   }
 }
 
-// ── HTTP surface ─────────────────────────────────────────────────────────────
 
 function bearerToken(req) {
   const header = req.headers.get('authorization') ?? '';
@@ -2179,7 +1974,7 @@ function tokenMatches(presented, expected) {
   return a.length === b.length && a.equals(b);
 }
 
-/** One POST /mcp request: auth → parse → dispatch → plain-JSON reply. */
+
 async function handleMcpPost(req, expectedToken, trackChild) {
   if (!tokenMatches(bearerToken(req), expectedToken)) {
     return new Response('missing or invalid bearer token', { status: 401 });
@@ -2205,18 +2000,13 @@ async function handleMcpPost(req, expectedToken, trackChild) {
     const { status, body } = await dispatchRpc(message, trackChild);
     return jsonResponse(body, status);
   } catch (err) {
-    // A crashing handler must still answer (contract: never a hung request).
     const id = message && typeof message === 'object' && !Array.isArray(message) ? message.id ?? null : null;
     if (id === null || id === undefined) return new Response(null, { status: 202 });
     return jsonResponse(rpcError(id, INTERNAL_ERROR, `Internal error: ${String(err?.message ?? err)}`));
   }
 }
 
-/**
- * Start execd. Returns { port, stop } — stop() closes the listener and
- * group-kills any still-running children (best-effort; the container teardown
- * kills everything anyway).
- */
+
 export function startExecd({
   port = Number(process.env.PORT) || DEFAULT_GUEST_PORT,
   hostname = '0.0.0.0',
@@ -2230,7 +2020,7 @@ export function startExecd({
   const server = Bun.serve({
     port,
     hostname,
-    idleTimeout: 0, // long silent tool calls must not be dropped mid-flight
+    idleTimeout: 0,
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === '/healthz' && req.method === 'GET') {
@@ -2253,39 +2043,16 @@ export function startExecd({
   return { port: server.port, stop };
 }
 
-// ── stdio transport (0.2 — HOST agent stages spawn execd as their own child) ─
 
-/**
- * Stdio activation: `--stdio` argv flag OR `EXECD_TRANSPORT=stdio`. Anything
- * else (no flag, other env values, other argv) → HTTP mode, byte-identical
- * to before. Deliberately dumb — this is the ONLY new activation surface.
- */
+
 function parseArgs(argv = process.argv) {
   return { stdio: argv.includes('--stdio') || process.env.EXECD_TRANSPORT === 'stdio' };
 }
 
-/** Bounded dispatch: at most this many tools/calls executing at once; the
- * rest queue FIFO in the stdin loop (an unbounded task pileup is a footgun). */
+
 const STDIO_MAX_IN_FLIGHT = 8;
 
-/**
- * Start the stdio transport WITHOUT owning a pipe. Returns { handleLine, run,
- * stop }: `handleLine(text) → Promise<string|null>` is the per-line dispatcher
- * the real loop uses — tests drive it directly (no child process needed);
- * `run()` pins the true stdin/stdout pipe for the real boot; `stop()`
- * group-kills any tracked children. Same dispatchRpc + tool registry as HTTP —
- * ZERO tool-semantics duplication.
- *
- * handleLine semantics (one COMPLETE JSON-RPC line, trailing newline optional
- * — JSON.parse tolerates trailing whitespace):
- *   → the response line to write to stdout: `JSON.stringify(body)` + '\n'
- *     (the one-line-response invariant: exactly one '\n', terminal), or
- *   → null when the message produces NO output at all: notifications
- *     (notification-silence invariant) and blank/whitespace-only lines.
- * Options { token, tmpdir } are accepted for call-site symmetry with
- * startExecd and deliberately ignored (no auth in stdio mode; bash temp
- * files keep honoring EXECD_TMPDIR).
- */
+
 export function startExecdStdio({ token: _ignoredToken, tmpdir: _ignoredTmpdir } = {}) {
   const activePids = new Set();
   const trackChild = (pid, { remove = false } = {}) => {
@@ -2296,7 +2063,7 @@ export function startExecdStdio({ token: _ignoredToken, tmpdir: _ignoredTmpdir }
 
   async function handleLine(text) {
     if (typeof text !== 'string') return null;
-    if (text.trim() === '') return null; // blank lines skipped silently
+    if (text.trim() === '') return null;
     let message;
     try {
       message = JSON.parse(text);
@@ -2305,46 +2072,37 @@ export function startExecdStdio({ token: _ignoredToken, tmpdir: _ignoredTmpdir }
     }
     try {
       const { status, body } = await dispatchRpc(message, trackChild);
-      if (status === 202 || body === null) return null; // notification → NO output at all
-      return `${JSON.stringify(body)}\n`; // exactly one '\n', terminal
+      if (status === 202 || body === null) return null;
+      return `${JSON.stringify(body)}\n`;
     } catch (err) {
-      // A crashing handler must still answer (the pipe must never hang).
       const id = message && typeof message === 'object' && !Array.isArray(message) ? message.id ?? null : null;
-      if (id === null || id === undefined) return null; // notification crash → silence (the 202 analog)
+      if (id === null || id === undefined) return null;
       return `${JSON.stringify(rpcError(id, INTERNAL_ERROR, `Internal error: ${String(err?.message ?? err)}`))}\n`;
     }
   }
 
-  /**
-   * The real stdin loop. Strict-JSONL framing: complete ('\n'-terminated)
-   * lines only — a partial trailing line waits for the rest and is discarded
-   * at EOF (never emitted). Dispatch is asynchronous with the ≤8-in-flight
-   * FIFO cap; each response is written when its own result settles (the
-   * JSON-RPC id pairs everything — interleaved completion order is legal).
-   * EOF → stop() (group-kills tracked children) → exit 0. Logs: stderr only.
-   */
+
   async function run() {
     console.error('[execd] stdio mode — newline-delimited JSON-RPC on stdin/stdout');
     let finished = false;
-    const pending = []; // FIFO of complete lines beyond the in-flight cap
+    const pending = [];
     let inFlight = 0;
 
     const writeLine = (line) => {
       if (stopped || finished || line === null || line === undefined) return;
       try {
         process.stdout.write(line);
-        process.stdout.flush?.(); // Bun FileSink — deliver even if exit follows close behind
+        process.stdout.flush?.();
       } catch {
-        // reader vanished mid-write — EOF/exit follows anyway
       }
     };
 
     const shutdown = (why) => {
       if (finished) return;
       finished = true;
-      stop(); // group-kill any tracked children
+      stop();
       console.error(`[execd] ${why} — stopping (active children group-killed)`);
-      try { process.stdout.flush?.(); } catch { /* nothing left to do */ }
+      try { process.stdout.flush?.(); } catch { }
       process.exit(0);
     };
 
@@ -2361,21 +2119,18 @@ export function startExecdStdio({ token: _ignoredToken, tmpdir: _ignoredTmpdir }
       inFlight++;
       handleLine(lineText)
         .then(writeLine)
-        .catch(() => {}) // handleLine is total (catches its own handler crashes); belt-and-braces
+        .catch(() => {})
         .finally(settle);
     };
     const onLine = (lineText) => {
       if (stopped || finished) return;
       if (inFlight >= STDIO_MAX_IN_FLIGHT) {
-        pending.push(lineText); // queue FIFO beyond the cap
+        pending.push(lineText);
         return;
       }
       dispatchLine(lineText);
     };
 
-    // Decode stdin byte-chunks into complete lines. '\n' (0x0A) never occurs
-    // inside a multi-byte UTF-8 sequence, so splitting the streamed-decoded
-    // text on '\n' is byte-safe.
     const decoder = new TextDecoder();
     let carry = '';
     const feedBytes = (bytes) => {
@@ -2385,18 +2140,16 @@ export function startExecdStdio({ token: _ignoredToken, tmpdir: _ignoredTmpdir }
         if (nl === -1) break;
         const line = carry.slice(0, nl);
         carry = carry.slice(nl + 1);
-        if (line.trim() !== '') onLine(line); // blank lines skipped silently
+        if (line.trim() !== '') onLine(line);
       }
     };
 
     try {
       for await (const chunk of Bun.stdin.stream()) {
         feedBytes(chunk);
-        if (finished) return; // a signal handler already shut us down
+        if (finished) return;
       }
       if (carry.trim() !== '') {
-        // A partial trailing line waits for the rest of the line; at EOF it is
-        // discarded — incomplete input never emits.
         console.error(`[execd] stdio: discarding ${Buffer.byteLength(carry, 'utf8')}-byte partial trailing line at EOF`);
       }
       shutdown('stdin EOF');
@@ -2415,21 +2168,19 @@ export function startExecdStdio({ token: _ignoredToken, tmpdir: _ignoredTmpdir }
   return { handleLine, run, stop };
 }
 
-// ── Main boot (in-guest: bun /opt/execd/index.mjs) ───────────────────────────
 
 if (import.meta.main) {
   if (parseArgs().stdio) {
-    // stdio: no ports, no token warning, no HTTP listener. Same shutdown as HTTP.
     const session = startExecdStdio();
     const shutdown = (signal) => {
       console.error(`[execd] ${signal} — stopping (active children group-killed)`);
       session.stop();
-      try { process.stdout.flush?.(); } catch { /* nothing left to do */ }
+      try { process.stdout.flush?.(); } catch { }
       process.exit(0);
     };
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
-    void session.run(); // owns the lifecycle: EOF → stop → exit 0
+    void session.run();
   } else {
     const port = Number(process.env.PORT) || DEFAULT_GUEST_PORT;
     if (!process.env.CUA_ENV_TOKEN) {

@@ -1,53 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# libs/images/linux (ghcr.io/trycua/linux): the default recommended "Spaces image",
-# in two tiers
-# (build one with `--target`; the default is the last stage, full):
-#
-#   slim   ghcr.io/trycua/linux:24.04-slim[-disk]  the minimum for
-#          `cua-spacesd doctor --strict` with every feature: no Firefox
-#   full   ghcr.io/trycua/linux:24.04[-disk]       FROM slim + dev tooling
-#          (build-essential, git, gh, jq, ripgrep, Node LTS + pnpm, python3 +
-#          uv, rustup stable, Go, the Docker CLI) + Firefox
-#
-# full is FROM slim, so the two share every slim layer in the registry.
-#
-# slim: Ubuntu 24.04 + XFCE on Xvfb (:1) + session D-Bus + AT-SPI + headless
-# PipeWire (null sink cua_desktop, virtual source cua_mic)
-# + Chromium (the browser cua-driver's browser tools drive over CDP)
-# + cua-spacesd (3211: gRPC, media, and the HTML5 viewer at /viewer)
-# + conformance fixtures under
-# /opt/cua/fixtures. This file builds the container rootfs (docker / gVisor,
-# supervisord as PID 1). The KubeVirt containerDisk is derived from THIS image
-# by common/vm/Dockerfile + common/disk-builder (see ../build.sh), so both
-# artifacts always carry the same guest.
-#
-# Build context: libs/images (so shared files under common/ are reachable).
-#   docker buildx build -f linux/Dockerfile libs/images \
-#     --target slim|full --build-arg CUA_SPACESD_SOURCE=local|release|none
-#
-# CUA_SPACESD_SOURCE
-#   local    copy linux/dist/<TARGETARCH>/cua-spacesd from the
-#            build context (produce it with build-spacesd-linux.sh). Missing
-#            binary = build error.
-#   release  download CUA_SPACESD_RELEASE_URL ({version} and {arch} =
-#            x86_64|aarch64 expanded), a .tar.gz holding a top-level
-#            `cua-spacesd` (.github/workflows/cd-cua-spacesd.yml).
-#   none     no driver; the supervisor program idles. Used while the driver is
-#            not buildable, and as a sanity check that nothing else depends on it.
-# The older build args (CUA_GUESTD_* and CUA_ENV_DRIVER_* SOURCE/_VERSION/
-# _RELEASE_URL) are still honoured when the CUA_SPACESD_* one is not given.
-#
-# Compat for one release, for both older names (cua-env-driver, cua-guestd):
-# /usr/local/bin/<old> links to cua-spacesd, <old>.service is an alias of
-# cua-spacesd.service, and /opt/cua/bin/start-<old>.sh links to
-# start-spacesd.sh.
 ARG UBUNTU_VERSION=24.04
 FROM ubuntu:${UBUNTU_VERSION} AS slim
 
 ARG TARGETARCH
-# Empty = the older CUA_GUESTD_* / CUA_ENV_DRIVER_* arg, else the default in the RUN below
-# (local; 0.1.0, keep in step with libs/cua-spacesd/VERSION; the GitHub
-# release URL).
 ARG CUA_SPACESD_SOURCE=
 ARG CUA_SPACESD_VERSION=
 ARG CUA_SPACESD_RELEASE_URL=
@@ -59,17 +14,6 @@ ARG CUA_ENV_DRIVER_VERSION=
 ARG CUA_ENV_DRIVER_RELEASE_URL=
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=Etc/UTC
 
-# Desktop, display, a11y and test tooling. No snaps anywhere (the full tier's
-# Firefox comes from Mozilla's APT repo, amd64 + arm64).
-# `apt-get install || dpkg --configure -a` retries: foreign-arch builds under
-# qemu-user (e.g. amd64 on an Apple Silicon Colima VM) intermittently segfault
-# in python byte-compilation postinsts; re-running the configure step passes.
-# Native builds never take the retry path.
-# The last group is the runtime of Electron and GTK apps that teleport
-# installs (VS Code, Slack, Discord, ...), so they start at once instead of
-# resolving packages first. XFCE and Chromium already pull nearly all of it;
-# listing it keeps it when they change, and the rest (libsecret, libxss,
-# EGL) adds about 1.2 MB.
 RUN apt-get update \
  && for attempt in 1 2 3; do apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg sudo tzdata locales procps psmisc iproute2 fuse3 \
@@ -92,23 +36,9 @@ RUN apt-get update \
  && mkdir -p /etc/systemd/user \
  && for u in pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service \
       wireplumber.service filter-chain.service; do ln -sf /dev/null "/etc/systemd/user/$u"; done
-# (The user-session PipeWire units are masked: cua-audio runs one headless
-# instance for the desktop instead, see files/start-audio.sh.)
 
 RUN install -d -m 0755 /etc/apt/keyrings
 
-# Chromium from the xtradeb/apps PPA (open-source build, BSD-3-Clause; not
-# Google-branded Chrome): only the chromium packages may come from it, at
-# exactly CHROMIUM_VERSION, and the key must have the pinned fingerprint.
-# The key is vendored (common/apt-keys/xtradeb-apps.asc), not fetched from
-# keyserver.ubuntu.com, so a keyserver outage cannot break the build.
-# cua-driver's browser_prepare launches /usr/lib/chromium/chromium (a
-# root-owned package payload) with a driver-owned throwaway profile. The
-# managed policy turns off first-run noise, sign-in and password saving, and
-# the "unsupported command-line flag" bar: the image picks the sandbox flags
-# per runtime (common/desktop/browser-sandbox.sh), not the user.
-# Per-arch pins: the PPA keeps only its newest build per arch, and the
-# arches do not always move together. CHROMIUM_VERSION, when set, wins.
 ARG CHROMIUM_VERSION=
 ARG CHROMIUM_VERSION_AMD64=154.0.8037.92-1xtradeb1.2404.1
 ARG CHROMIUM_VERSION_ARM64=154.0.8037.92-1xtradeb1.2404.1
@@ -138,10 +68,7 @@ RUN --mount=type=bind,source=common/apt-keys/xtradeb-apps.asc,target=/tmp/xtrade
  && test -x /usr/lib/chromium/chromium \
  && chromium --version | tee /etc/cua-image/chromium-version
 
-# Shared desktop plumbing (same files as plain/ubuntu-xfce-vnc).
 COPY common/desktop/ /opt/cua/desktop/
-# /volume: where cua-spacesd mounts Cua Volume (FUSE, served by the client
-# through /volume; see VolumeService). Owned by the desktop user.
 RUN /opt/cua/desktop/install-desktop-user.sh cua 1000 \
  && install -d -o cua -g cua -m 0755 /volume \
  && sed -i 's/^WebBrowser=.*/WebBrowser=chromium/' /home/cua/.config/xfce4/helpers.rc \
@@ -149,7 +76,6 @@ RUN /opt/cua/desktop/install-desktop-user.sh cua 1000 \
  && install -d /etc/systemd/system/cua-desktop.service.d \
  && printf '[Service]\nEnvironment=CUA_X_SERVER=xvfb\n' >/etc/systemd/system/cua-desktop.service.d/x-server.conf
 
-# cua-spacesd.
 RUN --mount=type=bind,source=linux/dist,target=/dist \
     set -eu; \
     bin=/usr/local/bin/cua-spacesd; \
@@ -219,9 +145,6 @@ RUN install -d /opt/cua/entrypoint.d \
  && echo container >/etc/cua-image/variant \
  && python3 -m py_compile /opt/cua/fixtures/*.py
 
-# /etc/cua-image/manifest.json: what this image claims (image.json `claims`
-# plus the baked cua-spacesd's build-info). `cua-spacesd doctor` checks the
-# running guest against it; the VM layer rewrites the variant fields.
 COPY common/tools/cua-image-manifest /opt/cua/bin/cua-image-manifest
 ARG CUA_IMAGE_SOURCE_REVISION=
 RUN /opt/cua/bin/cua-image-manifest generate --image-json /etc/cua-image/image.json --tier slim \
@@ -229,22 +152,12 @@ RUN /opt/cua/bin/cua-image-manifest generate --image-json /etc/cua-image/image.j
       --source-revision "$CUA_IMAGE_SOURCE_REVISION" --out /etc/cua-image/manifest.json
 
 ENV HOME=/root DISPLAY=:1 CUA_X_SERVER=xvfb CUA_AUDIO=true
-# 3211 spacesd (gRPC + gRPC-Web, /media, /viewer), 3212/udp spacesd QUIC
-# media, 18080 HTTP fixture (only while started).
 EXPOSE 3211 3212/udp 18080
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=12 \
   CMD ["/opt/cua/desktop/healthcheck.sh"]
 STOPSIGNAL SIGTERM
 CMD ["/opt/cua/desktop/entrypoint.sh"]
 
-# ---------------------------------------------------------------------------
-# full (the default tier): slim + developer tooling + Firefox.
-# Every download is pinned by version and sha256; apt packages come from the
-# Ubuntu 24.04 archive (and Docker's signed repo, key fingerprint checked,
-# docker-ce-cli only, at exactly DOCKER_CLI_VERSION). Tools land in
-# /usr/local/bin (thin wrappers where a tool needs its home), so they work in
-# every session: supervisord programs, ssh, and the VM's systemd units.
-# ---------------------------------------------------------------------------
 FROM slim AS full
 ARG TARGETARCH
 ARG CUA_IMAGE_SOURCE_REVISION=
@@ -268,7 +181,6 @@ ARG RUST_TOOLCHAIN=1.98.1
 ARG DOCKER_CLI_VERSION=5:29.8.1-1~ubuntu.24.04~noble
 ARG DOCKER_APT_KEY=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 
-# Build tools and the everyday CLI set, from the Ubuntu archive.
 RUN apt-get update \
  && for attempt in 1 2 3; do apt-get install -y --no-install-recommends \
       build-essential pkg-config cmake ninja-build \
@@ -278,7 +190,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/fdfind /usr/local/bin/fd
 
-# Docker CLI only (no daemon): docker-ce-cli from Docker's signed repo.
 RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor >/etc/apt/keyrings/docker.gpg \
  && gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -q "^fpr:::::::::${DOCKER_APT_KEY}:" \
  && echo "deb [signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" \
@@ -290,7 +201,6 @@ RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor >/et
  && rm -rf /var/lib/apt/lists/* \
  && docker --version
 
-# Pinned tarballs, each checked against its sha256 before it is unpacked.
 RUN set -eu; \
     case "$TARGETARCH" in \
       amd64) node_arch=x64; go_sha="$GO_SHA256_AMD64"; node_sha="$NODE_SHA256_AMD64"; uv_t=x86_64; uv_sha="$UV_SHA256_AMD64"; gh_sha="$GH_SHA256_AMD64"; ru_t=x86_64; ru_sha="$RUSTUP_SHA256_AMD64" ;; \
@@ -324,8 +234,6 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/pnpm; \
     node --version; pnpm --version; go version; uv --version; gh --version | head -1; rustc --version; cargo --version
 
-# Firefox from Mozilla's APT repo (full tier only), with a policy that turns
-# off updates, telemetry and first-run pages.
 RUN curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg -o /etc/apt/keyrings/packages.mozilla.org.asc \
  && echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
       >/etc/apt/sources.list.d/mozilla.list \
@@ -344,10 +252,8 @@ RUN curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg -o /etc/apt
  && python3 -m json.tool /usr/lib/firefox/distribution/policies.json >/dev/null \
  && firefox --version
 
-# Firefox is the full tier's default web browser, as before the tiers.
 RUN sed -i 's/^WebBrowser=.*/WebBrowser=firefox/' /home/cua/.config/xfce4/helpers.rc
 
-# The full tier's manifest: the same image.json, tier full (claims.tools).
 RUN /opt/cua/bin/cua-image-manifest generate --image-json /etc/cua-image/image.json --tier full \
       --variant rootfs --arch "$TARGETARCH" --spacesd-source "$(cat /etc/cua-image/spacesd-source)" \
       --source-revision "$CUA_IMAGE_SOURCE_REVISION" --out /etc/cua-image/manifest.json

@@ -1,40 +1,7 @@
-//! `sbox-lan` — the LAN gateway (SBOX_PLAN1 §5.4, §7).
-//!
-//! A deliberately boring reverse proxy that exposes **exactly one path** —
-//! `POST /mcp` — from the loopback backend to the local network, and nothing
-//! else. `sbox-b`'s REST API, its journal and its health endpoint stay where
-//! they are: on loopback, unreachable from the LAN.
-//!
-//! Why a separate process rather than binding `sbox-b` wider: binding the
-//! backend to the LAN would publish its entire unauthenticated `/api/*`
-//! surface along with the authenticated `/mcp`. The split is the whole point —
-//! one address exposes one authenticated path.
-//!
-//! What this means for endpoint protection on a work machine: the host never
-//! dials out and never echoes a shell. It listens on the LAN for an ordinary
-//! HTTP application protocol, the same artifact class as any other MCP server,
-//! and every side effect lands inside a container whose reachability into the
-//! host is a mount the operator declared.
-//!
-//! ```text
-//!   harness (another host) ──POST /mcp──► sbox-lan :7777 ──► 127.0.0.1:3000/mcp
-//!                             Bearer         (LAN)              (loopback)
-//! ```
-//!
-//! Usage:
-//! ```sh
-//! sbox-lan                      # 127.0.0.1:7777 (default; safe to leave running)
-//! sbox-lan --lan                # 0.0.0.0:7777 — reachable from the network
-//! sbox-lan --bind 10.0.0.5:9000 # an explicit address
-//! sbox-lan --upstream 127.0.0.1:3000
-//! ```
-
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-/// A create can legitimately block for the full sandbox boot, so the gateway
-/// must not be the component that gives up first.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -120,16 +87,12 @@ fn serve(mut client: TcpStream, upstream: &str) -> std::io::Result<()> {
         read_request(&mut reader)?
     };
 
-    // The allowlist IS the security boundary: one method, one path. Anything
-    // else is refused here and never reaches the backend.
     if path != "/mcp" {
         return refuse(&mut client, 404, "not_found", "Only /mcp is exposed");
     }
     if method != "POST" {
         return refuse(&mut client, 405, "method_not_allowed", "Use POST");
     }
-    // The token itself is checked by the backend, which owns it; the gateway
-    // only insists that one was offered, so an unauthenticated scan stops here.
     let authorized = headers
         .iter()
         .any(|(k, v)| k == "authorization" && v.starts_with("Bearer "));
@@ -216,8 +179,6 @@ fn forward(
 
     let mut head = format!("POST /mcp HTTP/1.1\r\nhost: {upstream}\r\n");
     for (k, v) in headers {
-        // `host` is the upstream's own authority; framing and hop-by-hop
-        // headers are re-derived below.
         if matches!(
             k.as_str(),
             "host" | "content-length" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade"

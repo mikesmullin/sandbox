@@ -1,25 +1,3 @@
-//! sbox MCP driver — deterministic tool execution for AJCS (batch 2.2).
-//!
-//! ONE driver mechanism, TWO sibling facades (one per upstream daemon):
-//!
-//!   GUI  (spacesd, host port = record.mcpPort):
-//!   GET  /api/orchestration/sandboxes/:id/mcp/tools        proxy `tools/list`
-//!   POST /api/orchestration/sandboxes/:id/mcp/tools/:name  proxy `tools/call`
-//!   POST /api/orchestration/sandboxes/:id/mcp/rpc          JSON-RPC passthrough
-//!
-//!   EXEC (execd, guest :3213, host port = record.execPort):
-//!   GET  /api/orchestration/sandboxes/:id/exec/tools       proxy `tools/list`
-//!   POST /api/orchestration/sandboxes/:id/exec/tools/bash  proxy `tools/call`
-//!   POST /api/orchestration/sandboxes/:id/exec/rpc         JSON-RPC passthrough
-//!
-//! ONE driver mechanism, two callers (plan §7.1): an agent session drives a
-//! sandbox's /mcp with LLM-decided calls; AJCS drives it THROUGH this endpoint
-//! with Jobfile-decided calls. No LLM, no sampling, no conversation: one HTTP
-//! request = one MCP request. The driver holds NO session state beyond the
-//! HTTP request — the MCP initialize handshake runs per request.
-//!
-//! Contract: docs/mcp-driver-contract.md.
-
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -31,15 +9,12 @@ use crate::http::{client, Request, Response};
 use crate::util;
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
-/// Same probe semantics as the orchestration health check.
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(1000);
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const CLIENT_NAME: &str = "sandbox2-mcp-driver";
 const CLIENT_VERSION: &str = "1";
-/// Methods the caller may drive itself through /mcp/rpc — skip the handshake.
 const HANDSHAKE_METHODS: [&str; 2] = ["initialize", "notifications/initialized"];
 
-/// Upstream surfaces: same JSON-RPC transport, different daemon + host port.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Gui,
@@ -61,7 +36,6 @@ impl Surface {
         }
     }
 
-    /// The port whose daemon answers a liveness probe for this record.
     fn health_port(record: &Record) -> u16 {
         if record.kind.has_desktop() {
             record.mcp_port
@@ -71,7 +45,6 @@ impl Surface {
     }
 }
 
-/// Per-call upstream budget, env-configurable; read per request.
 fn driver_timeout() -> Duration {
     std::env::var("MCP_DRIVER_TIMEOUT_MS")
         .ok()
@@ -81,7 +54,6 @@ fn driver_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(30))
 }
 
-/// URL-expressible tool names; anything else goes through /mcp/rpc.
 fn is_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
@@ -90,13 +62,7 @@ fn is_tool_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-// ── sandbox record + readiness gate ─────────────────────────────────────────
 
-/// Read one sandbox record from the shared state file; `None` when untracked.
-///
-/// Deliberately reads the file rather than the orchestration module's
-/// in-memory map: the driver must see exactly what was persisted, and a read
-/// here must never take the orchestration lock while a pipeline holds it.
 fn load_record(id: &str) -> Option<Record> {
     let raw = std::fs::read_to_string(state_file()).ok()?;
     let doc: Value = serde_json::from_str(&raw).ok()?;
@@ -104,7 +70,6 @@ fn load_record(id: &str) -> Option<Record> {
     serde_json::from_value(entry.clone()).ok()
 }
 
-/// spacesd `/health` → 2xx once serving.
 async fn probe_health(port: u16, kind: Kind) -> bool {
     let path = if kind.has_desktop() { "/health" } else { "/healthz" };
     client::request("127.0.0.1", port, "GET", path, &[], None, HEALTH_TIMEOUT)
@@ -113,8 +78,6 @@ async fn probe_health(port: u16, kind: Kind) -> bool {
         .unwrap_or(false)
 }
 
-/// Sandbox-level gate, shared by both facades: 404 unknown id; 409 (with the
-/// record's state in error.details) when the lifecycle has not reached ready.
 fn gate_core(id: &str) -> Result<Record, Response> {
     let record = load_record(id)
         .ok_or_else(|| fail(404, "not_found", &format!("No such sandbox: {id}"), None))?;
@@ -129,7 +92,6 @@ fn gate_core(id: &str) -> Result<Record, Response> {
     Ok(record)
 }
 
-/// A ready-recorded sandbox must still answer /health (stale record check).
 async fn gate_health(id: &str, record: Record) -> Result<Record, Response> {
     if probe_health(Surface::health_port(&record), record.kind).await {
         return Ok(record);
@@ -144,11 +106,6 @@ async fn gate_health(id: &str, record: Record) -> Result<Record, Response> {
     ))
 }
 
-/// GUI facade gate: the sandbox must HAVE a desktop, then be ready and live.
-///
-/// A headless sandbox refuses here with a typed 409 rather than being dialled
-/// on a port nothing is listening on — the caller gets "this kind has no GUI"
-/// instead of a 30s timeout it has to interpret.
 async fn gate_sandbox(id: &str) -> Result<Record, Response> {
     let record = gate_core(id)?;
     if !record.kind.has_desktop() {
@@ -169,8 +126,6 @@ async fn gate_sandbox(id: &str) -> Result<Record, Response> {
     gate_health(id, record).await
 }
 
-/// Exec facade gate: the GUI gate PLUS the exec surface itself — records
-/// persisted before execd carry no exec port and have nothing to drive.
 async fn gate_exec(id: &str) -> Result<Record, Response> {
     let record = gate_core(id)?;
     if record.exec_port == 0 {
@@ -184,7 +139,6 @@ async fn gate_exec(id: &str) -> Result<Record, Response> {
     gate_health(id, record).await
 }
 
-// ── MCP client (per-request handshake, then one operation) ──────────────────
 
 enum UpstreamError {
     Error(String),
@@ -217,8 +171,6 @@ struct Reply {
     message: Option<Value>,
 }
 
-/// Defensive SSE extraction: Streamable-HTTP servers may answer with
-/// `data:` lines rather than a bare JSON body.
 fn parse_sse(text: &str) -> Option<Value> {
     let mut parsed = None;
     for line in text.split('\n') {
@@ -244,12 +196,9 @@ fn is_valid_reply(message: &Value) -> bool {
     }
 }
 
-/// One JSON-RPC POST to the sandbox's /mcp. Threads the Mcp-Session-Id the
-/// server issues (per POST) for the rest of this driver request, then the
-/// session is dropped — the next request handshakes afresh.
 async fn post_rpc(session: &mut Session, message: &Value) -> Result<Reply, UpstreamError> {
     let budget = session.remaining()?;
-    let auth = format!("Bearer {}", session.token); // minted internally, never echoed
+    let auth = format!("Bearer {}", session.token);
     let body = serde_json::to_vec(message).unwrap_or_else(|_| b"{}".to_vec());
 
     let mut headers: Vec<(&str, &str)> = vec![
@@ -294,7 +243,6 @@ async fn post_rpc(session: &mut Session, message: &Value) -> Result<Reply, Upstr
 
     let text = res.text();
     if text.trim().is_empty() {
-        // notifications answer empty (202)
         return Ok(Reply {
             status: res.status,
             message: None,
@@ -326,10 +274,6 @@ async fn post_rpc(session: &mut Session, message: &Value) -> Result<Reply, Upstr
     })
 }
 
-/// Spec-correct client opening for one driver request: initialize → (session
-/// issued) notifications/initialized. Per-request, not cached per sandbox:
-/// cached sessions die with daemon restarts and caching would hold state
-/// beyond the HTTP request.
 async fn handshake(session: &mut Session) -> Result<(), UpstreamError> {
     let init = post_rpc(
         session,
@@ -368,10 +312,6 @@ fn new_session(record: &Record, surface: Surface) -> Session {
     }
 }
 
-/// Standard operation: handshake, then `{ id: 2, method, params }`.
-///
-/// One driver request = one operation upstream — no internal retries:
-/// tools/call is not idempotent and a silent retry could double-fire.
 async fn run_operation(
     record: &Record,
     method: &str,
@@ -387,7 +327,6 @@ async fn run_operation(
     .await
 }
 
-/// /mcp/rpc passthrough: exact caller message (id/notification semantics kept).
 async fn run_passthrough(
     record: &Record,
     message: &Value,
@@ -401,7 +340,6 @@ async fn run_passthrough(
     post_rpc(&mut session, message).await
 }
 
-/// Map an UpstreamError to the 502/504 envelope.
 fn upstream_failure(err: UpstreamError, record: &Record, method: &str) -> Response {
     let details = json!({ "sandboxId": record.id, "state": record.state, "method": method });
     match err {
@@ -417,7 +355,6 @@ fn upstream_failure(err: UpstreamError, record: &Record, method: &str) -> Respon
     }
 }
 
-/// JSON-RPC error → 400 upstream_rejected with the protocol error passed through.
 fn rejected_by_upstream(rpc_error: &Value, extra: Value) -> Response {
     let mut jsonrpc = json!({
         "code": rpc_error.get("code").cloned().unwrap_or(Value::Null),
@@ -440,9 +377,7 @@ fn rejected_by_upstream(rpc_error: &Value, extra: Value) -> Response {
     )
 }
 
-// ── route handlers ──────────────────────────────────────────────────────────
 
-/// GET /sandboxes/:id/{mcp,exec}/tools — proxy tools/list.
 async fn handle_tools_list(record: &Record, surface: Surface) -> Response {
     match run_operation(record, "tools/list", json!({}), surface).await {
         Ok(reply) => {
@@ -469,8 +404,6 @@ async fn handle_tools_list(record: &Record, surface: Surface) -> Response {
     }
 }
 
-/// POST /sandboxes/:id/{mcp,exec}/tools/:name — proxy tools/call.
-/// Tool errors stay HTTP 200: `isError` means the TOOL failed, the CALL did not.
 async fn handle_tool_call(
     req: &Request,
     record: &Record,
@@ -508,7 +441,7 @@ async fn handle_tool_call(
         Ok(reply) => {
             let message = reply.message.unwrap_or(Value::Null);
             if let Some(err) = non_null(message.get("error")) {
-                return rejected_by_upstream(err, json!({ "tool": name })); // JSON-RPC refusal
+                return rejected_by_upstream(err, json!({ "tool": name }));
             }
             Response::ok(json!({
                 "ok": true,
@@ -519,7 +452,6 @@ async fn handle_tool_call(
     }
 }
 
-/// POST /sandboxes/:id/{mcp,exec}/rpc — arbitrary method/params passthrough.
 async fn handle_rpc(req: &Request, record: &Record, surface: Surface) -> Response {
     let body = match parse_body(req) {
         Ok(b) => b,
@@ -536,7 +468,6 @@ async fn handle_rpc(req: &Request, record: &Record, surface: Surface) -> Respons
     } else {
         json!({ "jsonrpc": "2.0", "id": rpc.id.clone().unwrap_or(json!(1)), "method": rpc.method })
     };
-    // params verbatim passthrough: omitted stays omitted.
     if let Some(params) = rpc.params {
         message["params"] = params;
     }
@@ -577,15 +508,11 @@ fn non_null(v: Option<&Value>) -> Option<&Value> {
     }
 }
 
-// ── dispatch ────────────────────────────────────────────────────────────────
 
-/// Claims only `sandboxes/:id/{mcp,exec}/*`; everything else under
-/// `/api/orchestration` falls through to the 2.1 handler.
 pub fn claims(path: &str) -> bool {
     parse_path(path).is_some()
 }
 
-/// `/api/orchestration/sandboxes/<id>/<mcp|exec>[/<sub>]`
 fn parse_path(path: &str) -> Option<(String, bool, String)> {
     let rest = path.strip_prefix("/api/orchestration/sandboxes/")?;
     let mut parts = rest.splitn(3, '/');
@@ -607,7 +534,6 @@ pub async fn handle(req: Request) -> Response {
     };
     let surface = if is_exec { Surface::Exec } else { Surface::Gui };
 
-    // `tools` (list)
     if sub == "tools" {
         if req.method != "GET" {
             return fail(405, "method_not_allowed", "Use GET", None).with_header("allow", "GET");
@@ -619,7 +545,6 @@ pub async fn handle(req: Request) -> Response {
         return handle_tools_list(&record, surface).await;
     }
 
-    // execd v0 serves only bash through the named proxy.
     if is_exec && sub == "tools/bash" {
         if req.method != "POST" {
             return fail(405, "method_not_allowed", "Use POST", None).with_header("allow", "POST");
@@ -679,7 +604,6 @@ async fn gate(id: &str, is_exec: bool) -> Result<Record, Response> {
     }
 }
 
-/// Call one spacesd (GUI) tool in a sandbox and return its MCP result verbatim.
 pub async fn call_gui_tool(record: &Record, name: &str, arguments: Value) -> Result<Value, String> {
     let reply = run_operation(
         record,
@@ -702,11 +626,6 @@ pub async fn call_gui_tool(record: &Record, name: &str, arguments: Value) -> Res
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
 
-/// Call one execd tool in a sandbox and return its MCP result verbatim.
-///
-/// The host MCP server's `read`/`write`/`bash` are this function: the names
-/// and argument shapes are execd's own, so the tool an agent calls on the host
-/// is the tool that runs in the guest, with no translation layer to drift.
 pub async fn call_exec_tool(record: &Record, name: &str, arguments: Value) -> Result<Value, String> {
     let reply = run_operation(
         record,
@@ -732,7 +651,6 @@ pub async fn call_exec_tool(record: &Record, name: &str, arguments: Value) -> Re
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
 
-// ── validation (polite: every problem reported in one response) ─────────────
 
 fn parse_body(req: &Request) -> Result<Value, Response> {
     if req.body.len() > MAX_BODY_BYTES {
@@ -753,7 +671,6 @@ fn parse_body(req: &Request) -> Result<Value, Response> {
     }
 }
 
-/// POST /mcp/tools/:name body: `{ arguments?: object }` — nothing else.
 fn validate_tool_call(body: &Value) -> Result<Value, Response> {
     let obj = body.as_object().cloned().unwrap_or_default();
     let extra: Vec<String> = obj.keys().filter(|k| *k != "arguments").cloned().collect();
@@ -784,7 +701,6 @@ struct RpcCall {
     id_is_null: bool,
 }
 
-/// POST /mcp/rpc body: `{ method: string, params?: object, id?: number|string|null }`.
 fn validate_rpc(body: &Value) -> Result<RpcCall, Response> {
     let obj = body.as_object().cloned().unwrap_or_default();
     let allowed = ["method", "params", "id"];

@@ -1,5 +1,3 @@
-//! The API surface, one module per plane.
-
 pub mod container_cli;
 pub mod containers;
 pub mod handlers;

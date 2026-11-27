@@ -1,18 +1,3 @@
-//! cua-spacesd gRPC-Web client (host side).
-//!
-//! spacesd serves gRPC + gRPC-Web on :3211. The host app authenticates with the
-//! per-container token as `x-cua-env-authorization: Bearer <token>` and speaks
-//! minimal hand-rolled protobuf frames — only one call is needed:
-//!
-//!   SystemService/CreateViewerTicket — mints the short-lived viewer ticket
-//!     the HTML5 viewer at /viewer ingests via `#ticket=…` (never the env token)
-//!
-//! Wire format (see spike/README.md + libs/cua/proto/cua/env/v1):
-//!   grpc-web frame = 1-byte flag (0=data, 0x80=trailers) + uint32be length
-//!   CreateViewerTicketRequest  — an empty message is valid (defaults: 1h TTL,
-//!     SESSION_POLICY_ALLOW_ACTIVATION, no clipboard/files)
-//!   CreateViewerTicketResponse — 1: ticket, 2: expires_at, 3: viewer_path
-
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -26,7 +11,6 @@ pub struct ViewerTicket {
     pub viewer_path: String,
 }
 
-/// Frame a protobuf message for gRPC-Web (flag 0 + uint32be length).
 fn grpc_frame(message: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + message.len());
     out.push(0u8);
@@ -35,7 +19,6 @@ fn grpc_frame(message: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Split a gRPC-Web response into data payload and trailer text.
 fn parse_grpc_web(buf: &[u8]) -> (Vec<u8>, String) {
     let mut pos = 0usize;
     let mut data = Vec::new();
@@ -56,7 +39,6 @@ fn parse_grpc_web(buf: &[u8]) -> (Vec<u8>, String) {
     (data, trailers)
 }
 
-/// Walk protobuf wire fields; keep length-delimited values by field number.
 fn parse_proto_fields(buf: &[u8]) -> HashMap<u32, Vec<u8>> {
     let mut fields = HashMap::new();
     let mut pos = 0usize;
@@ -67,7 +49,6 @@ fn parse_proto_fields(buf: &[u8]) -> HashMap<u32, Vec<u8>> {
         let field_number = (tag >> 3) as u32;
         match wire_type {
             0 => {
-                // varint — skip
                 while pos < buf.len() && buf[pos] & 0x80 != 0 {
                     pos += 1;
                 }
@@ -94,7 +75,7 @@ fn parse_proto_fields(buf: &[u8]) -> HashMap<u32, Vec<u8>> {
                 pos = end;
             }
             5 => pos += 4,
-            _ => break, // unknown wire type — stop defensively
+            _ => break,
         }
     }
     fields
@@ -112,7 +93,6 @@ fn grpc_error(trailers: &str) -> Result<(), String> {
     }
 }
 
-/// Pull the value that follows `key` on its line in the trailer blob.
 fn capture_after(text: &str, key: &str) -> Option<String> {
     let idx = text.find(key)?;
     let rest = &text[idx + key.len()..];
@@ -124,20 +104,15 @@ fn capture_after(text: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Mint a viewer ticket for the HTML5 viewer served at /viewer.
-///
-/// `ttl_seconds` is clamped to 1..=86400 when given; omitted it takes spacesd's
-/// own default (1h).
 pub async fn mint_viewer_ticket(
     port: u16,
     token: &str,
     ttl_seconds: Option<u64>,
 ) -> Result<ViewerTicket, String> {
-    // CreateViewerTicketRequest: ttl = field 1 (google.protobuf.Duration, LEN).
     let mut message: Vec<u8> = Vec::new();
     if let Some(ttl) = ttl_seconds {
         let seconds = ttl.clamp(1, 86_400);
-        let mut duration = vec![0x08u8]; // Duration.seconds = field 1, varint
+        let mut duration = vec![0x08u8];
         let mut v = seconds;
         while v > 0x7f {
             duration.push(((v & 0x7f) as u8) | 0x80);
@@ -163,7 +138,6 @@ pub async fn mint_viewer_ticket(
     .map_err(|e| format!("spacesd CreateViewerTicket: {e}"))?;
 
     let (data, trailers) = parse_grpc_web(&res.body);
-    // The status can arrive in the trailer frame or as a response header.
     let trailer_text = if trailers.is_empty() {
         res.header("grpc-status")
             .map(|s| format!("grpc-status: {s}"))

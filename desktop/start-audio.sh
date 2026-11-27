@@ -1,20 +1,13 @@
 #!/usr/bin/env bash
-# Headless PipeWire for the desktop user: pipewire + wireplumber +
-# pipewire-pulse (Pulse protocol at $XDG_RUNTIME_DIR/pulse/native), with the
-# virtual devices from /etc/pipewire/pipewire.conf.d/10-cua-virtual-devices.conf
-# made the defaults. Runs under supervisord (container) and systemd (VM); exits
-# non-zero if any of the three dies so the supervisor restarts the set.
 set -euo pipefail
 log() { echo "[$(date -Iseconds)] start-audio: $*"; }
 export HOME="${HOME:-/home/$(id -un)}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/cua-desktop}"
 
-# Share the desktop session bus when it is up (wireplumber uses it for
-# reservation/portal features; audio works without it).
 ENV_FILE="$XDG_RUNTIME_DIR/desktop.env"
 for _ in $(seq 1 30); do [ -r "$ENV_FILE" ] && break; sleep 1; done
 if [ -r "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; fi
-unset DISPLAY  # audio daemons don't need X
+unset DISPLAY
 
 rm -f "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pipewire-0.lock" "$XDG_RUNTIME_DIR/pipewire-0-manager"*
 PIDS=()

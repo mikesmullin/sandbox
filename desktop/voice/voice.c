@@ -1,23 +1,3 @@
-/*
- * voice — thin TTS client for the sandbox image.
- *
- * Exactly two things, in sequence:
- *   1. POST {"text":"...", ["voice":"...",] "mode":"download"} to a TTS HTTP
- *      endpoint on the host, and save the response body (wav bytes).
- *   2. Run `paplay <file>` so the narration plays inside the sandbox's
- *      PipeWire/PulseAudio stack.
- *
- * It BLOCKS until playback finishes: the caller sequences narration this way
- * (text in, sound in, done), so the exit code means "the sound has played",
- * never "the request was sent".
- *
- * No dependencies beyond libc + POSIX sockets. Built static for
- * x86_64-linux-musl via build-voice.sh.
- *
- * Exit codes: 0 = fetch+save+playback ok (or dry-run)  1 = fetch/HTTP/
- * playback failure (details on stderr)  2 = usage error (usage on stderr).
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
@@ -47,7 +27,7 @@ static void die(const char *msg)
 
 static void usage(FILE *out)
 {
-    /* Usage text doubles as the error message source, so keep it one screen. */
+
     fprintf(out,
         "Usage: voice say [--voice NAME] [--url URL] [--dry-run] TEXT...\n"
         "       voice [--voice NAME] [--url URL] [--dry-run] TEXT...\n"
@@ -76,7 +56,7 @@ static void usage_err(const char *msg)
     exit(2);
 }
 
-/* SIGALRM handler: a wedged connection must not hang a tool call forever. */
+
 static void on_timeout(int sig)
 {
     (void)sig;
@@ -85,7 +65,7 @@ static void on_timeout(int sig)
     _exit(1);
 }
 
-/* Growable byte buffer for the response / decoded body. */
+
 typedef struct { uint8_t *buf; size_t len, cap; } bodybuf_t;
 
 static bodybuf_t bodybuf_new(size_t hint)
@@ -111,8 +91,7 @@ static void bodybuf_put(bodybuf_t *b, const uint8_t *p, size_t n)
     b->len += n;
 }
 
-/* JSON string escaping: backslash and quote escaped; newlines become \n and
- * any other control character becomes \u00XX. Built by hand (no JSON dep). */
+
 static char *json_escape(const char *s)
 {
     size_t cap = strlen(s) * 4 + 16;
@@ -149,7 +128,7 @@ static char *json_escape(const char *s)
     return buf;
 }
 
-/* Minimal URL parsing: expectations are "http://host[:port][/path]". */
+
 typedef struct { char host[256]; int port; char path[512]; } url_part_t;
 
 static int parse_url(const char *url, url_part_t *out)
@@ -182,9 +161,7 @@ static int parse_url(const char *url, url_part_t *out)
     return out->host[0] ? 0 : -1;
 }
 
-/* Chunked-body decoder: "<hex>\r\n<data>\r\n" ... "0\r\n". Returns the malloc'd
- * decoded body (caller frees); on a broken stream the bytes decoded so far are
- * returned — a truncated wav header is present at the start either way. */
+
 static uint8_t *decode_chunked(const uint8_t *body, size_t body_len, size_t *out_len)
 {
     bodybuf_t out = bodybuf_new(body_len);
@@ -200,18 +177,18 @@ static uint8_t *decode_chunked(const uint8_t *body, size_t body_len, size_t *out
         char linebuf[64];
         memcpy(linebuf, cur, ll);
         linebuf[ll] = '\0';
-        char *semi = strchr(linebuf, ';'); /* chunk extensions are legal */
+        char *semi = strchr(linebuf, ';');
         if (semi) *semi = '\0';
         size_t l2 = strlen(linebuf);
         if (l2 > 0 && linebuf[l2 - 1] == '\r') linebuf[l2 - 1] = '\0';
         long n = strtol(linebuf, NULL, 16);
-        off += (size_t)(nl - cur) + 1;           /* -> start of chunk data */
-        if (n == 0) break;                       /* terminating chunk */
-        if ((size_t)n > body_len - off) break;   /* truncated chunk */
+        off += (size_t)(nl - cur) + 1;
+        if (n == 0) break;
+        if ((size_t)n > body_len - off) break;
         bodybuf_put(&out, (const uint8_t *)body + off, (size_t)n);
         off += (size_t)n;
         if (off + 1 < body_len && body[off] == '\r' && body[off + 1] == '\n')
-            off += 2;                            /* CRLF after chunk data */
+            off += 2;
         else
             off = body_len;
     }
@@ -219,7 +196,7 @@ static uint8_t *decode_chunked(const uint8_t *body, size_t body_len, size_t *out
     return out.buf;
 }
 
-/* Split raw response into status + decoded body. Returns 0 on success. */
+
 static int parse_response(const uint8_t *raw, size_t raw_len,
                           int *out_status, uint8_t **out_body, size_t *out_body_len)
 {
@@ -237,7 +214,7 @@ static int parse_response(const uint8_t *raw, size_t raw_len,
     memcpy(hdr, raw, hdr_len);
     hdr[hdr_len] = '\0';
 
-    /* Status line: first line, second whitespace-delimited token is the code. */
+
     int status = 0;
     char *nl = strstr(hdr, "\r\n");
     if (nl) {
@@ -252,7 +229,7 @@ static int parse_response(const uint8_t *raw, size_t raw_len,
         if (tok) status = atoi(tok);
     }
 
-    /* Header lines: content-length and transfer-encoding (case-insensitive). */
+
     long content_length = -1;
     int chunked = 0;
     char *hcpy = strdup(hdr);
@@ -296,8 +273,7 @@ static int parse_response(const uint8_t *raw, size_t raw_len,
     return 0;
 }
 
-/* Fetch: resolve, connect, write the request, read to EOF, parse.
- * Returns 0 on success; -1 on error (message on stderr). */
+
 static int fail(void)
 {
     alarm(0);
@@ -313,7 +289,7 @@ static int fetch(const char *url, const uint8_t *body, size_t body_len,
         return -1;
     }
 
-    /* Wrap the whole fetch (connect + send + recv) in the alarm timeout. */
+
     signal(SIGALRM, on_timeout);
     alarm(FETCH_TIMEOUT_SECS);
 
@@ -341,7 +317,7 @@ static int fetch(const char *url, const uint8_t *body, size_t body_len,
         return fail();
     }
 
-    /* Request: minimal HTTP/1.1 POST with Host + Connection: close. */
+
     char hdr[512];
     int hl = snprintf(hdr, sizeof(hdr),
                       "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
@@ -375,7 +351,7 @@ static int fetch(const char *url, const uint8_t *body, size_t body_len,
         boff += (size_t)n;
     }
 
-    /* Read to EOF (Connection: close means the server closes the socket). */
+
     bodybuf_t resp = bodybuf_new(64 * 1024);
     uint8_t chunk[4096];
     for (;;) {
@@ -383,7 +359,7 @@ static int fetch(const char *url, const uint8_t *body, size_t body_len,
         if (n > 0) { bodybuf_put(&resp, chunk, (size_t)n); continue; }
         if (n == 0) break;
         if (errno == EINTR) continue;
-        break; /* read error — bail with whatever we have */
+        break;
     }
     alarm(0);
     close(fd);
@@ -404,7 +380,7 @@ static int fetch(const char *url, const uint8_t *body, size_t body_len,
     return 0;
 }
 
-/* Write every byte of a buffer to fd (POSIX write may be short). Returns -1 on failure. */
+
 static int write_all(int fd, const uint8_t *buf, size_t len)
 {
     size_t off = 0;
@@ -418,22 +394,20 @@ static int write_all(int fd, const uint8_t *buf, size_t len)
 
 int main(int argc, char **argv)
 {
-    signal(SIGPIPE, SIG_IGN); /* a closed-by-the-server socket must not kill us */
+    signal(SIGPIPE, SIG_IGN);
 
-    /* Optional "say" subcommand — the shorthand form of this tool. */
+
     int i = 1;
     if (i < argc && strcmp(argv[i], "say") == 0) i++;
 
     const char *url = getenv("VOICE_TTS_URL");
-    /* Voice stays NULL when nobody named one: the request then carries no
-     * voice field at all and the SERVER's default preset speaks — hardcoding
-     * a fallback here would silently override the operator's choice. */
+
     const char *voice = getenv("VOICE_TTS_VOICE");
     if (!url || !*url) url = DEFAULT_URL;
     if (voice && !*voice) voice = NULL;
     int dry_run = 0;
 
-    /* Collect TEXT args; parse flags anywhere (before, between, after text). */
+
     size_t text_cap = 4096;
     char *text = malloc(text_cap);
     if (!text) die("out of memory");
@@ -478,7 +452,7 @@ int main(int argc, char **argv)
 
     if (!saw_text) usage_err("missing TEXT arguments");
 
-    /* Build the JSON request body (escaped). */
+
     char *esc_text = json_escape(text);
     char *esc_voice = voice ? json_escape(voice) : NULL;
     size_t jcap = strlen(esc_text) + (esc_voice ? strlen(esc_voice) : 0) + 80;
@@ -488,7 +462,7 @@ int main(int argc, char **argv)
         snprintf(jbody, jcap, "{\"text\":\"%s\",\"voice\":\"%s\",\"mode\":\"download\"}",
                  esc_text, esc_voice);
     } else {
-        /* No voice field: the server's own default_preset speaks. */
+
         snprintf(jbody, jcap, "{\"text\":\"%s\",\"mode\":\"download\"}", esc_text);
     }
 
@@ -502,8 +476,7 @@ int main(int argc, char **argv)
     free(jbody); free(text); free(esc_text); free(esc_voice);
 
     if (status < 200 || status >= 300 || wav_len == 0) {
-        /* Print status + a truncated body for debugging, never dump the whole
-         * thing (a server error message could be huge). */
+
         size_t show = wav_len < 200 ? wav_len : 200;
         fprintf(stderr, "voice: TTS endpoint returned HTTP %d", status);
         if (wav_len == 0) fprintf(stderr, " with an empty body");
@@ -521,7 +494,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Save wav (temp file, or voice-out.wav in dry-run mode). */
+
     if (dry_run) {
         int f = open("voice-out.wav", O_CREAT | O_WRONLY | O_TRUNC, 0600);
         if (f < 0) {
@@ -560,7 +533,7 @@ int main(int argc, char **argv)
     close(tf);
     free(wav);
 
-    /* execvp paplay and block until playback finishes. */
+
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "voice: fork failed\n");

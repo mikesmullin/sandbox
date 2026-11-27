@@ -1,13 +1,3 @@
-//! Orchestration create-payload validation — pure functions, zero I/O.
-//!
-//! Validation is deliberately polite: every bad field is reported in one
-//! response so AJCS can fix requests in a single round-trip.
-//!
-//! The Node original leaned on regular expressions. These are hand-written
-//! predicates instead — the patterns are small and character-classy, and
-//! spelling them out keeps a regex crate out of the dependency set while
-//! producing the same accept/reject decisions and the same messages.
-
 use serde_json::{Map, Value};
 
 use super::images::Kind;
@@ -18,41 +8,25 @@ pub const MAX_REPOS: usize = 20;
 pub const MAX_VOLUMES: usize = 16;
 const BACKREF_URL_MAX: usize = 2048;
 
-/// What a create payload becomes once accepted.
-///
-/// `image` and `devices` (PLAN55): a kind name resolves to a matrix row and its
-/// built reference; a free admin reference is used verbatim. `devices` is a
-/// list of podman `--device` specs for GPU passthrough.
 pub struct CreateInput {
-    /// Which row of the image matrix a kind-named payload selects, or the kind
-    /// (always `Headless` for a free admin reference) the record will classify.
     pub kind: Kind,
-    /// The actual image reference used to `container create`.
     pub image: String,
     pub repos: Vec<RepoEntry>,
     pub volumes: Vec<VolumeEntry>,
     pub cpus: Option<u64>,
     pub memory: Option<String>,
-    /// Container network connectivity (SBOX_PLAN1 §3.1). Default on; `false`
-    /// creates the sandbox with no network at all.
     pub network: bool,
-    /// Per-sandbox GPU device passthrough: podman `--device` specs
-    /// (e.g. `nvidia.com/gpu`). Empty = no device.
     pub devices: Vec<String>,
     pub backref: Option<Map<String, Value>>,
 }
 
-/// `{ code, message, details }` — the error envelope every AJCS route returns.
 pub struct ValidationError {
     pub code: &'static str,
     pub message: String,
     pub details: Value,
 }
 
-// ── field predicates ────────────────────────────────────────────────────────
 
-/// `^(?:[a-z][a-z0-9+.-]*://|[^@\s]+@[^\s:]+:)\S+$` — a URL with a scheme, or
-/// an scp-style `user@host:path`.
 fn is_repo_url(v: &str) -> bool {
     let t = v.trim();
     if t.is_empty() || t.len() > 2048 || t.chars().any(char::is_whitespace) {
@@ -68,7 +42,6 @@ fn is_repo_url(v: &str) -> bool {
         let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-');
         return first_ok && rest_ok && t.len() > idx + 3;
     }
-    // scp-style: <user>@<host>:<path>, where user has no '@' and host no ':'.
     if let Some(at) = t.find('@') {
         let (user, after) = (&t[..at], &t[at + 1..]);
         if user.is_empty() || user.contains('@') {
@@ -82,13 +55,11 @@ fn is_repo_url(v: &str) -> bool {
     false
 }
 
-/// A branch or tag: non-empty, no whitespace, no leading dash, max 200.
 fn is_git_ref(v: &str) -> bool {
     let t = v.trim();
     !t.is_empty() && !t.starts_with('-') && t.len() <= 200 && !t.chars().any(char::is_whitespace)
 }
 
-/// `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`
 fn is_volume_name(v: &str) -> bool {
     let mut chars = v.chars();
     let first = match chars.next() {
@@ -101,7 +72,6 @@ fn is_volume_name(v: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
-/// An absolute guest path without spaces or ':' (and not '/').
 fn is_mount_path(v: &str) -> bool {
     v.starts_with('/')
         && v.len() <= 256
@@ -109,10 +79,6 @@ fn is_mount_path(v: &str) -> bool {
         && !v.chars().any(|c| c.is_whitespace() || c == ':')
 }
 
-/// Host bind path (idea #22/RCA-1): must be ABSOLUTE (relative paths are the
-/// classic mistake), and must survive the comma-separated `--mount` format —
-/// so no whitespace, ':' or ','. '/' is rejected: binding the host root is
-/// never the intent and far too dangerous to accept by default.
 fn is_bind_path(v: &str) -> bool {
     v.starts_with('/')
         && v.len() <= 256
@@ -120,7 +86,6 @@ fn is_bind_path(v: &str) -> bool {
         && !v.chars().any(|c| c.is_whitespace() || c == ':' || c == ',')
 }
 
-/// `^[a-z][a-z0-9_-]*$`, max 32.
 fn is_backref_name(v: &str) -> bool {
     let mut chars = v.chars();
     let first = match chars.next() {
@@ -141,11 +106,9 @@ fn is_http_url(v: &str) -> bool {
         Some(r) => r,
         None => return false,
     };
-    // A URL needs an authority; `http://` alone is not one.
     !rest.is_empty() && !rest.starts_with('/') && !rest.chars().any(char::is_whitespace)
 }
 
-/// `^\d+(M|G)$`, converted to MiB.
 fn memory_mb(spec: &str) -> Option<u64> {
     let (digits, unit) = spec.split_at(spec.len().checked_sub(1)?);
     if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
@@ -159,7 +122,6 @@ fn memory_mb(spec: &str) -> Option<u64> {
     }
 }
 
-// ── entry checks ────────────────────────────────────────────────────────────
 
 fn unknown_fields(obj: &Map<String, Value>, allowed: &[&str]) -> Vec<String> {
     obj.keys()
@@ -249,9 +211,6 @@ fn check_volumes(raw: &Value, problems: &mut Vec<String>) -> Vec<VolumeEntry> {
                 continue;
             }
         };
-        // The field set is resolved PER ENTRY: an entry without `type` is a
-        // named volume, and a stray `path` on it is reported as an unknown
-        // field rather than silently guessing a bind.
         let kind_text = obj.get("type");
         let is_bind = kind_text.and_then(Value::as_str) == Some("bind");
         let allowed: &[&str] = if is_bind {
@@ -323,9 +282,6 @@ fn check_volumes(raw: &Value, problems: &mut Vec<String>) -> Vec<VolumeEntry> {
     out
 }
 
-/// Duplicate-mount rejection across ALL volume entries — named AND bind
-/// (`container create` fails duplicate attachments regardless of kind).
-/// Duplicate NAMES stay a volume-only rule (binds have no name).
 fn check_volume_uniqueness(volumes: &[VolumeEntry], problems: &mut Vec<String>) {
     let mut by_mount: Vec<(&str, usize)> = Vec::new();
     let mut by_name: Vec<(&str, usize)> = Vec::new();
@@ -349,7 +305,6 @@ fn check_volume_uniqueness(volumes: &[VolumeEntry], problems: &mut Vec<String>) 
     }
 }
 
-/// Optional resources block: `{ cpus, memory }` — reported per-field.
 fn check_resources(body: &Map<String, Value>, problems: &mut Vec<String>) -> (Option<u64>, Option<String>) {
     let raw = match body.get("resources") {
         None | Some(Value::Null) => return (None, None),
@@ -402,9 +357,6 @@ fn check_resources(body: &Map<String, Value>, problems: &mut Vec<String>) -> (Op
     (cpus, memory)
 }
 
-/// Caller-owned `backref` (the AJCS-side run pointer): opaque to this plane —
-/// validated for shape, stored verbatim, echoed verbatim, never acted on.
-/// Every field is required; anything else inside the object is rejected.
 fn check_backref(raw: &Value, problems: &mut Vec<String>) -> Option<Map<String, Value>> {
     let obj = match raw.as_object() {
         Some(o) => o,
@@ -448,7 +400,6 @@ fn check_backref(raw: &Value, problems: &mut Vec<String>) -> Option<Map<String, 
     }
 }
 
-/// Validate a create payload.
 pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
     let obj = match body.as_object() {
         Some(o) => o.clone(),
@@ -465,10 +416,6 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
     }
 
     let mut problems: Vec<String> = Vec::new();
-    // `image` names the sandbox's image. A kind name (headed|headless) still
-    // selects a row of the host-built matrix; any other well-formed local
-    // reference (sbox-video:latest) is an admin-built image chat names, and
-    // is used verbatim (it classifies headless — see images::Kind::parse_ref).
     let (kind, image_ref) = match obj.get("image") {
         None | Some(Value::Null) => (Kind::default(), Kind::default().image()),
         Some(Value::String(s)) => match Kind::parse_ref(s) {
@@ -493,18 +440,6 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
     };
     check_volume_uniqueness(&volumes, &mut problems);
     let (cpus, memory) = check_resources(&obj, &mut problems);
-    // `network: false` is accepted as a field but refused as a value, on
-    // purpose. Disabling the container network also disables PUBLISHED PORTS
-    // (verified: `--network none` + `-p` yields no listener), and the agent
-    // plane — execd, and spacesd on a headed box — is reached exactly through
-    // a published port. A no-network sandbox created this way is not isolated,
-    // it is unreachable: it would boot fine and then time out at readiness.
-    //
-    // The real implementation is execd's stdio transport (0.2,
-    // docs/execd-contract.md): drive the guest over `container exec` instead
-    // of TCP, and the network becomes genuinely optional. Until the driver
-    // speaks that transport, refusing is better than handing back a sandbox
-    // that looks created and answers nothing.
     let network = match obj.get("network") {
         None | Some(Value::Null) | Some(Value::Bool(true)) => true,
         Some(Value::Bool(false)) => {
@@ -521,10 +456,6 @@ pub fn validate_create(body: &Value) -> Result<CreateInput, ValidationError> {
             true
         }
     };
-    // PLAN55 D8/D12: optional `devices` array of podman `--device` specs for
-    // GPU passthrough (e.g. `nvidia.com/gpu`). Each entry must be a non-empty
-    // string without whitespace or commas (the CLI separates args on whitespace
-    // and commas break the `--mount`-style field).
     let devices = match obj.get("devices") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) if let Some(arr) = v.as_array() => arr

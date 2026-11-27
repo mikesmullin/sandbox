@@ -1,18 +1,3 @@
-//! Container CLI port — one `run()` entry, two backends.
-//!
-//! The codebase speaks ONE dialect: Apple Containers' `container` argv
-//! (`ls`, `inspect <id>`, `create -p h:g -c N -m MEM --name ID -e K=V IMAGE`,
-//! `start|stop|rm <id>`, `volume create <name>`, `exec [-u u] [-e K=V] <id> …`).
-//! On macOS that argv is handed to the real CLI untouched. On Linux there is no
-//! `container` binary, so this module translates the same argv to podman/docker
-//! and translates the OUTPUT BACK into the Apple shapes the callers parse
-//! (`ls` table columns; `inspect` → `[{ status.state, configuration.publishedPorts }]`).
-//!
-//! Translating at the argv boundary — rather than teaching every call site about
-//! two runtimes — is what keeps the rest of this crate runtime-agnostic.
-//!
-//! Override detection with `SANDBOX_RUNTIME=container|podman|docker`.
-
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -20,13 +5,9 @@ use std::sync::OnceLock;
 use serde_json::Value;
 use tokio::process::Command;
 
-/// Columns the `ls` parsers index into (0=id, 1=image, 4=state, 5=addr),
-/// padded to the 9 fields the parser requires before it accepts a row.
 const LS_HEADER: [&str; 9] = [
     "ID", "IMAGE", "OS", "ARCH", "STATE", "ADDR", "CPUS", "MEMORY", "CREATED",
 ];
-/// Placeholder for a column this runtime does not report — never empty, or the
-/// whitespace split would shift every column after it.
 const NONE: &str = "-";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +24,6 @@ pub struct Runtime {
 
 static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
 
-/// Resolve the container runtime once per process.
 pub fn runtime() -> Result<&'static Runtime, String> {
     let found = RUNTIME.get_or_init(|| {
         let forced = std::env::var("SANDBOX_RUNTIME").ok();
@@ -89,7 +69,6 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// What a CLI invocation produced.
 #[derive(Clone, Debug, Default)]
 pub struct Output {
     pub stdout: String,
@@ -102,7 +81,6 @@ impl Output {
         self.exit_code != 0
     }
 
-    /// The message to surface for a failure: stderr if there is any, else stdout.
     pub fn message(&self) -> &str {
         if self.stderr.is_empty() {
             &self.stdout
@@ -112,7 +90,6 @@ impl Output {
     }
 }
 
-/// Run one container-CLI command in the Apple `container` dialect.
 pub async fn run(argv: &[String]) -> Result<Output, String> {
     let rt = runtime()?;
     match rt.kind {
@@ -121,13 +98,11 @@ pub async fn run(argv: &[String]) -> Result<Output, String> {
     }
 }
 
-/// Convenience for the many call sites that build argv from &str literals.
 pub async fn run_str(argv: &[&str]) -> Result<Output, String> {
     let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     run(&owned).await
 }
 
-/// Dispatch one Apple-dialect argv onto podman/docker.
 async fn run_oci(bin: &str, argv: &[String]) -> Result<Output, String> {
     let verb = argv.first().map(String::as_str).unwrap_or("");
     match verb {
@@ -138,14 +113,10 @@ async fn run_oci(bin: &str, argv: &[String]) -> Result<Output, String> {
             args.extend(translate_create(&argv[1..]));
             spawn(bin, &args).await
         }
-        // start / stop / rm / exec / volume create: argv is already compatible.
         _ => spawn(bin, argv).await,
     }
 }
 
-/// `container ls` → `podman ps --format json`, re-emitted as the Apple table.
-/// Both runtimes list only RUNNING containers by default, which the reconciler
-/// relies on (it tells "stopped" from "deleted" with a follow-up inspect).
 async fn oci_ls(bin: &str, rest: &[String]) -> Result<Output, String> {
     let mut args = vec!["ps".to_string(), "--format".to_string(), "json".to_string()];
     args.extend_from_slice(rest);
@@ -170,8 +141,6 @@ async fn oci_ls(bin: &str, rest: &[String]) -> Result<Output, String> {
 
     let mut lines = vec![LS_HEADER.join("  ")];
     for row in rows {
-        // The app addresses containers by the --name it created them with;
-        // podman's own 64-hex Id would match nothing in the store.
         let id = row
             .get("Names")
             .and_then(|n| n.get(0))
@@ -188,7 +157,7 @@ async fn oci_ls(bin: &str, rest: &[String]) -> Result<Output, String> {
                 "linux",
                 NONE,
                 state,
-                NONE, // rootless podman gives the container no host-visible address
+                NONE,
                 NONE,
                 NONE,
                 NONE,
@@ -203,8 +172,6 @@ async fn oci_ls(bin: &str, rest: &[String]) -> Result<Output, String> {
     })
 }
 
-/// `container inspect <id>` → `podman inspect <id>`, reshaped to the two fields
-/// the callers read: `[0].status.state` and `[0].configuration.publishedPorts`.
 async fn oci_inspect(bin: &str, rest: &[String]) -> Result<Output, String> {
     let mut args = vec!["inspect".to_string()];
     args.extend_from_slice(rest);
@@ -250,10 +217,6 @@ async fn oci_inspect(bin: &str, rest: &[String]) -> Result<Output, String> {
     })
 }
 
-/// `HostConfig.PortBindings` (`{"3211/tcp":[{HostIp,HostPort}]}`) → Apple's
-/// `publishedPorts` (`[{containerPort,hostPort,proto}]`). HostConfig is used
-/// rather than NetworkSettings because it is populated for a CREATED container
-/// too, not only a running one.
 fn published_ports(doc: &Value) -> Vec<Value> {
     let bindings = doc
         .pointer("/HostConfig/PortBindings")
@@ -290,10 +253,6 @@ fn published_ports(doc: &Value) -> Vec<Value> {
     out
 }
 
-/// podman reports a locally built image as `localhost/<name>:<tag>`; the app
-/// filters on the bare `<name>:<tag>` it was configured with (SANDBOX_IMAGE),
-/// so strip the implicit local registry. A reference the caller fully qualified
-/// is left alone.
 fn normalize_image(reference: Option<&str>) -> String {
     match reference {
         None | Some("") => NONE.to_string(),
@@ -301,12 +260,6 @@ fn normalize_image(reference: Option<&str>) -> String {
     }
 }
 
-/// Apple `create` flags → podman/docker `create` flags.
-///   `-c N`   → `--cpus N`         (podman's `-c` is cpu-shares, a different knob)
-///   `-p h:g` → `-p 127.0.0.1:h:g` (Apple publishes on host loopback ONLY; the
-///                                  app assumes 127.0.0.1 reachability and
-///                                  nothing should be exposed on 0.0.0.0)
-/// `-m`, `-e`, `-v`, `--mount`, `--name` and the image pass through unchanged.
 fn translate_create(rest: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(rest.len());
     let mut i = 0;
@@ -328,7 +281,6 @@ fn translate_create(rest: &[String]) -> Vec<String> {
     out
 }
 
-/// `8080:3211[/udp]` → `127.0.0.1:8080:3211[/udp]`; an explicit host IP wins.
 fn loopback_publish(spec: &str) -> String {
     let mut parts = spec.splitn(2, ':');
     let host = parts.next().unwrap_or("");
@@ -345,7 +297,6 @@ fn loopback_publish(spec: &str) -> String {
     }
 }
 
-/// Spawn a CLI and capture its output.
 async fn spawn(bin: &str, args: &[String]) -> Result<Output, String> {
     let out = Command::new(bin)
         .args(args)

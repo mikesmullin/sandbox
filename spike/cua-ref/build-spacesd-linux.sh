@@ -1,33 +1,4 @@
 #!/usr/bin/env bash
-# Build cua-spacesd for Linux inside Docker and stage it where the image
-# build expects it: libs/images/linux/dist/<arch>/cua-spacesd.
-#
-#   build-spacesd-linux.sh [arm64|amd64 ...]     (default: host arch)
-#
-# Builds in rust:1-bookworm (glibc 2.36, so the binary runs on Ubuntu 24.04's
-# 2.39 and older distros too). The repo root is mounted read-only because
-# libs/cua-spacesd path-depends on libs/cua-driver/rust crates; cargo's
-# registry and target dir live in named Docker volumes, not the macOS mount.
-#
-# Native arch builds directly. A foreign arch is built with either
-#   CROSS_MODE=cross    (default) Debian multiarch cross toolchain + :<arch> -dev libs
-#   CROSS_MODE=emulate  the rust image for that platform under binfmt (Rosetta/qemu)
-#
-# Env overrides:
-#   CUA_SPACESD_PACKAGE  cargo package   (default cua-spacesd)
-#   CUA_SPACESD_BIN      binary name     (default cua-spacesd)
-#   CUA_SPACESD_FEATURES extra --features
-#   RUST_IMAGE              default rust:1-bookworm
-#   CUA_SPACESD_GIT_SHA  source revision baked into the binary (default: git
-#                       HEAD of this checkout; reported by `build-info` and
-#                       the doctor)
-#   CUA_SPACESD_TARGET_VOLUME  cargo target volume name prefix (default
-#                           cua-e2e-spacesd-target); give each worktree its
-#                           own, since concurrent builds of different sources
-#                           in one target dir mix their artifacts
-#   CUA_BUILD_CORP_CA          optional path to a corp CA bundle to trust (work
-#                            VPN TLS interception). Never committed; unset means
-#                            the default public bundle only.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
@@ -40,9 +11,6 @@ host_arch() { case "$(uname -m)" in arm64|aarch64) echo arm64 ;; *) echo amd64 ;
 CORP_CA="${CUA_BUILD_CORP_CA:-}"
 [ $# -gt 0 ] || set -- "$(host_arch)"
 
-# Build dependencies of cua-spacesd + the cua-driver platform-linux crates
-# (same set as .github/workflows/cd-rust-cua-driver.yml / ci-rust-linux.yml),
-# plus protoc for tonic codegen and a C++ toolchain for openh264-sys2.
 DEV_LIBS="libx11-dev libxi-dev libxtst-dev libxext-dev libxkbcommon-dev libdbus-1-dev libwayland-dev libxcb1-dev"
 TOOLS="clang pkg-config cmake nasm protobuf-compiler libprotobuf-dev perl make"
 
@@ -94,9 +62,6 @@ for arch in "$@"; do
         "$RUST_IMAGE" bash -euo pipefail -c "
             { $setup; } || { echo 'toolchain setup failed' >&2; exit 1; }
             $cargo_env
-            # Optional corp CA (work-VPN TLS MITM). Bound only when the
-            # user points at a local bundle (CUA_BUILD_CORP_CA); never
-            # committed and never named. Absent = plain public bundle.
             if [ -f /tmp/corp-ca.crt ]; then
               cat /tmp/corp-ca.crt >> /etc/ssl/certs/ca-certificates.crt
               export CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt

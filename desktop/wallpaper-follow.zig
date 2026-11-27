@@ -1,18 +1,14 @@
 const std = @import("std");
 
 const poll_interval = std.Io.Duration.fromMilliseconds(50);
-const stable_polls_initial: u8 = 1;   // 1 poll after first change → ~50ms immediate
-const stable_polls_repeat: u8 = 20;   // 20 polls × 50ms = 1000ms debounce
+const stable_polls_initial: u8 = 1;
+const stable_polls_repeat: u8 = 20;
 
-// Profiling toggle: set WALLFOLLOW_PROFILE=1 to enable timing logs.
-// Default is off for production. Enable to profile xdotool/feh latency.
 var profiling_enabled: bool = false;
 fn enableProfiling() bool {
     return profiling_enabled;
 }
 
-// Microsecond timer via Linux clock_gettime(CLOCK_MONOTONIC).
-// Bypasses std.time which is just constants on 0.18-dev.
 fn nowMicros() u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(
@@ -176,7 +172,6 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    // Check WALLFOLLOW_PROFILE env var for profiling
     const profile_val = init.environ_map.get("WALLFOLLOW_PROFILE");
     if (std.mem.eql(u8, profile_val orelse "", "1") or
         std.mem.eql(u8, profile_val orelse "", "true"))
@@ -185,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var args = init.minimal.args.iterate();
-    _ = args.next(); // skip argv[0]
+    _ = args.next();
 
     const wallpaper =
         args.next() orelse
@@ -227,7 +222,6 @@ pub fn main(init: std.process.Init) !void {
             total_xdotool_us += loop_total_us;
             xdotool_count += 1;
 
-            // Report timing stats every 100 polls
             if (xdotool_count % 100 == 0) {
                 const avg = total_xdotool_us / xdotool_count;
                 std.log.info(

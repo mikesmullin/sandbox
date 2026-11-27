@@ -1,45 +1,7 @@
 #!/bin/sh
-# chromium wrapper — the ONLY reliable injection point (the cua-driver resolves
-# the browser itself and bypasses PATH wrappers; every launch path — the
-# driver's own launches, launch_app/.desktop, the openbox menu, agent exec —
-# converges here).
-#
-# Layer 1 — GPU/shm survival (the original wrapper's job):
-#   --disable-gpu            ANGLE-Vulkan hard-aborts in the container (the
-#                            process is a zombie in <1s without it).
-#   --disable-dev-shm-usage  /dev/shm is a 64MB tmpfs in these guests; a
-#                            second windowed chromium dies for lack of shared
-#                            memory without it.
-#
-# Layer 2 — DEFERRED WARMUP (Mike, 2026-10-14): the boot-time prewarm retired
-# (RAM/shm saved for browser-less jobs); the warmup rides the FIRST `chromium`
-# invocation instead. Deterministic by construction — no recipe burden: any
-# plain launch produces a driver-attachable, theme-correct browser.
-#   --remote-debugging-port=0      → DevToolsActivePort: consent-free CDP
-#                                    discovery for the cua-driver.
-#   --force-renderer-accessibility → the COMPLETE AT-SPI tree (existing-profile
-#                                    attach requires it on Linux).
-#   --no-sandbox                   → no user namespaces under Apple Containers.
-#   the no-first-run flag set      → no first-run noise on any launch path.
-#   --start-maximized              → the prewarm's window posture.
-#   the BAKED profile              → the black-theme extension + tuned
-#                                    placement (no --user-data-dir passed =
-#                                    the default profile ~/.config/chromium).
-#   + stale-artifact cleanup       → a reused named profile carries rot:
-#                                    SingletonLock/DevToolsActivePort left by a
-#                                    dead instance poison the next launch
-#                                    (browser_endpoint_owner_mismatch).
-#                                    Cleaned when no LIVE chromium holds them;
-#                                    a live instance just gains a new window.
-# The DRIVER's own launches pass --user-data-dir (their isolated lease, the
-# verified 806ms prepare→discover→bind path) — respected UNTOUCHED: only the
-# unconditional survival flags apply, nothing is injected, no profile is
-# cleaned. The boot-time prewarm (CUA_PREWARM_BROWSER=1) still exists and now
-# also rides this wrapper (its explicit flags are seen → nothing doubled).
 
 REAL=/usr/lib/chromium/chromium.real
 
-# ── scan the caller's flags — inject only what is missing ──────────────────
 seen_cdp=0; seen_a11y=0; seen_nosandbox=0; seen_nofirstrun=0; seen_nodbcheck=0
 seen_nosearch=0; seen_nocrashbubble=0; seen_maximized=0; seen_udd=0
 for a in "$@"; do
@@ -56,23 +18,10 @@ for a in "$@"; do
   esac
 done
 
-# ── unconditional survival flags (both layers, every launch) ───────────────
-# --enable-unsafe-swiftshader: with --disable-gpu, Chromium 128+ refuses
-# software WebGL unless this flag opts back in — THREE.js games (the
-# arcade's darkmarch) drew a flat "WEBGL" error without it. Software GL is
-# the honest posture here: ANGLE-Vulkan hard-aborts in the container.
-# The debugging port stays DYNAMIC (`=0`): Chromium 158 writes its
-# DevToolsActivePort discovery file only for a dynamic port, and the
-# cua-driver's prepare discovers the endpoint from exactly that file.
 set -- --disable-gpu --enable-unsafe-swiftshader --disable-dev-shm-usage "$@"
 
 if [ "$seen_udd" = "0" ]; then
-  # ── deferred warmup: plain launches (the baked profile) ──────────────────
   PROFILE_DIR="${HOME:-/home/desktop}/.config/chromium"
-  # Profile-rot cleanup: a dead instance's Singleton lock (a symlink whose
-  # target ends in the pid) + a stale DevToolsActivePort poison the next
-  # launch. A LIVE instance is left alone (its launch opens a new window in
-  # the existing process — chromium's normal singleton behavior).
   if [ -L "$PROFILE_DIR/SingletonLock" ]; then
     target=$(readlink "$PROFILE_DIR/SingletonLock" 2>/dev/null) || target=''
     pid=${target##*-}
@@ -88,7 +37,6 @@ if [ "$seen_udd" = "0" ]; then
     rm -f "$PROFILE_DIR/DevToolsActivePort" 2>/dev/null
   fi
 
-  # The warmup flag set — the prewarm's exact set, missing-only.
   [ "$seen_nosandbox" = "0" ]       && set -- --no-sandbox "$@"
   [ "$seen_nofirstrun" = "0" ]      && set -- --no-first-run "$@"
   [ "$seen_nodbcheck" = "0" ]       && set -- --no-default-browser-check "$@"

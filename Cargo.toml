@@ -10,18 +10,11 @@ description = "sbox B-SIDE — the headless backend: container orchestration, th
 name = "sbox-b"
 path = "src/main.rs"
 
-# The LAN gateway: exposes only POST /mcp, so the backend's REST surface can
-# stay on loopback. Separate binary because it is a separate trust boundary.
 [[bin]]
 name = "sbox-lan"
 path = "src/bin/sbox-lan.rs"
 
 [dependencies]
-# Everything this process talks to is loopback HTTP (podman's CLI, spacesd on
-# 127.0.0.1, execd in the guest), so there is no TLS and no need for a full
-# HTTP client stack — src/http/client.rs is ~200 lines against tokio directly.
-# Same reasoning as brain's `serve.rs`, which hand-rolls its server on tokio
-# rather than pulling hyper/axum.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "process", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

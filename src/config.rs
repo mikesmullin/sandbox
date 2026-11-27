@@ -1,13 +1,3 @@
-//! App-config loader.
-//!
-//! Reads `config.yaml` (a small YAML subset — nested `key: value` mappings,
-//! `#` comments, and simple scalars) at startup and exposes it as JSON. The
-//! SPA gets it via `GET /api/config`.
-//!
-//! The subset is deliberate, and ported rather than replaced by a real YAML
-//! crate: the file it reads is a handful of nested scalars, and matching the
-//! Node parser's exact behaviour keeps an existing config.yaml working.
-
 use std::sync::OnceLock;
 
 use serde_json::{Map, Value};
@@ -21,7 +11,6 @@ fn config_path() -> std::path::PathBuf {
     util::project_root().join("config.yaml")
 }
 
-/// Coerce a YAML scalar string to a JSON value.
 fn scalar(s: &str) -> Value {
     let t = s.trim();
     if t.is_empty() || t == "null" || t == "Null" || t == "NULL" {
@@ -70,7 +59,6 @@ fn is_float(t: &str) -> bool {
     }
 }
 
-/// Strip a trailing comment from a line (respecting quotes).
 fn strip_comment(s: &str) -> &str {
     let bytes = s.as_bytes();
     let mut quote: Option<u8> = None;
@@ -87,14 +75,12 @@ fn strip_comment(s: &str) -> &str {
     s
 }
 
-/// Parse a YAML subset: nested mappings, comments, simple scalars.
 pub fn parse_yaml(text: &str) -> Value {
     let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
     let mut pos = 0usize;
     Value::Object(parse_map(&lines, &mut pos, -1))
 }
 
-/// Parse a mapping whose keys live at an indent strictly greater than `indent`.
 fn parse_map(lines: &[&str], pos: &mut usize, indent: i32) -> Map<String, Value> {
     let mut obj = Map::new();
     loop {
@@ -109,7 +95,7 @@ fn parse_map(lines: &[&str], pos: &mut usize, indent: i32) -> Map<String, Value>
             continue;
         }
         if line_pad < indent + 1 {
-            break; // de-indent => parent block
+            break;
         }
         let (key, val) = match split_key(&raw) {
             Some(parts) => parts,
@@ -129,7 +115,6 @@ fn parse_map(lines: &[&str], pos: &mut usize, indent: i32) -> Map<String, Value>
     obj
 }
 
-/// `key: value` where key matches `[A-Za-z_$][A-Za-z0-9_$-]*`.
 fn split_key(raw: &str) -> Option<(String, String)> {
     let colon = raw.find(':')?;
     let key = raw[..colon].trim();

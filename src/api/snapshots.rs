@@ -1,10 +1,3 @@
-//! Snapshot and thumbnail service.
-//!
-//! Capture runs ImageMagick's `import` inside the guest through the container
-//! CLI. The desktop image does not ship ImageMagick today, so this is a
-//! best-effort path: a failure answers `None` and the route turns that into a
-//! 501, exactly as the Node version did.
-
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -26,11 +19,6 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
-/// Capture a snapshot (screenshot) of a container's desktop.
-///
-/// Unlike every other CLI call this one wants BINARY stdout, so it spawns the
-/// runtime binary directly rather than going through `container_cli::run`,
-/// which trims and lossily decodes output as UTF-8.
 pub async fn capture_snapshot(container_id: &str) -> Option<Value> {
     let rt = cli::runtime().ok()?;
     let out = tokio::time::timeout(
@@ -61,7 +49,6 @@ pub async fn capture_snapshot(container_id: &str) -> Option<Value> {
     }))
 }
 
-/// Read the most recent snapshot for a container.
 pub fn read_snapshot(container_id: &str) -> Result<Vec<u8>, String> {
     let latest = list_snapshots(container_id)
         .into_iter()
@@ -70,7 +57,6 @@ pub fn read_snapshot(container_id: &str) -> Result<Vec<u8>, String> {
     std::fs::read(&latest).map_err(|e| format!("{e}"))
 }
 
-/// Snapshots for a container, newest first.
 fn list_snapshots(container_id: &str) -> Vec<PathBuf> {
     let prefix = format!("{container_id}-");
     let mut files: Vec<PathBuf> = match std::fs::read_dir(snap_dir()) {
@@ -86,13 +72,11 @@ fn list_snapshots(container_id: &str) -> Vec<PathBuf> {
             .collect(),
         Err(_) => return Vec::new(),
     };
-    // Names carry a millisecond stamp, so a reverse lexical sort is newest-first.
     files.sort();
     files.reverse();
     files
 }
 
-/// The URL the SPA uses for a container's thumbnail.
 pub fn thumb_url(container_id: &str) -> String {
     format!(
         "/api/snapshots/{}/thumb",

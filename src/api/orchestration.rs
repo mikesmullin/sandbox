@@ -1,23 +1,3 @@
-//! sbox orchestration API — machine-facing lifecycle for AJCS (job controller).
-//!
-//!   POST   /api/orchestration/sandboxes       create + boot (async: 202, then poll)
-//!   GET    /api/orchestration/sandboxes       list tracked sandboxes (no tokens)
-//!   GET    /api/orchestration/sandboxes/:id   detail (includes per-sandbox token)
-//!   DELETE /api/orchestration/sandboxes/:id   stop + delete (named volumes persist;
-//!                                             host bind paths never touched)
-//!   GET    /api/orchestration/healthz         service health
-//!
-//! Reuses the `containers` primitives (CLI runner, HMAC token scheme, image
-//! name); create mirrors `create_container` plus volume binds, clones and
-//! readiness. Volumes are typed (named | host-path bind — idea #22/RCA-1).
-//! Contract: docs/orchestration-contract.md.
-//!
-//! State lives in one `Mutex<Store>` rather than the Node version's module
-//! globals: the record map, the in-flight set and the readiness stamps are
-//! mutated from request handlers and from background pipeline tasks at the
-//! same time, so they are one lock, taken briefly and never held across an
-//! await.
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -34,36 +14,22 @@ use super::orchestration_volumes::{
 use crate::http::{Request, Response};
 use crate::util;
 
-/// Once confirmed-up, trust the probe this long without re-fetching.
 const READY_TTL: Duration = Duration::from_secs(30);
-/// Boot deadline before the pipeline gives up (state → error).
 const BOOT_DEADLINE: Duration = Duration::from_secs(120);
 const BOOT_POLL: Duration = Duration::from_millis(500);
-/// `container start` returns before init accepts execs — retry briefly.
 const EXEC_RETRIES: u32 = 3;
-/// A guest exec (git clone being the long pole) must never wedge the pipeline.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(180);
 const EXEC_RETRY: Duration = Duration::from_secs(1);
-/// DELETE join timeout before force-cleaning a wedged pipeline.
 const PIPELINE_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TRANSITIONS: usize = 50;
 
-// ── shared state ────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct Store {
-    /// id → record. Ordered so list output is stable across reads.
     records: BTreeMap<String, Record>,
-    /// ids with a live background pipeline (create→start→clone→ready).
     in_flight: HashSet<String>,
-    /// ids a DELETE has asked to stand down.
     aborted: HashSet<String>,
-    /// id → last confirmed-good readiness probe.
     known_good: HashMap<String, Instant>,
-    /// The ACTIVE sandbox: the one `read`/`write`/`bash`/`screenshot` act on
-    /// when the caller names none (SBOX_PLAN1 §3.1). Global and persisted, not
-    /// per-connection, so every harness that attaches sees the same cursor —
-    /// which is the point: the operator watches one box, not one per client.
     active_id: Option<String>,
     loaded: bool,
 }
@@ -73,8 +39,6 @@ fn store() -> &'static Mutex<Store> {
     STORE.get_or_init(|| Mutex::new(Store::default()))
 }
 
-/// Load the persisted records once per process. A missing or corrupt file
-/// reads as empty — the CLI reconcile re-derives container state anyway.
 fn ensure_loaded(st: &mut Store) {
     if st.loaded {
         return;
@@ -122,8 +86,6 @@ fn save(st: &Store) {
     }
 }
 
-/// Apply a state transition and persist. Takes the lock itself, so callers
-/// must not already hold it.
 fn set_state(id: &str, state: &str, error: Option<Value>) {
     let mut st = store().lock().unwrap();
     ensure_loaded(&mut st);
@@ -154,9 +116,7 @@ fn is_aborted(id: &str) -> bool {
     store().lock().unwrap().aborted.contains(id)
 }
 
-// ── the active sandbox ──────────────────────────────────────────────────────
 
-/// The active sandbox id, if one is set and still tracked.
 pub fn active_id() -> Option<String> {
     let mut st = store().lock().unwrap();
     ensure_loaded(&mut st);
@@ -165,8 +125,6 @@ pub fn active_id() -> Option<String> {
         .filter(|id| st.records.contains_key(id))
 }
 
-/// Point the cursor at a sandbox. Errors when the id is not tracked, so
-/// `sandbox_use` of a typo is a refusal rather than a silent dead cursor.
 pub fn set_active(id: &str) -> Result<(), String> {
     let mut st = store().lock().unwrap();
     ensure_loaded(&mut st);
@@ -178,21 +136,14 @@ pub fn set_active(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Drop the cursor if it points at `id` — called on delete so the next tool
-/// call says "no active sandbox" instead of dialling a container that is gone.
 fn clear_active_if(st: &mut Store, id: &str) {
     if st.active_id.as_deref() == Some(id) {
         st.active_id = None;
     }
 }
 
-// ── readiness ───────────────────────────────────────────────────────────────
 
-/// Same readiness probe as `containers`: spacesd `/health` → 2xx once serving;
-/// `/mcp` lives behind the same port.
 async fn is_serving(record: &Record) -> bool {
-    // A headless sandbox has no spacesd: its readiness is execd's /healthz on
-    // the exec port, so probing mcp_port would simply never answer.
     let port = if record.kind.has_desktop() {
         record.mcp_port
     } else {
@@ -219,9 +170,7 @@ async fn is_serving(record: &Record) -> bool {
     serving
 }
 
-// ── response shapes ─────────────────────────────────────────────────────────
 
-/// List item. The token is deliberately omitted — detail endpoint only.
 fn to_list_item(record: &Record) -> Value {
     let repos: Vec<Value> = record
         .repos
@@ -243,21 +192,13 @@ fn to_list_item(record: &Record) -> Value {
         "mcpPort": if record.kind.has_desktop() { json!(record.mcp_port) } else { Value::Null },
         "quicPort": if record.kind.has_desktop() { json!(record.quic_port) } else { Value::Null },
         "mcpUrl": if record.kind.has_desktop() { port_url(record.mcp_port) } else { Value::Null },
-        // pre-execd records have no exec surface
         "execPort": if record.exec_port == 0 { Value::Null } else { json!(record.exec_port) },
         "execUrl": port_url(record.exec_port),
-        // image is the actual reference (a matrix row for built boxes, or a
-        // free admin reference such as sbox-video:latest). Chat's sandboxes
-        // menu (PLAN55 D6) groups live sandboxes by it.
         "image": record.image.clone(),
         "repos": repos,
-        // Volumes ride list items too (RCA-1): bind entries must be visible
-        // without a detail round-trip — additive, contract §15.
         "volumes": record.volumes.iter().map(to_volume_detail).collect::<Vec<_>>(),
         "createdAt": record.created_at,
     });
-    // Caller-owned backref rides list items too (non-secret label, verbatim);
-    // the key is absent entirely when the record carries none.
     if let Some(b) = &record.backref {
         out["backref"] = Value::Object(b.clone());
     }
@@ -277,7 +218,6 @@ fn to_detail(record: &Record) -> Value {
     out["image"] = json!(record.image);
     out["cpus"] = json!(record.cpus);
     out["memory"] = json!(record.memory);
-    // Authorization: Bearer <token> on the data plane.
     out["token"] = json!(container_token(&record.id));
     out["transitions"] = serde_json::to_value(&record.transitions).unwrap_or(Value::Null);
     out["updatedAt"] = json!(record.updated_at);
@@ -285,10 +225,7 @@ fn to_detail(record: &Record) -> Value {
     out
 }
 
-// ── reconcile (the CLI is the source of truth for existence/state) ──────────
 
-/// `container ls` for reconciliation; `None` on CLI outage so callers serve
-/// last-known state instead of pruning records on a failed lookup.
 async fn safe_rows() -> Option<Vec<containers::Row>> {
     match containers::list_containers().await {
         Ok(rows) => Some(rows),
@@ -310,11 +247,8 @@ async fn inspect_state(id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Reconcile one record against an `ls` snapshot. Returns `None` when the
-/// record was pruned (its container vanished externally).
 async fn reconcile_row(record: &Record, rows: Option<&Vec<containers::Row>>) -> Option<Record> {
     let rows = match rows {
-        // CLI outage → last-known state; never prune on a failed lookup.
         None => return Some(record.clone()),
         Some(r) => r,
     };
@@ -324,19 +258,16 @@ async fn reconcile_row(record: &Record, rows: Option<&Vec<containers::Row>>) -> 
     if row.map(|r| r.state.as_str()) == Some("running") {
         if is_serving(record).await {
             if record.state != "ready" {
-                // also heals 'error' after a late boot
                 set_state(&record.id, "ready", None);
             }
         } else if record.state != "starting" {
-            // running but not serving yet (booting, or the daemon died)
             set_state(&record.id, "starting", None);
         }
         return get_record(&record.id);
     }
 
-    // `container ls` omits stopped containers — inspect tells stopped from deleted.
     match inspect_state(&record.id).await.as_deref() {
-        Some("running") => return get_record(&record.id), // ls/inspect race — trust the next read
+        Some("running") => return get_record(&record.id),
         Some("stopped") | Some("exited") | Some("created") => {
             if record.state != "stopped" {
                 set_state(&record.id, "stopped", None);
@@ -346,7 +277,6 @@ async fn reconcile_row(record: &Record, rows: Option<&Vec<containers::Row>>) -> 
         _ => {}
     }
     if record.state == "error" {
-        // boot-failure diagnostics stay visible until DELETE
         return get_record(&record.id);
     }
     let mut st = store().lock().unwrap();
@@ -357,14 +287,11 @@ async fn reconcile_row(record: &Record, rows: Option<&Vec<containers::Row>>) -> 
     None
 }
 
-/// Reconcile every persisted record against one `container ls`. Skips
-/// in-flight pipelines (they own their transitions).
 async fn reconcile_all() -> Vec<Record> {
     let snapshot: Vec<Record> = {
         let mut st = store().lock().unwrap();
         ensure_loaded(&mut st);
         let mut v: Vec<Record> = st.records.values().cloned().collect();
-        // Newest first, by creation time.
         v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         v
     };
@@ -393,16 +320,12 @@ async fn find_tracked(id: &str) -> Option<Record> {
     reconcile_row(&record, rows.as_ref()).await
 }
 
-// ── create pipeline (background) ────────────────────────────────────────────
 
 struct PipelineError {
     code: &'static str,
     message: String,
 }
 
-/// The identity is the container's, full stop (PLAN55 D3/D10): a bare
-/// 12-hex id shaped like a container short-hash — no service prefix, no
-/// friendly name. The id doubles as the container's `--name`.
 fn fresh_id() -> String {
     loop {
         let id = util::random_hex(6);
@@ -417,10 +340,6 @@ fn fresh_id() -> String {
     }
 }
 
-/// Idempotent (the CLI errors "already exists" for existing); `created` = we
-/// made it. Bind entries are skipped entirely: a host path is NOT a volume we
-/// own — `container volume create` would be nonsense and `created` stays false
-/// forever (idea #22/RCA-1).
 async fn ensure_volumes(id: &str) -> Result<(), PipelineError> {
     let volumes = match get_record(id) {
         Some(r) => r.volumes,
@@ -457,15 +376,7 @@ async fn ensure_volumes(id: &str) -> Result<(), PipelineError> {
     Ok(())
 }
 
-/// One bounded guest exec: a hard wall-clock so a hung guest process (a git
-/// credential prompt on the console, a wedged download) records as a FAILED
-/// exec instead of wedging the pipeline forever. Git clones additionally run
-/// as the DESKTOP USER (`-u desktop` + HOME=/home/desktop, so git finds its
-/// global config) and with GIT_TERMINAL_PROMPT=0 + a null askpass — an auth
-/// challenge becomes an immediate failure instead of a hidden console prompt.
 async fn exec_bounded(argv: &[String]) -> cli::Output {
-    // OPTIONS BEFORE THE ID: `container exec [<options>] <container-id> <args>`
-    // — env flags after the id are parsed as the target executable.
     let is_git = argv.get(2).map(String::as_str) == Some("git");
     let full: Vec<String> = if is_git {
         let mut v: Vec<String> = vec![
@@ -544,10 +455,6 @@ fn repo_dest(url: &str, used: &mut Vec<String>) -> String {
     format!("/home/desktop/repos/{name}")
 }
 
-/// Clone repos inside the guest, sequentially, recording per-repo status.
-/// A failed clone does NOT fail the sandbox — AJCS decides per-repo. Repos
-/// land in /home/desktop/repos (the desktop user's own home) so the session
-/// user — not root — owns and sees them.
 async fn clone_repos(id: &str) {
     let repos = match get_record(id) {
         Some(r) if !r.repos.is_empty() => r.repos,
@@ -570,7 +477,6 @@ async fn clone_repos(id: &str) {
             argv.push("-b".into());
             argv.push(r.clone());
         }
-        // `--` stops a hostile URL from parsing as a git option.
         argv.push("--".into());
         argv.push(repo.url.clone());
         argv.push(dest.clone());
@@ -597,7 +503,6 @@ async fn clone_repos(id: &str) {
     }
 }
 
-/// Poll the health probe until serving or deadline (spacesd boots ~10–30s).
 async fn await_readiness(id: &str) -> bool {
     let deadline = Instant::now() + BOOT_DEADLINE;
     loop {
@@ -618,7 +523,6 @@ async fn force_cleanup(id: &str) {
     let _ = cli::run_str(&["rm", id]).await;
 }
 
-/// Background lifecycle: volumes → create → start → clone → ready.
 async fn run_pipeline(id: String) {
     let result = pipeline_body(&id).await;
     if let Err(e) = result {
@@ -643,8 +547,6 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
         None => return Ok(()),
     };
 
-    // A headless sandbox binds only execd, so publishing spacesd's TCP port
-    // and its QUIC media port would map host ports at nothing.
     let mut argv: Vec<String> = vec!["create".into()];
     if record.kind.has_desktop() {
         argv.extend([
@@ -656,17 +558,9 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
     }
     argv.extend(["-p".into(), format!("{}:{}", record.exec_port, GUEST_EXEC_PORT)]);
     if !record.network {
-        // An air-gapped sandbox: no DNS, no egress, no clone. The published
-        // ports still work — they are host-side plumbing, not container network.
         argv.extend(["--network".into(), "none".into()]);
     }
-    // Named volumes → `-v name:mount:mode`; host binds → `--mount
-    // type=bind,…`. All of it rides BEFORE the image — OPTIONS-BEFORE-TARGET.
     argv.extend(volume_create_args(&record.volumes));
-    // GPU passthrough (PLAN55 D8/D12): each stored device spec becomes a
-    // `--device` flag, still before the image. `nvidia.com/gpu` asks the
-    // nvidia-driver to grant the whole device; a specific `/dev/nvidia*` is
-    // passed through to the runtime, which maps it into the guest.
     for dev in &record.devices {
         argv.extend(["--device".into(), dev.clone()]);
     }
@@ -699,7 +593,6 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
         message: util::first_line(&e),
     })?;
     if started.failed() {
-        // mirror create_container: no dead containers left behind
         force_cleanup(id).await;
         return Err(PipelineError {
             code: "start_failed",
@@ -709,7 +602,7 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
 
     clone_repos(id).await;
     if is_aborted(id) {
-        return Ok(()); // DELETE owns the outcome from here
+        return Ok(());
     }
     if await_readiness(id).await {
         set_state(id, "ready", None);
@@ -727,7 +620,6 @@ async fn pipeline_body(id: &str) -> Result<(), PipelineError> {
     }
 }
 
-// ── route handlers ──────────────────────────────────────────────────────────
 
 fn fail(status: u16, code: &str, message: &str) -> Response {
     Response::json(status, json!({ "error": { "code": code, "message": message } }))
@@ -740,15 +632,8 @@ fn fail_with(status: u16, code: &str, message: &str, details: Value) -> Response
     )
 }
 
-/// Start a sandbox: allocate ports, persist the record, launch the pipeline.
-///
-/// Shared by the REST route and the host MCP tool, so the two cannot drift
-/// into creating subtly different sandboxes. Returns the record as it looked
-/// the moment it was registered (state `creating`).
 pub fn start_create(input: CreateInput) -> Result<Record, String> {
     let id = fresh_id();
-    // Registered before any await — a concurrent GET must not reconcile-prune
-    // a half-created record.
     {
         let mut st = store().lock().unwrap();
         ensure_loaded(&mut st);
@@ -804,11 +689,6 @@ pub fn start_create(input: CreateInput) -> Result<Record, String> {
     Ok(record)
 }
 
-/// Wait for a sandbox to leave `creating`/`starting`/`cloning`.
-///
-/// Returns the settled record, or `None` on deadline. The caller decides what
-/// a timeout means — the host MCP tool reports it with the id attached, so an
-/// agent can still list or destroy a sandbox that booted slowly.
 pub async fn wait_until_settled(id: &str, timeout: Duration) -> Option<Record> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -824,14 +704,10 @@ pub async fn wait_until_settled(id: &str, timeout: Duration) -> Option<Record> {
     }
 }
 
-/// One tracked record, unreconciled — the cheap lookup the host MCP tools use
-/// before dialling a sandbox.
 pub fn record_of(id: &str) -> Option<Record> {
     get_record(id)
 }
 
-/// Stop and delete a sandbox. Returns the volume projections the REST route
-/// also reports (named volumes persist; host binds were never ours).
 pub async fn destroy(id: &str) -> Result<Vec<Value>, String> {
     let record = get_record(id).ok_or_else(|| format!("No such sandbox: {id}"))?;
     match handle_delete(id).await {
@@ -851,12 +727,10 @@ pub async fn destroy(id: &str) -> Result<Vec<Value>, String> {
     }
 }
 
-/// Every tracked record, reconciled — the host MCP `sandbox_list` view.
 pub async fn list_records() -> Vec<Record> {
     reconcile_all().await
 }
 
-/// The public projection of a record (same shape the REST detail returns).
 pub fn detail_of(record: &Record) -> Value {
     to_detail(record)
 }
@@ -867,7 +741,7 @@ pub fn list_item_of(record: &Record) -> Value {
 
 async fn handle_create(req: &Request) -> Response {
     let body: Value = if req.body.is_empty() {
-        json!({}) // empty body = defaults
+        json!({})
     } else {
         match serde_json::from_slice(&req.body) {
             Ok(v) => v,
@@ -908,9 +782,6 @@ async fn handle_delete(id: &str) -> Response {
         None => return fail(404, "not_found", &format!("No such sandbox: {id}")),
     };
 
-    // The pipeline checks `aborted` between stages and stands down. Wait for
-    // it to notice, but never longer than the join timeout — a wedged clone
-    // must not hold the DELETE open.
     let in_flight = {
         let mut st = store().lock().unwrap();
         st.aborted.insert(id.to_string());
@@ -932,9 +803,6 @@ async fn handle_delete(id: &str) -> Response {
         Err(e) => return fail(502, "upstream_error", &util::first_line(&e)),
     };
     let removed_stderr = removed.stderr.to_lowercase();
-    // "not found" / "no such container" = already gone (deleted via CLI / a
-    // legacy route, or the container never came up, e.g. a boot failure) —
-    // treat as a clean delete rather than surfacing an upstream error.
     if removed.failed() && !removed_stderr.contains("not found") && !removed_stderr.contains("no such container") {
         let msg = if removed.stderr.is_empty() {
             "container rm failed".to_string()
@@ -961,8 +829,6 @@ async fn handle_delete(id: &str) -> Response {
     }))
 }
 
-/// Registered AHEAD of the `/api/` catch-all (dispatch is in registration
-/// order; the catch-all would otherwise 404 these routes).
 pub async fn handle(req: Request) -> Response {
     let rest: Vec<&str> = req
         .path
@@ -1009,8 +875,6 @@ pub async fn handle(req: Request) -> Response {
     }
 }
 
-/// Shared with the MCP/exec driver facade, which needs the tracked record and
-/// its readiness without re-implementing reconcile.
 pub async fn tracked_for_driver(id: &str) -> Option<Record> {
     find_tracked(id).await
 }
@@ -1019,7 +883,5 @@ pub async fn record_is_serving(record: &Record) -> bool {
     is_serving(record).await
 }
 
-/// Keep `Arc` in the import set honest: the pipeline spawns detached tasks and
-/// shares nothing by handle, so this module never needs one.
 #[allow(dead_code)]
 type _Unused = Arc<()>;
