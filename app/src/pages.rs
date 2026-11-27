@@ -1,18 +1,3 @@
-//! The one page: the wall, which becomes the detail view when a box is
-//! drilled into.
-//!
-//! The tree is an `m()` expression handed to `Def::tree`. It compiles to an
-//! m-js template string, so the directives (`x-for`, `x-text`, `:class`,
-//! `@click`) are the same ones a hand-written template would use — the gain is
-//! that the structure is a Rust expression the compiler checks, and the kit's
-//! linter checks the directives before anything paints.
-//!
-//! Layout contract, unchanged from the JS original:
-//!   * the tile head selects (builds the batch) — it never drills down;
-//!   * the screen overlay is a BARRIER: it selects an unpicked tile, and
-//!     drills into an already-picked one;
-//!   * a box without a `backref` renders NO chip, not a placeholder.
-
 use rustex1_kit::h::{lit, m, Node};
 use rustex1_kit::mjs::Def;
 use rustex1_kit::{mjs, Runtime};
@@ -32,14 +17,10 @@ fn shell() -> Node {
     m("div").class("shell").kids(vec![top_bar(), stage()])
 }
 
-// ── chrome ──────────────────────────────────────────────────────────────────
 
 fn top_bar() -> Node {
     m("header").class("top").kids(vec![
         m("div").class("brand").kids(vec![
-            // The logomark IS the server-health indicator: the poll's last
-            // outcome drives the class, so a dead backend is visible without
-            // reading the error text.
             m("span")
                 .class("brand-status")
                 .bind(
@@ -70,7 +51,6 @@ fn top_bar() -> Node {
             .show(&format!("$store.{STORE}.error"))
             .text(&format!("$store.{STORE}.error")),
         m("div").class("actions").kids(vec![
-            // The tool-call feed: always reachable, on every view.
             m("button")
                 .class("btn ghost log-toggle")
                 .attr("type", "button")
@@ -78,7 +58,6 @@ fn top_bar() -> Node {
                 .attr("title", "Tool-call log — what every client did")
                 .on("click", &format!("$store.{STORE}.toggleLog()"))
                 .kids(vec![Node::icon("list-dashes")]),
-            // Wall, nothing picked → create.
             m("button")
                 .class("btn")
                 .attr("type", "button")
@@ -88,7 +67,6 @@ fn top_bar() -> Node {
                 .bind("disabled", &format!("$store.{STORE}.busy"))
                 .on("click", &format!("$store.{STORE}.onAdd()"))
                 .child(lit("+ new box")),
-            // Wall, tiles picked → batch remove.
             m("button")
                 .class("btn")
                 .attr("type", "button")
@@ -105,7 +83,6 @@ fn top_bar() -> Node {
                             lit(")"),
                         ]),
                 ]),
-            // Detail view → back to the wall.
             m("button")
                 .class("btn ghost")
                 .attr("type", "button")
@@ -116,7 +93,6 @@ fn top_bar() -> Node {
     ])
 }
 
-// ── the wall ────────────────────────────────────────────────────────────────
 
 fn stage() -> Node {
     m("main")
@@ -125,12 +101,6 @@ fn stage() -> Node {
         .kids(vec![wall(), empty_state(), journal()])
 }
 
-/// The sticky tool-call log (SBOX_PLAN1 §3.3).
-///
-/// Every host MCP call, from every client, against every sandbox — the
-/// operator's answer to "what did the agent just do on my machine". It is a
-/// panel rather than a page because it is meant to be watched WHILE the
-/// desktops are visible, not instead of them.
 fn journal() -> Node {
     m("aside")
         .class("journal")
@@ -215,9 +185,6 @@ fn tile_head() -> Node {
                 .class("badge")
                 .bind("class", &format!("$store.{STORE}.badgeClass(c)"))
                 .text(&format!("$store.{STORE}.badgeText(c)")),
-            // The ACTIVE sandbox: the one the host MCP tools act on when a
-            // client names none. Absent on every other tile, not greyed out —
-            // there is exactly one, and it should be findable at a glance.
             m("span")
                 .class("badge active-badge")
                 .iff("c.active")
@@ -227,8 +194,6 @@ fn tile_head() -> Node {
         ])
 }
 
-/// Only when the record carries a backref — `x-if`, so an ordinary box
-/// renders NOTHING here rather than an empty chip.
 fn run_chip() -> Node {
     m("a")
         .class("run-chip")
@@ -250,9 +215,6 @@ fn run_chip() -> Node {
 
 fn tile_screen() -> Node {
     m("div").class("screen").kids(vec![
-        // Only a headed sandbox has a viewer. Gating on kind as well as
-        // readiness stops a headless tile from asking the backend to mint a
-        // viewer ticket, once per render, against a daemon that is not there.
         m("div")
             .class("tile-vnc-viewport")
             .show("c.ready && c.kind !== 'headless'")
@@ -264,7 +226,6 @@ fn tile_screen() -> Node {
                     .attr("allow", "fullscreen")
                     .on("load", &format!("$store.{STORE}.fitTile($event)")),
             ),
-        // BARRIER: always blocks wall interaction; select, then drill down.
         m("div")
             .class("screen-overlay")
             .show(&format!("!$store.{STORE}.inFull"))
@@ -276,8 +237,6 @@ fn tile_screen() -> Node {
                 m("i").class("ph ph-circle-notch ph-spinner"),
                 m("span").child(lit("waiting for box")),
             ]),
-        // A headless sandbox is working fine; it simply has no screen. Saying
-        // so beats a black rectangle that reads as a broken viewer.
         m("div")
             .class("placeholder headless-note")
             .show("c.ready && c.kind === 'headless'")

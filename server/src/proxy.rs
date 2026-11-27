@@ -1,24 +1,3 @@
-//! A-side API forwards — one streamed round trip per upstream prefix.
-//!
-//! `/api/*`  → the b-side backend (headless sandbox core, default
-//!             `http://127.0.0.1:3000`, env `SANDBOX_API_ORIGIN`).
-//! `/ajcs/*` → the AJCS core (default `http://127.0.0.1:4482`, env
-//!             `SANDBOX_AJCS_ORIGIN`) with the path mapping
-//!             `/ajcs/<rest>` => `<origin>/v1/<rest>` — `/ajcs/runs/54` hits
-//!             `/v1/runs/54`.
-//!
-//! The sandbox split: the SPA does not share a process with the API. The dev
-//! server owns HTTP + static + HMR here; every forwarded request goes through
-//! to its backend with its method, headers and body, and the response comes
-//! back with its status, headers and body. The browser never knows the API
-//! moved.
-//!
-//! Hop-by-hop headers never cross a proxy (RFC 7230 §6.1), and the dev
-//! server's `Stream` adds its own framing, so `content-length` and
-//! `transfer-encoding` from the upstream are dropped rather than forwarded —
-//! passing either along beside chunked framing is how a response arrives
-//! truncated or double-framed.
-
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -29,11 +8,8 @@ use std::sync::Arc;
 
 const DEFAULT_API_ORIGIN: &str = "127.0.0.1:3000";
 const DEFAULT_AJCS_ORIGIN: &str = "127.0.0.1:4482";
-/// A driver tool call can legitimately run for a while (execd's bash has its
-/// own 180s ceiling upstream), so the proxy must not be the thing that gives up.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(240);
 
-/// Hop-by-hop headers must never cross the proxy (RFC 7230 §6.1).
 const HOP_HEADERS: [&str; 8] = [
     "connection",
     "keep-alive",
@@ -45,8 +21,6 @@ const HOP_HEADERS: [&str; 8] = [
     "upgrade",
 ];
 
-/// Headers the dev server's `Stream` re-derives; forwarding them would
-/// conflict with its own chunked framing.
 const FRAMING_HEADERS: [&str; 2] = ["content-length", "transfer-encoding"];
 
 struct Upstream {
@@ -72,8 +46,6 @@ fn ajcs_origin() -> Upstream {
     }
 }
 
-/// The env vars carry a full origin (`http://host:port`) for parity with the
-/// Node version; this layer dials a host:port.
 fn strip_scheme(origin: String) -> String {
     origin
         .trim_start_matches("http://")
@@ -82,13 +54,11 @@ fn strip_scheme(origin: String) -> String {
         .to_string()
 }
 
-/// `/api/*` rides to the b-side verbatim.
 pub fn handle_api(_state: &Arc<State>, req: &Request, out: &mut Stream<'_>) {
     let target = with_query(&req.path, &req.query);
     forward(&api_origin(), &target, req, out);
 }
 
-/// `/ajcs/<rest>` → `/v1/<rest>` on the AJCS core (query rides along).
 pub fn handle_ajcs(_state: &Arc<State>, req: &Request, out: &mut Stream<'_>) {
     let rest = req.path.strip_prefix("/ajcs/").unwrap_or("");
     let target = with_query(&format!("/v1/{rest}"), &req.query);
@@ -146,7 +116,6 @@ fn round_trip(
     );
     for (name, value) in &req.headers {
         let lower = name.to_ascii_lowercase();
-        // `host` is the upstream's own authority, not the client's.
         if lower == "host" || HOP_HEADERS.contains(&lower.as_str()) || FRAMING_HEADERS.contains(&lower.as_str()) {
             continue;
         }
@@ -163,9 +132,6 @@ fn round_trip(
     }
     sock.flush()?;
 
-    // Framing is read explicitly rather than by slurping to EOF: an upstream
-    // that keeps the connection alive (ours does, unless asked to close) never
-    // sends one, and read-to-EOF would block until the socket timeout.
     let mut reader = BufReader::new(sock);
     read_response(&mut reader)
 }
@@ -200,8 +166,6 @@ fn read_response(
         reader.read_exact(&mut buf)?;
         buf
     } else {
-        // No framing at all: the upstream said `connection: close`, so the
-        // body runs to EOF.
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
         buf
@@ -209,7 +173,6 @@ fn read_response(
     Ok((status, headers, body))
 }
 
-/// RFC 7230 chunked decoding, for an upstream that framed its answer that way.
 fn read_chunked(reader: &mut BufReader<TcpStream>) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -223,7 +186,6 @@ fn read_chunked(reader: &mut BufReader<TcpStream>) -> std::io::Result<Vec<u8>> {
             Err(_) => return Ok(out),
         };
         if size == 0 {
-            // Consume trailers up to the terminating blank line.
             loop {
                 let mut t = String::new();
                 if reader.read_line(&mut t)? == 0 || t.trim().is_empty() {
@@ -240,7 +202,6 @@ fn read_chunked(reader: &mut BufReader<TcpStream>) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Status line + headers → (status, forwardable headers, chunked?, length).
 fn parse_head(
     head: &[u8],
 ) -> std::io::Result<(u16, Vec<(String, String)>, bool, Option<usize>)> {

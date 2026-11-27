@@ -7,8 +7,6 @@ version = "1.0.0"
 edition = "2021"
 license = "MIT"
 
-# The wasm frontend's profile. It has to exist at THIS workspace root because
-# the dev server builds the wasm half from here (vendor/rustex1/docs/RUST_M_JS.md).
 [profile.wasm]
 inherits = "release"
 opt-level = "s"
