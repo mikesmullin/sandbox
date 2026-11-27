@@ -4,14 +4,16 @@
  *
  * THREE tools — `bash`, `read`, `write` — with pi-harness semantics
  * (pi-coding-agent dist/core/tools/{bash,read,write}.js — semantics copied,
- * not code). TWO transports, one dispatch (contract: web/docs/execd-contract.md):
+ * not code), plus — gated on CUA_BROWSER_TOOLS=1 — the 15 browser tools that
+ * wrap spacesd's raw GUI tools (see the browser section below). TWO transports,
+ * one dispatch (contract: web/docs/execd-contract.md):
  *
  * Streamable-HTTP (default): JSON-RPC at POST /mcp, plain-JSON responses,
  * stateless (no session ids):
  *
  *   initialize                   → protocolVersion 2025-03-26, serverInfo execd 0.2.0
  *   notifications/initialized    → 202, empty
- *   tools/list                   → exactly [bash, read, write]
+ *   tools/list                   → [bash, read, write] (+ the 15 browser tools when gated on)
  *   tools/call                   → tool result (or JSON-RPC error, see below)
  *   GET /healthz                 → 200 {ok:true,service:'execd'}
  *
@@ -33,7 +35,7 @@
  */
 import { constants } from 'node:fs';
 import { createWriteStream } from 'node:fs';
-import { access, mkdir, open as fsOpen, readFile, realpath, writeFile } from 'node:fs/promises';
+import { access, mkdir, open as fsOpen, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { constants as osConstants, homedir } from 'node:os';
@@ -523,9 +525,11 @@ const BASH_TOOL = {
   },
 };
 
-function toolResult(text, structured, isError) {
-  const result = { content: [{ type: 'text', text }], structuredContent: structured, isError };
-  if (structured === null) delete result.structuredContent;
+function toolResult(text, structured, isError, extraContent) {
+  // Content: extra blocks first (e.g. image payloads passed through verbatim),
+  // then the summary text block — matches the raw spacesd ordering.
+  const result = { content: [...(extraContent ?? []), { type: 'text', text }], structuredContent: structured, isError };
+  if (structured === null || structured === undefined) delete result.structuredContent;
   return result;
 }
 
@@ -561,11 +565,12 @@ function validateBashArgs(args) {
   return { args: { command: args.command, timeout: args.timeout, cwd: args.cwd } };
 }
 
-/** Tool registry: name → validator + runner. */
-const TOOL_REGISTRY = {
-  bash: { validate: validateBashArgs },
-  read: { validate: validateReadArgs },
-  write: { validate: validateWriteArgs },
+/** Base tool registry: name → validator + runner. Browser tools (gated) are
+ * merged in below. */
+const BASE_TOOL_REGISTRY = {
+  bash: { validate: validateBashArgs, run: (args, trackChild) => runBash(args, trackChild) },
+  read: { validate: validateReadArgs, run: (args) => runRead(args) },
+  write: { validate: validateWriteArgs, run: (args) => runWrite(args) },
 };
 
 /**
@@ -863,6 +868,1213 @@ function validateWriteArgs(args) {
   return { args: { path: args.path, content: args.content } };
 }
 
+// ── Gated browser tool table (CUA_BROWSER_TOOLS=1) ──────────────────────────
+// Wraps spacesd's raw GUI tools with t3code-shaped contract tools (15). The gate
+// is OFF by default → tools/list is byte-identical to the 3-tool surface;
+// tools/call only exposes the gated tools when enabled.
+//
+// One persistent spacesd session per execd process: initialize once, capture the
+// mcp-session-id response header, and send it on every later request (the
+// connections can drop/reconnect — the header is what matters). The named
+// lifecycle session 'agent' is created lazily on the first browser call and
+// passed as session:"agent" on every spacesd call that accepts a session param.
+// A tool call that answers a refusal with structuredContent.refusal.code
+// "session_ended" is retried ONCE after re-issuing start_session.
+// One promise-queue mutex serializes every browser tool call (the harness can
+// call tools in parallel; spacesd state is shared).
+
+const BROWSER_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.CUA_BROWSER_TOOLS ?? '').trim());
+const BROWSER_SESSION = 'agent';
+const SPACESD_URL = process.env.CUA_SPACESD_URL || 'http://127.0.0.1:3211/mcp';
+const SPACESD_TOKEN = process.env.CUA_ENV_TOKEN ?? '';
+const BROWSER_REQUEST_TIMEOUT_MS = 180000;
+
+// Module browser state — set by browser_open/auto-bind, cleared by browser_close.
+// Also holds the recording bookkeeping (recordingPid/ffmpegPid/…).
+const browserState = {
+  targetId: null, tabId: null, pid: null, windowId: null, url: null,
+  recording: null, // { id, outputDir, tabId, url, createdAt, ffmpegPid, ffmpegChild }
+};
+
+async function ensureBrowserLease() {
+  if (browserLease) return browserLease;
+  const headers = {
+    'content-type': 'application/json',
+    'accept': 'application/json, text/event-stream',
+    'authorization': `Bearer ${SPACESD_TOKEN}`,
+  };
+  const init = await fetch(SPACESD_URL, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'execd' } },
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!init.ok) throw new Error(`spacesd initialize failed (HTTP ${init.status})`);
+  const sessionId = init.headers.get('mcp-session-id');
+  if (!sessionId) throw new Error('spacesd did not issue an mcp-session-id — cannot keep a browser lease');
+  browserLease = { sessionId };
+  // notifications/initialized — best-effort, never awaited for correctness.
+  try {
+    await fetch(SPACESD_URL, {
+      method: 'POST', headers: { ...headers },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch { /* connection may drop mid-flight — the header is what matters */ }
+  return browserLease;
+}
+
+// One shared lease per execd process (created lazily on the first browser call).
+let browserLease = null;
+// Whether the named 'agent' session is alive on the lease (re-armed by the retry rule).
+let browserSessionActive = false;
+// ONE promise-queue mutex — all browser tool calls run through this.
+const browserQueue = { tail: Promise.resolve() };
+
+function enqueueBrowser(fn) {
+  const run = browserQueue.tail.then(fn);
+  browserQueue.tail = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+function pickSpacesdText(result) {
+  if (!result || !Array.isArray(result.content)) return '';
+  const t = result.content.find(c => c && c.type === 'text');
+  return t?.text ?? '';
+}
+
+function isSessionEndedRefusal(res) {
+  return res?.structuredContent?.refusal?.code === 'session_ended';
+}
+
+async function callSpacesdTool(toolName, args) {
+  // Args must be spacesd-style (snake_case). The session param is owned here —
+  // every spacesd call that accepts a session param gets session:'agent'.
+  const lease = await ensureBrowserLease();
+  const res = await fetch(SPACESD_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'accept': 'application/json, text/event-stream',
+      'authorization': `Bearer ${SPACESD_TOKEN}`,
+      'mcp-session-id': lease.sessionId,
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: toolName, arguments: { ...args, session: BROWSER_SESSION } },
+    }),
+    signal: AbortSignal.timeout(BROWSER_REQUEST_TIMEOUT_MS),
+  });
+  let body = null;
+  try { body = await res.json(); } catch { /* not JSON */ }
+  if (!res.ok) {
+    return { isError: true, text: `spacesd answered HTTP ${res.status}`, structuredContent: null, content: [] };
+  }
+  if (!body || typeof body !== 'object') {
+    return { isError: true, text: 'spacesd answered an unreadable payload', structuredContent: null, content: [] };
+  }
+  if (body.error) {
+    return { isError: true, text: `spacesd refused: ${body.error.message ?? JSON.stringify(body.error)}`, structuredContent: null, content: [] };
+  }
+  const result = body.result;
+  return {
+    isError: !!result?.isError,
+    text: pickSpacesdText(result),
+    structuredContent: result?.structuredContent ?? null,
+    content: Array.isArray(result?.content) ? result.content : [],
+  };
+}
+
+/**
+ * Lazily ensure the named session is alive, call the tool, and honor the
+ * single-retry-on-session_ended rule (re-issue start_session, retry ONCE).
+ */
+async function withNamedSession(toolName, args, { retryOnce = true } = {}) {
+  if (!browserSessionActive) {
+    const started = await callSpacesdTool('start_session', {});
+    if (started.isError) {
+      return { isError: true, text: `could not start lifecycle session '${BROWSER_SESSION}': ${started.text}`, structuredContent: null, content: [] };
+    }
+    browserSessionActive = true;
+  }
+  let res = await callSpacesdTool(toolName, args);
+  if (retryOnce && isSessionEndedRefusal(res)) {
+    browserSessionActive = false;
+    const started = await callSpacesdTool('start_session', {});
+    if (!started.isError) {
+      browserSessionActive = true;
+      res = await callSpacesdTool(toolName, args);
+    }
+  }
+  return res;
+}
+
+function browserResult(text, structured) {
+  return { text, structured, isError: false };
+}
+
+function browserError(text) {
+  return { text, structured: null, isError: true };
+}
+
+/** Default-cwd-ish scratch for guest bash commands (execd's resolution chain). */
+function shQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+function isChromiumWindow(w) {
+  const title = typeof w?.title === 'string' ? w.title : '';
+  const app = typeof w?.app_name === 'string' ? w.app_name : '';
+  return /chromium/i.test(title) || /chromium/i.test(app);
+}
+
+function isProcessAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function sideNote(result) {
+  if (!result) return 'unknown error';
+  return result.text || JSON.stringify(result.structuredContent ?? {}) || 'unknown error';
+}
+
+/**
+ * Auto-bind: the module browser state (pid/windowId) when it is in a live
+ * browser (checked against the process), otherwise the running Chromium window
+ * (steps 2-4 of browser_open). Returns {pid, windowId, targetId, tabId, url,
+ * tabs} or {error}.
+ */
+async function requireBoundBrowser() {
+  try {
+    if (browserState.pid !== null && !isProcessAlive(browserState.pid)) {
+      browserState.targetId = browserState.tabId = browserState.pid = browserState.windowId = null;
+      browserState.url = null;
+      return { error: 'browser is gone — call browser_open again' };
+    }
+    let { pid, windowId } = browserState;
+    if (pid === null || windowId === null) {
+      const listRes = await withNamedSession('list_windows', {});
+      if (listRes.isError) return { error: `could not list windows: ${listRes.text || 'unknown error'}` };
+      const windows = Array.isArray(listRes?.structuredContent?.windows) ? listRes.structuredContent.windows : [];
+      const chromium = windows.find(isChromiumWindow);
+      if (!chromium) return { error: 'no browser — call browser_open' };
+      pid = chromium.pid;
+      windowId = chromium.window_id;
+    }
+    const prepared = await withNamedSession('browser_prepare', {
+      pid, window_id: windowId, strategy: { kind: 'existing_profile' },
+    });
+    if (prepared.isError) return { error: `could not attach to the browser (pid ${pid}): ${prepared.text || 'unknown error'}` };
+    const state4 = await withNamedSession('get_browser_state', { pid, window_id: windowId });
+    if (state4.isError) return { error: `could not read browser state (pid ${pid}): ${state4.text || 'unknown error'}` };
+    const targetId = state4.structuredContent?.target_id ?? null;
+    const tabs = Array.isArray(state4.structuredContent?.tabs) ? state4.structuredContent.tabs : [];
+    const tab0 = tabs[0] ?? null;
+    const tabId = tab0?.tab_id ?? null;
+    if (!targetId || !tabId) return { error: 'no browser tab is available — cannot continue' };
+    browserState.pid = pid;
+    browserState.windowId = windowId;
+    browserState.targetId = targetId;
+    browserState.tabId = tabId;
+    browserState.url = tab0?.url ?? null;
+    return { pid, windowId, targetId, tabId, url: tab0?.url ?? null, tabs };
+  } catch (err) {
+    return { error: `spacesd unreachable: ${String(err?.message ?? err)}` };
+  }
+}
+
+function snapTabsToContract(tabs) {
+  return (Array.isArray(tabs) ? tabs : []).map(t => ({
+    tabId: t?.tab_id ?? null,
+    url: t?.url ?? null,
+    title: t?.title ?? null,
+    active: Boolean(t?.active),
+  }));
+}
+
+function viewportFromStructured(structured) {
+  const sc = structured ?? {};
+  return {
+    width: sc.width ?? null,
+    height: sc.height ?? null,
+    scaleFactor: sc.scale_factor ?? null,
+  };
+}
+
+async function runBrowserStatus(_args, _trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  const size = await withNamedSession('get_screen_size', {});
+  if (size.isError) return browserError(`could not read screen size: ${size.text || 'unknown error'}`);
+  const viewport = viewportFromStructured(size.structuredContent);
+  return browserResult(
+    `browser ready: target ${bound.targetId}, tab ${bound.tabId}`,
+    {
+      ready: true,
+      browserPid: bound.pid,
+      windowId: bound.windowId,
+      targetId: bound.targetId,
+      tabId: bound.tabId,
+      viewport,
+      tabs: snapTabsToContract(bound.tabs),
+    },
+  );
+}
+
+async function runBrowserOpen(args, _trackChild) {
+  try {
+    // (1) launch a driver-owned isolated Chromium (allow_launch)
+    const launched = await withNamedSession('browser_prepare', {
+      allow_launch: true,
+      profile: { mode: 'isolated_new' },
+    });
+    if (launched.isError) return browserError(`could not launch a browser: ${launched.text || 'unknown error'}`);
+    const preparedPid = launched.structuredContent?.prepared_pid ?? null;
+    if (preparedPid === null) return browserError('could not launch a browser: spacesd did not report prepared_pid');
+    browserState.pid = preparedPid;
+    // (2) poll list_windows (~250ms, ≤15s) for a Chromium window
+    const deadline = Date.now() + 15000;
+    let chromium = null;
+    while (Date.now() < deadline) {
+      const strip = await withNamedSession('list_windows', {});
+      if (!strip.isError) {
+        const windows = Array.isArray(strip.structuredContent?.windows) ? strip.structuredContent.windows : [];
+        chromium = windows.find(isChromiumWindow) ?? null;
+        if (chromium) break;
+      }
+      await new Promise(r => setTimeout(r, 250));
+    }
+    if (!chromium) return browserError('timed out after 15000ms waiting for the Chromium window to appear');
+    const windowId = chromium.window_id;
+    browserState.windowId = windowId;
+    browserState.pid = chromium.pid ?? preparedPid;
+    // (3) attach: existing_profile
+    const prepared = await withNamedSession('browser_prepare', {
+      pid: browserState.pid, window_id: windowId, strategy: { kind: 'existing_profile' },
+    });
+    if (prepared.isError) return browserError(`could not attach to the browser: ${prepared.text || 'unknown error'}`);
+    // (4) bind: get_browser_state → target_id + tabs[0]
+    const state4 = await withNamedSession('get_browser_state', { pid: browserState.pid, window_id: windowId });
+    if (state4.isError) return browserError(`could not read browser state: ${state4.text || 'unknown error'}`);
+    const targetId = state4.structuredContent?.target_id ?? null;
+    const tabs = Array.isArray(state4.structuredContent?.tabs) ? state4.structuredContent.tabs : [];
+    const tab0 = tabs[0] ?? null;
+    const tabId = tab0?.tab_id ?? null;
+    if (!targetId || !tabId) return browserError('browser has no tab — cannot finish browser_open');
+    browserState.targetId = targetId;
+    browserState.tabId = tabId;
+    browserState.url = tab0?.url ?? null;
+    // (5) navigate when a URL was given
+    if (args.url) {
+      const nav = await withNamedSession('browser_navigate', { target_id: targetId, tab_id: tabId, url: args.url });
+      if (nav.isError) return browserError(`browser opened but navigation failed: ${nav.text || 'unknown error'}`);
+      browserState.url = nav.structuredContent?.url ?? args.url;
+    }
+    const finalUrl = args.url ?? browserState.url;
+    return browserResult(`browser ready: target ${targetId}, tab ${tabId}${finalUrl ? `, ${finalUrl}` : ''}`, {
+      targetId, tabId, url: finalUrl ?? undefined, windowId, pid: browserState.pid,
+    });
+  } catch (err) {
+    return browserError(`spacesd unreachable: ${String(err?.message ?? err)}`);
+  }
+}
+
+async function runBrowserNavigate(args, _trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  const tabId = args.tabId ?? bound.tabId;
+  const nav = await withNamedSession('browser_navigate', { target_id: bound.targetId, tab_id: tabId, url: args.url });
+  if (nav.isError) return browserError(`navigation failed: ${nav.text || 'unknown error'}`);
+  browserState.url = nav.structuredContent?.url ?? args.url;
+  return browserResult(nav.text || `navigated to ${args.url}`, { url: nav.structuredContent?.url ?? args.url, tabId, targetId: bound.targetId });
+}
+
+async function runBrowserDialog(args, _trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  const res = await withNamedSession('browser_dialog', {
+    target_id: bound.targetId, tab_id: bound.tabId, action: args.action,
+    dialog_id: args.dialogId, prompt_text: args.promptText,
+    delivery_mode: 'foreground',
+  });
+  if (res.isError) return browserError(`dialog ${args.action} failed: ${res.text || 'unknown error'}`);
+  return browserResult(res.text || `dialog ${args.action}`, { action: args.action, ...(res.structuredContent ?? {}) });
+}
+
+const BROWSER_RESIZE_PRESETS = {
+  default: [1280, 800],
+  hd: [1280, 720],
+  '1080p': [1920, 1080],
+  '1440p': [2560, 1440],
+  '2160p': [3840, 2160],
+};
+const BROWSER_RESIZE_MAX_WIDTH = 7680;
+const BROWSER_RESIZE_MAX_HEIGHT = 4320;
+const BROWSER_RESIZE_MIN_WIDTH = 320;
+const BROWSER_RESIZE_MIN_HEIGHT = 200;
+
+async function runBrowserResize(args, trackChild) {
+  let width = null, height = null, preset = null;
+  if (args.mode === 'reset') {
+    width = 1280; height = 800; preset = 'default';
+  } else if (args.mode === 'preset') {
+    const [w, h] = BROWSER_RESIZE_PRESETS[args.preset];
+    width = w; height = h; preset = args.preset;
+  } else {
+    width = args.width; height = args.height;
+  }
+  const cmd = `xrandr --fb ${width}x${height}`;
+  const res = await runBash({ command: cmd, timeout: 15 }, trackChild);
+  if (res.structured?.exit_code !== 0) return browserError(`xrandr failed: ${(res.structured?.output ?? '').trim() || res.text}`);
+  let screen = null;
+  try {
+    const size = await withNamedSession('get_screen_size', {});
+    if (!size.isError) screen = viewportFromStructured(size.structuredContent);
+  } catch { /* screen confirm is best-effort */ }
+  return browserResult(`desktop resolution set to ${width}x${height}${preset ? ` (preset ${preset})` : ''}`, {
+    mode: args.mode, width, height, preset, screen,
+  });
+}
+
+async function runBrowserSnapshot(args, _trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  const snap = await withNamedSession('get_browser_state', {
+    target_id: bound.targetId, tab_id: bound.tabId, include_screenshot: true,
+  });
+  if (snap.isError) return browserError(`snapshot failed: ${snap.text || 'unknown error'}`);
+  const structured = snap.structuredContent ?? {};
+  const content = Array.isArray(snap.content) ? snap.content : [];
+  const imageBlocks = content.filter(c => c && c.type === 'image' && typeof c.data === 'string')
+    .map(c => ({ type: 'image', data: c.data, mimeType: c.mimeType ?? 'image/png' }));
+  const textBlock = content.find(c => c && c.type === 'text');
+  const screenshot = structured.screenshot ?? null;
+  const shotDims = screenshot ? { width: screenshot.width ?? null, height: screenshot.height ?? null, mimeType: screenshot.mime_type ?? 'image/png' } : null;
+  let passImage = imageBlocks.length > 0;
+  if (args.maxImageDimension && shotDims && (shotDims.width === null || shotDims.width > args.maxImageDimension || shotDims.height === null || shotDims.height > args.maxImageDimension)) {
+    passImage = false;
+  }
+  const text = textBlock?.text ?? `snapshot ${structured.snapshot_id ?? 'unknown'} of ${structured.url ?? bound.url ?? 'about:blank'}`;
+  return {
+    text,
+    structured: {
+      snapshotId: structured.snapshot_id ?? null,
+      mode: 'snapshot',
+      targetId: bound.targetId,
+      tabId: bound.tabId,
+      url: structured.url ?? null,
+      refs: Array.isArray(structured.refs) ? structured.refs : [],
+      screenshot: shotDims,
+      truncated: structured.truncated ?? false,
+      status: structured.status ?? 'ok',
+      ...(args.maxImageDimension && !passImage ? { imageSkipped: `screenshot exceeds maxImageDimension ${args.maxImageDimension}` } : {}),
+    },
+    isError: false,
+    extraContent: passImage ? imageBlocks : [],
+  };
+}
+
+// Per-action fan-out for browser_act.
+function buildBrowserActCall(action, args, bound) {
+  switch (action) {
+    case 'click':
+      return { name: 'browser_click', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, ref: args.ref, x: args.x, y: args.y,
+        delivery_mode: 'foreground',
+      } };
+    case 'double_click':
+      return { name: 'browser_pointer', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, action: 'double_click', ref: args.ref, x: args.x, y: args.y,
+        delivery_mode: 'foreground',
+      } };
+    case 'right_click':
+      return { name: 'browser_pointer', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, action: 'right_click', ref: args.ref, x: args.x, y: args.y,
+        delivery_mode: 'foreground',
+      } };
+    case 'type':
+      return { name: 'browser_type', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, ref: args.ref, text: args.text,
+        ...(args.replace !== undefined ? { replace: args.replace } : {}),
+        ...(args.mode !== undefined ? { mode: args.mode } : {}),
+      } };
+    case 'select':
+      return { name: 'browser_select', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, ref: args.ref, label: args.label, value: args.value,
+      } };
+    case 'hover':
+    case 'point':
+      // point is the narration aid: the cursor moves to the spot (the agent
+      // cursor glides there on screen) but nothing is clicked.
+      return { name: 'browser_pointer', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, action: 'hover', ref: args.ref, x: args.x, y: args.y,
+        delivery_mode: 'foreground',
+      } };
+    case 'drag':
+      return { name: 'browser_pointer', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, action: 'drag', ref: args.ref, x: args.x, y: args.y,
+        destination_ref: args.destinationRef, to_x: args.toX, to_y: args.toY,
+        delivery_mode: 'foreground',
+      } };
+    case 'scroll':
+      return { name: 'browser_pointer', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, action: 'scroll', ref: args.ref, x: args.x, y: args.y,
+        delta_x: args.deltaX, delta_y: args.deltaY,
+        delivery_mode: 'foreground',
+      } };
+    case 'press_key':
+      return { name: 'press_key', args: {
+        key: args.key, pid: bound.pid, window_id: bound.windowId,
+        delivery_mode: 'foreground',
+      } };
+    case 'set_input_files':
+      return { name: 'browser_set_input_files', args: {
+        target_id: bound.targetId, tab_id: bound.tabId, ref: args.ref, files: args.files,
+      } };
+    default:
+      return null;
+  }
+}
+
+async function runBrowserAct(args, _trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  const call = buildBrowserActCall(args.action, args, bound);
+  if (!call) return browserError(`unsupported action: ${args.action}`);
+  // Strip undefined params (spacesd expects clean args)
+  const params = Object.fromEntries(Object.entries(call.args).filter(([, v]) => v !== undefined));
+  const res = await withNamedSession(call.name, params);
+  if (res.isError) return browserError(`${args.action} failed: ${res.text || 'unknown error'}`);
+  return browserResult(res.text || `${args.action} ok`, { action: args.action, status: 'ok' });
+}
+
+async function runBrowserEvaluate(args, _trackChild) {
+    const bound = await requireBoundBrowser();
+    if (bound.error) return browserError(bound.error);
+    // Direct CDP, not spacesd's legacy `page` tool: that one demands a
+    // fixed `--remote-debugging-port` plus a matching daemon env, while
+    // every real launch path uses the dynamic port the cua-driver's
+    // discovery depends on. The endpoint is one HTTP read away
+    // (DevToolsActivePort), so this speaks the protocol itself.
+    try {
+        const out = await cdpEvaluate(bound.pid, args.expression, !!args.awaitPromise);
+        const text = typeof out === "string" ? out : JSON.stringify(out);
+        return browserResult(text ?? "undefined", { expression: args.expression, value: out ?? null });
+    } catch (e) {
+        return browserError(`evaluation failed: ${e?.message || e}`);
+    }
+}
+
+/// `Runtime.evaluate` over the browser's own CDP WebSocket. The endpoint
+/// file can lag the launch by a few seconds — only the DISCOVERY polls, so
+/// a side-effecting expression is never evaluated twice.
+async function cdpEvaluate(pid, expression, awaitPromise) {
+    let port = null;
+    for (let i = 0; i < 20 && !port; i++) {
+        port = await discoverCdpPort(pid);
+        if (!port) await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!port) throw new Error(`no CDP endpoint found for pid ${pid}`);
+    // Runtime.evaluate is a PAGE-target domain: the /json/version socket is
+    // the browser target (no Runtime), so pick the page target's socket.
+    // The driver's launch opens about:blank alongside the navigated tab —
+    // prefer a real page over it.
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`);
+    if (!res.ok) throw new Error(`CDP endpoint ${port} did not answer`);
+    const targets = await res.json();
+    const pages = (targets || []).filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+    const page = pages.find((t) => !(t.url || "").startsWith("about:"))
+        || pages[0]
+        || (targets || []).find((t) => t.webSocketDebuggerUrl);
+    const wsUrl = page?.webSocketDebuggerUrl;
+    if (!wsUrl) throw new Error("the browser reports no page target to evaluate in");
+    return await new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        const timer = setTimeout(() => {
+            try { ws.close(); } catch { /* already gone */ }
+            reject(new Error("CDP evaluate timed out"));
+        }, 30000);
+        ws.addEventListener("open", () => {
+            ws.send(JSON.stringify({
+                id: 1,
+                method: "Runtime.evaluate",
+                params: { expression, returnByValue: true, awaitPromise: !!awaitPromise },
+            }));
+        });
+        ws.addEventListener("message", (ev) => {
+            try {
+                const msg = JSON.parse(typeof ev.data === "string" ? ev.data : String(ev.data));
+                if (msg.id !== 1) return;
+                clearTimeout(timer);
+                ws.close();
+                if (msg.error) return reject(new Error(msg.error.message || "CDP error"));
+                const r = msg.result?.result;
+                if (r?.subtype === "error") return reject(new Error(r.description || "page error"));
+                resolve(r && "value" in r ? r.value : (r?.description ?? null));
+            } catch (e) {
+                clearTimeout(timer);
+                reject(e);
+            }
+        });
+        ws.addEventListener("error", () => {
+            clearTimeout(timer);
+            reject(new Error("CDP socket error"));
+        });
+    });
+}
+
+/// The CDP port a browser process is serving: `--user-data-dir` off its
+/// cmdline, then the DevToolsActivePort file the browser writes there.
+/// Returns null when either step fails — the caller then lets spacesd try
+/// its own discovery and reports its error unchanged.
+async function discoverCdpPort(pid) {
+  // Route 1: the driver-owned profile dir. One browser per sandbox, so the
+  // newest isolated profile's DevToolsActivePort names the live endpoint.
+  // More robust than /proc parsing (bun's readFile truncates procfs), and
+  // it survives the process having been re-parented.
+  try {
+    const root = join(homedir(), '.local/share/cua-driver-profiles');
+    const names = await readdir(root);
+    let best = null;
+    let bestMtime = 0;
+    for (const n of names) {
+      const p = join(root, n, 'DevToolsActivePort');
+      try {
+        const st = await stat(p);
+        if (st.mtimeMs > bestMtime) {
+          bestMtime = st.mtimeMs;
+          best = p;
+        }
+      } catch { /* not this profile */ }
+    }
+    if (best) {
+      const first = (await readFile(best, 'utf8')).split('\n')[0].trim();
+      const port = parseInt(first, 10);
+      if (Number.isInteger(port) && port > 0 && port < 65536) return port;
+    }
+  } catch { /* no profiles yet */ }
+  // Route 2: the process's own --user-data-dir. /proc/<pid>/cmdline is
+  // NUL-separated and reads short through bun's readFile, so it is drained
+  // through a FileHandle instead.
+  try {
+    const raw = await readProcCmdline(pid);
+    const udd = raw.find((a) => a.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length);
+    if (!udd) return null;
+    const first = (await readFile(join(udd, 'DevToolsActivePort'), 'utf8')).split('\n')[0].trim();
+    const port = parseInt(first, 10);
+    return Number.isInteger(port) && port > 0 && port < 65536 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+/// Drain /proc/<pid>/cmdline to its EOF and split the NUL-separated argv.
+async function readProcCmdline(pid) {
+  const fh = await fsOpen(`/proc/${pid}/cmdline`, 'r');
+  try {
+    const chunks = [];
+    const buf = Buffer.alloc(4096);
+    for (;;) {
+      const { bytesRead } = await fh.read(buf, 0, buf.length, null);
+      if (bytesRead <= 0) break;
+      chunks.push(Buffer.from(buf.subarray(0, bytesRead)));
+    }
+    return Buffer.concat(chunks).toString('latin1').split('\0').filter((a) => a.length > 0);
+  } finally {
+    await fh.close();
+  }
+}
+
+async function runBrowserWaitFor(args, _trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  const res = await withNamedSession('verify_state', {
+    pid: bound.pid, window_id: bound.windowId, expect: args.expect,
+  });
+  if (res.isError) return browserError(`wait failed: ${res.text || 'unknown error'}`);
+  return browserResult(res.text || 'wait complete', res.structuredContent ?? null);
+}
+
+async function runBrowserRecordingStart(args, trackChild) {
+  // No bound browser needed — recording is the desktop via spacesd.
+  try {
+    const outDir = args.outputDir ? resolveToCwd(args.outputDir, resolveCwd({})) : '/tmp/browser-recording';
+    await mkdir(outDir, { recursive: true });
+    if (browserState.recording) {
+      return browserError(`a recording is already in progress (id ${browserState.recording.id})`);
+    }
+    const cursor = await withNamedSession('set_agent_cursor_enabled', { enabled: true });
+    if (cursor.isError) return browserError(`could not enable the agent cursor: ${cursor.text || 'unknown error'}`);
+    const started = await withNamedSession('start_recording', {
+      record_video: true, output_dir: outDir, include_accessibility_tree: false,
+    });
+    if (started.isError) return browserError(`could not start the recording: ${started.text || 'unknown error'}`);
+    const narrationPath = join(outDir, 'narration.m4a');
+    let ffmpegChild = null;
+    try {
+      ffmpegChild = spawn('ffmpeg', ['-y', '-hide_banner', '-loglevel', 'error', '-f', 'pulse',
+        '-i', 'cua_desktop.monitor', '-c:a', 'aac', narrationPath], { stdio: 'ignore', detached: false });
+    } catch (err) {
+      ffmpegChild = null;
+      // honest cleanup: stop the recording we already started
+      try { await withNamedSession('stop_recording', {}); } catch { /* best-effort */ }
+      return browserError(`could not start audio capture (ffmpeg): ${String(err?.message ?? err)}`);
+    }
+    ffmpegChild.once('error', () => {}); // async spawn failure is surfaced at stop; never crash
+    const id = `rec-${randomBytes(6).toString('hex')}`;
+    const recording = {
+      id, outputDir: outDir, tabId: browserState.tabId, url: browserState.url,
+      createdAt: new Date().toISOString(), ffmpegPid: ffmpegChild.pid, ffmpegChild,
+    };
+    browserState.recording = recording;
+    return browserResult(`recording started (id ${id})`, {
+      id, outputDir: outDir, tabId: recording.tabId, createdAt: recording.createdAt,
+    });
+  } catch (err) {
+    return browserError(`could not start the recording: ${String(err?.message ?? err)}`);
+  }
+}
+
+async function runBrowserRecordingStop(_args, trackChild) {
+  const recording = browserState.recording;
+  browserState.recording = null;
+  if (!recording) return browserError('no recording in progress');
+  let stopRes = null;
+  try { stopRes = await withNamedSession('stop_recording', {}); }
+  catch (err) { stopRes = { isError: true, text: String(err?.message ?? err), structuredContent: null, content: [] }; }
+  // SIGINT the audio capture regardless of the spacesd outcome
+  if (recording.ffmpegPid) {
+    try { process.kill(recording.ffmpegPid, 'SIGINT'); } catch { /* already dead */ }
+    try {
+      await Promise.race([
+        new Promise(r => {
+          recording.ffmpegChild.once('exit', r);
+          recording.ffmpegChild.once('close', r);
+        }),
+        new Promise(r => setTimeout(r, 5000)),
+      ]);
+    } catch { /* best-effort */ }
+  }
+  if (stopRes.isError) {
+    return browserError(`recording stop failed: ${stopRes.text || 'unknown error'} — audio capture was killed, the video path is unknown`);
+  }
+  const lastVideo = stopRes.structuredContent?.last_video_path ?? null;
+  if (!lastVideo) return browserError('recording stopped but spacesd did not report last_video_path');
+  // Mux the narration audio when the audio capture produced a real audio stream
+  const narrationPath = join(recording.outputDir, 'narration.m4a');
+  let audioOk = false;
+  try {
+    const st = await stat(narrationPath);
+    if (st.size > 0) {
+      const probe = await runBash({
+        command: `ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 ${shQuote(narrationPath)}`,
+        timeout: 30,
+      }, trackChild);
+      const out = (probe.structured?.output ?? '').trim();
+      audioOk = out.length > 0 && !/no streams|error/i.test(out);
+    }
+  } catch { audioOk = false; }
+  let path = lastVideo;
+  let muxed = false;
+  if (audioOk) {
+    const narrated = join(recording.outputDir, 'recording-narrated.mp4');
+    const mux = await runBash({
+      command: `ffmpeg -y -i ${shQuote(lastVideo)} -i ${shQuote(narrationPath)} -map 0:v -map 1:a -c:v copy -c:a aac -shortest ${shQuote(narrated)}`,
+      timeout: 120,
+    }, trackChild);
+    if (mux.structured?.exit_code === 0) { path = narrated; muxed = true; }
+    else return browserError(`recording audio is present but the mux failed: ${(mux.structured?.output ?? '').trim() || mux.text} — video kept at ${lastVideo}`);
+  }
+  let sizeBytes = 0;
+  try { sizeBytes = (await stat(path)).size; } catch { sizeBytes = 0; }
+  return browserResult(`recording saved: ${path} (${sizeBytes} bytes)${muxed ? ' (with narration audio)' : ''}`, {
+    id: recording.id, tabId: recording.tabId, path, mimeType: 'video/mp4', sizeBytes,
+    createdAt: recording.createdAt, muxed,
+  });
+}
+
+async function runBrowserList(_args, _trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  return browserResult(`${(bound.tabs ?? []).length} tab(s)`, { tabs: snapTabsToContract(bound.tabs) });
+}
+
+async function runBrowserClose(_args, _trackChild) {
+  if (browserState.pid === null) return browserError('no browser — call browser_open');
+  const pid = browserState.pid;
+  const res = await withNamedSession('kill_app', { pid });
+  if (res.isError) return browserError(`could not close browser (pid ${pid}): ${res.text || 'unknown error'}`);
+  browserState.targetId = browserState.tabId = browserState.pid = browserState.windowId = browserState.url = null;
+  return browserResult(`browser closed (pid ${pid}) — tabs do not survive`);
+}
+
+async function runBrowserFullscreen(_args, trackChild) {
+  const bound = await requireBoundBrowser();
+  if (bound.error) return browserError(bound.error);
+  const winId = bound.windowId;
+  const act = await runBash({ command: `xdotool windowactivate --sync ${winId} && xdotool key F11`, timeout: 15 }, trackChild);
+  let method;
+  if (act.structured?.exit_code === 0) {
+    method = 'f11';
+  } else {
+    const fb = await runBash({ command: `xdotool windowmaximize ${winId}`, timeout: 15 }, trackChild);
+    if (fb.structured?.exit_code !== 0) {
+      return browserError(`could not full-screen the browser window: xdotool key F11 failed (${(act.structured?.output ?? '').trim() || act.text}) and windowmaximize also failed (${(fb.structured?.output ?? '').trim() || fb.text})`);
+    }
+    method = 'windowmaximize';
+  }
+  let bounds = null;
+  try {
+    const strip = await withNamedSession('list_windows', {});
+    if (!strip.isError) {
+      const windows = Array.isArray(strip.structuredContent?.windows) ? strip.structuredContent.windows : [];
+      const win = windows.find(w => w.window_id === winId);
+      if (win) bounds = win.bounds ?? { x: win.x ?? null, y: win.y ?? null, width: win.width ?? null, height: win.height ?? null };
+    }
+  } catch { /* bounds read is best-effort */ }
+  return browserResult(`browser window full-screened (${method})${bounds ? `: ${bounds.width}x${bounds.height}@${bounds.x},${bounds.y}` : ''}`, {
+    method, windowId: winId, bounds,
+  });
+}
+
+async function runBrowserNarrate(args, _trackChild) {
+  // Spawn the in-image voice client and WAIT for it to exit — narration must
+  // be sequenced (it blocks on playback). Presets: /usr/local/bin/voice.
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (out) => { if (settled) return; settled = true; clearTimeout(timer); resolve(out); };
+    const child = spawn('/usr/local/bin/voice', ['say', ...(args.voice ? ['--voice', args.voice] : []), args.text], { stdio: ['ignore', 'ignore', 'pipe'], detached: false });
+    let stderr = '';
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* best-effort */ }
+      finish(browserError('voice timed out after 180s'));
+    }, 180000);
+    if (timer.unref) timer.unref();
+    child.stderr?.on('data', d => { if (stderr.length < 8000) stderr += d; });
+    child.once('error', (err) => {
+      finish(browserError(`voice client could not start: ${err.message}`));
+    });
+    child.once('close', (code, signal) => {
+      if (code === 0) finish(browserResult(`spoken: ${args.text}`, { spoken: true, voice: args.voice ?? null, text: args.text }));
+      else finish(browserError(`voice failed (exit ${code ?? signal ?? 'unknown'}): ${stderr.trim() || 'no error output'}`));
+    });
+  });
+}
+
+/** Validate a browser-act arg set after the shared per-action rules. */
+function validateBrowserActArgs(args) {
+  const action = args.action;
+  const ACTIONS = ['click', 'point', 'double_click', 'right_click', 'type', 'select', 'hover', 'drag', 'scroll', 'press_key', 'set_input_files'];
+  if (typeof action !== 'string' || !ACTIONS.includes(action)) {
+    return { code: INVALID_PARAMS, message: `Invalid params: "action" must be one of ${ACTIONS.join('|')}` };
+  }
+  for (const [key, v] of Object.entries(args)) {
+    if (key === 'action') continue;
+    if (v !== undefined && typeof v === 'object' && v !== null && !Array.isArray(v)) {
+      return { code: INVALID_PARAMS, message: `Invalid params: "${key}" must be a scalar, not an object` };
+    }
+  }
+  if (args.ref !== undefined && args.ref !== null && typeof args.ref !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "ref" must be a string' };
+  }
+  for (const k of ['x', 'y', 'toX', 'toY', 'deltaX', 'deltaY']) {
+    if (args[k] !== undefined && typeof args[k] !== 'number') {
+      return { code: INVALID_PARAMS, message: `Invalid params: "${k}" must be a number` };
+    }
+  }
+  if (args.text !== undefined && typeof args.text !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "text" must be a string' };
+  }
+  if (args.replace !== undefined && typeof args.replace !== 'boolean') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "replace" must be a boolean' };
+  }
+  if (args.mode !== undefined && args.mode !== 'insert_text' && args.mode !== 'keystrokes') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "mode" must be "insert_text" or "keystrokes"' };
+  }
+  if (args.label !== undefined && typeof args.label !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "label" must be a string' };
+  }
+  if (args.value !== undefined && typeof args.value !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "value" must be a string' };
+  }
+  if (args.key !== undefined && typeof args.key !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "key" must be a string' };
+  }
+  if (args.files !== undefined) {
+    if (!Array.isArray(args.files) || args.files.length < 1 || args.files.length > 32) {
+      return { code: INVALID_PARAMS, message: 'Invalid params: "files" must be an array of 1..32 absolute file paths' };
+    }
+    for (const f of args.files) {
+      if (typeof f !== 'string' || !isAbsolute(f)) {
+        return { code: INVALID_PARAMS, message: 'Invalid params: "files" must be absolute file paths' };
+      }
+    }
+  }
+  if (args.destinationRef !== undefined && typeof args.destinationRef !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "destinationRef" must be a string' };
+  }
+  const point = args.ref !== undefined || (args.x !== undefined && args.y !== undefined);
+  switch (action) {
+    case 'click':
+    case 'point':
+    case 'double_click':
+    case 'right_click':
+    case 'hover':
+      if (!point) return { code: INVALID_PARAMS, message: `Invalid params: ${action} requires a ref or both x and y` };
+      break;
+    case 'type':
+      if (args.ref === undefined) return { code: INVALID_PARAMS, message: 'Invalid params: type requires "ref"' };
+      if (args.text === undefined) return { code: INVALID_PARAMS, message: 'Invalid params: type requires "text"' };
+      break;
+    case 'select':
+      if (args.ref === undefined) return { code: INVALID_PARAMS, message: 'Invalid params: select requires "ref"' };
+      if ((args.label === undefined) === (args.value === undefined)) {
+        return { code: INVALID_PARAMS, message: 'Invalid params: select requires exactly one of "label" or "value"' };
+      }
+      break;
+    case 'drag':
+      if (!point) return { code: INVALID_PARAMS, message: 'Invalid params: drag requires an origin (ref or x and y)' };
+      if (args.destinationRef === undefined && !(args.toX !== undefined && args.toY !== undefined)) {
+        return { code: INVALID_PARAMS, message: 'Invalid params: drag requires a destination (destinationRef or toX and toY)' };
+      }
+      break;
+    case 'scroll':
+      if (args.deltaX === undefined && args.deltaY === undefined) {
+        return { code: INVALID_PARAMS, message: 'Invalid params: scroll requires deltaX or deltaY' };
+      }
+      break;
+    case 'press_key':
+      if (args.key === undefined) return { code: INVALID_PARAMS, message: 'Invalid params: press_key requires "key"' };
+      break;
+    case 'set_input_files':
+      if (args.ref === undefined) return { code: INVALID_PARAMS, message: 'Invalid params: set_input_files requires "ref"' };
+      if (args.files === undefined) return { code: INVALID_PARAMS, message: 'Invalid params: set_input_files requires "files"' };
+      break;
+  }
+  return { args: { ...args } };
+}
+
+function validateBrowserOpenArgs(args) {
+  if (args.url !== undefined && typeof args.url !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "url" must be a string' };
+  }
+  return { args: { url: args.url } };
+}
+
+function validateBrowserNavigateArgs(args) {
+  if (typeof args.url !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "url" is required and must be a string' };
+  }
+  if (args.tabId !== undefined && typeof args.tabId !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "tabId" must be a string' };
+  }
+  return { args: { url: args.url, tabId: args.tabId } };
+}
+
+function validateBrowserDialogArgs(args) {
+  const ACTIONS = ['inspect', 'accept', 'dismiss'];
+  if (typeof args.action !== 'string' || !ACTIONS.includes(args.action)) {
+    return { code: INVALID_PARAMS, message: `Invalid params: "action" must be one of ${ACTIONS.join('|')}` };
+  }
+  if (args.dialogId !== undefined && typeof args.dialogId !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "dialogId" must be a string' };
+  }
+  if (args.promptText !== undefined && typeof args.promptText !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "promptText" must be a string' };
+  }
+  return { args: { action: args.action, dialogId: args.dialogId, promptText: args.promptText } };
+}
+
+function validateBrowserResizeArgs(args) {
+  const MODES = ['freeform', 'preset', 'reset'];
+  if (typeof args.mode !== 'string' || !MODES.includes(args.mode)) {
+    return { code: INVALID_PARAMS, message: `Invalid params: "mode" must be one of ${MODES.join('|')}` };
+  }
+  if (args.mode === 'reset') return { args: { mode: 'reset' } };
+  if (args.mode === 'preset') {
+    if (typeof args.preset !== 'string' || !(args.preset in BROWSER_RESIZE_PRESETS)) {
+      return { code: INVALID_PARAMS, message: `Invalid params: "preset" must be one of ${Object.keys(BROWSER_RESIZE_PRESETS).join('|')}` };
+    }
+    return { args: { mode: 'preset', preset: args.preset } };
+  }
+  if (typeof args.width !== 'number' || !Number.isFinite(args.width)) {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "width" is required and must be a number' };
+  }
+  if (typeof args.height !== 'number' || !Number.isFinite(args.height)) {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "height" is required and must be a number' };
+  }
+  if (args.width < BROWSER_RESIZE_MIN_WIDTH || args.width > BROWSER_RESIZE_MAX_WIDTH) {
+    return { code: INVALID_PARAMS, message: `Invalid params: "width" must be between ${BROWSER_RESIZE_MIN_WIDTH} and ${BROWSER_RESIZE_MAX_WIDTH}` };
+  }
+  if (args.height < BROWSER_RESIZE_MIN_HEIGHT || args.height > BROWSER_RESIZE_MAX_HEIGHT) {
+    return { code: INVALID_PARAMS, message: `Invalid params: "height" must be between ${BROWSER_RESIZE_MIN_HEIGHT} and ${BROWSER_RESIZE_MAX_HEIGHT}` };
+  }
+  return { args: { mode: 'freeform', width: args.width, height: args.height } };
+}
+
+function validateBrowserSnapshotArgs(args) {
+  if (args.maxImageDimension !== undefined) {
+    if (typeof args.maxImageDimension !== 'number' || !Number.isFinite(args.maxImageDimension) || args.maxImageDimension < 1) {
+      return { code: INVALID_PARAMS, message: 'Invalid params: "maxImageDimension" must be a positive number' };
+    }
+  }
+  return { args: { maxImageDimension: args.maxImageDimension } };
+}
+
+function validateBrowserEvaluateArgs(args) {
+  if (typeof args.expression !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "expression" is required and must be a string' };
+  }
+  if (args.awaitPromise !== undefined && typeof args.awaitPromise !== 'boolean') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "awaitPromise" must be a boolean' };
+  }
+  return { args: { expression: args.expression, awaitPromise: args.awaitPromise } };
+}
+
+function validateBrowserWaitForArgs(args) {
+  if (!Array.isArray(args.expect) || args.expect.length < 1 || args.expect.length > 8) {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "expect" must be an array of 1..8 predicates' };
+  }
+  for (const pred of args.expect) {
+    if (!pred || typeof pred !== 'object' || Array.isArray(pred)) {
+      return { code: INVALID_PARAMS, message: 'Invalid params: every "expect" predicate must be an object' };
+    }
+  }
+  return { args: { expect: args.expect } };
+}
+
+function validateBrowserRecordingStartArgs(args) {
+  if (args.outputDir !== undefined && typeof args.outputDir !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "outputDir" must be a string' };
+  }
+  return { args: { outputDir: args.outputDir } };
+}
+
+function validateBrowserNarrateArgs(args) {
+  if (typeof args.text !== 'string' || args.text.length === 0) {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "text" is required and must be a non-empty string' };
+  }
+  if (args.voice !== undefined && typeof args.voice !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "voice" must be a string' };
+  }
+  return { args: { text: args.text, voice: args.voice } };
+}
+
+const BROWSER_TOOLS = [
+  {
+    name: 'browser_status',
+    description: 'Read the bound browser: ready state, browserPid, windowId, targetId, tabId, viewport and tab list. Auto-binds the running browser when one is alive (re-runs the browser_open attach flow); errors "no browser — call browser_open" otherwise.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_open',
+    description: 'Launch a driver-owned isolated Chromium (allow_launch) or attach to a running one and bind it: launches, finds the Chromium window, attaches (existing_profile), reads the target/tab, then navigates when a URL is given. Returns {targetId, tabId, url?, windowId, pid}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Optional URL to navigate the browser to (http:, https:, or about:)' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_navigate',
+    description: 'Navigate a tab of the bound browser to a new URL (http/https/about only — file:// is refused). Pass tabId to override the bound tab.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Destination URL (http:, https:, or about:)' },
+        tabId: { type: 'string', description: 'Optional tab id override — defaults to the bound tab' },
+      },
+      required: ['url'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_dialog',
+    description: 'Inspect or resolve a page-owned JS alert/confirm/prompt/beforeunload dialog on the bound tab. action=inspect returns the current dialog_id; accept/dismiss require that exact id. Linux callers always use foreground delivery (trusted input is refused in the background).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['inspect', 'accept', 'dismiss'], description: 'What to do with the current dialog' },
+        dialogId: { type: 'string', description: 'Opaque dialog id from action=inspect (required for accept/dismiss)' },
+        promptText: { type: 'string', description: 'Sensitive response text, valid only when accepting a prompt dialog' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_resize',
+    description: 'Resize the WHOLE desktop (xrandr --fb WxH — the window manager, the viewer and the recording follow). mode=freeform takes width/height (320..7680 / 200..4320); mode=preset picks a named resolution (default 1280x800, hd 1280x720, 1080p 1920x1080, 1440p 2560x1440, 2160p 3840x2160); mode=reset restores the 1280x800 default.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: ['freeform', 'preset', 'reset'], description: 'freeform: width/height required; preset: preset required; reset: always 1280x800' },
+        width: { type: 'number', description: 'freeform only — framebuffer width in px (320..7680)' },
+        height: { type: 'number', description: 'freeform only — framebuffer height in px (200..4320)' },
+        preset: { type: 'string', enum: ['default', 'hd', '1080p', '1440p', '2160p'], description: 'preset only — named desktop resolution' },
+      },
+      required: ['mode'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_snapshot',
+    description: 'Capture the exact tab viewport (PNG) plus the snapshot refs and metadata. Returns the image block verbatim (one PNG image block) + the text summary + structured refs. maxImageDimension skips the image block when the viewport exceeds it (no resizing is done) and records imageSkipped instead. Refs are session-scoped and are invalidated by navigation/snapshots.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        maxImageDimension: { type: 'number', description: 'Skip the image block when either viewport dimension exceeds this value (default: always include)' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_act',
+    description: 'Perform one browser action on the bound tab/window, dispatched to the matching spacesd tool: click→browser_click (also moves the agent-cursor overlay); double_click/right_click/hover/drag/scroll→browser_pointer (hover/double_click/right_click/drag need ref or x/y; scroll needs deltaX or deltaY; drag needs a destination); type→browser_type (ref + text, optional replace/mode); select→browser_select (ref + exactly one of label/value); press_key→press_key (key, desktop-level XSendEvent to the browser window); set_input_files→browser_set_input_files (ref + 1..32 absolute files). Input tools always default delivery_mode to foreground.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['click', 'point', 'double_click', 'right_click', 'type', 'select', 'hover', 'drag', 'scroll', 'press_key', 'set_input_files'], description: 'The action to perform. "point" moves the agent cursor to the spot WITHOUT clicking — a narration aid that shows in recordings; "click" and friends click.' },
+        ref: { type: 'string', description: 'Page element ref (from browser_snapshot)' },
+        x: { type: 'number', description: 'Viewport x (CSS px) — alternative to ref' },
+        y: { type: 'number', description: 'Viewport y (CSS px) — alternative to ref' },
+        text: { type: 'string', description: 'type: text to type (required)' },
+        replace: { type: 'boolean', description: 'type: select the whole field content first (default: insert at caret)' },
+        mode: { type: 'string', enum: ['insert_text', 'keystrokes'], description: 'type: insert_text (default) or keystrokes' },
+        label: { type: 'string', description: 'select: exact visible label of the option' },
+        value: { type: 'string', description: 'select: exact value attribute of the option' },
+        key: { type: 'string', description: 'press_key: key name (enter, tab, escape, space, backspace, delete, insert, home, end, pageup, pagedown, up, down, left, right, f1-f12, or a single ASCII character)' },
+        files: { type: 'array', items: { type: 'string' }, description: 'set_input_files: 1..32 absolute file paths' },
+        deltaX: { type: 'number', description: 'scroll: horizontal scroll delta (CSS px)' },
+        deltaY: { type: 'number', description: 'scroll: vertical scroll delta (CSS px)' },
+        destinationRef: { type: 'string', description: 'drag: destination page ref' },
+        toX: { type: 'number', description: 'drag: destination viewport x (CSS px)' },
+        toY: { type: 'number', description: 'drag: destination viewport y (CSS px)' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_evaluate',
+    description: 'Execute a JavaScript expression in the bound browser via the legacy page tool (page {action:"execute_javascript"}). The expression is self-contained (e.g. "document.title"); values are returned in the text summary. awaitPromise has no spacesd-side effect in v1 — keep the expression self-contained (the document is already loaded).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        expression: { type: 'string', description: 'JavaScript source to execute in the bound page' },
+        awaitPromise: { type: 'boolean', description: 'Accepted for contract parity — no spacesd-side effect; do not rely on it' },
+      },
+      required: ['expression'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_wait_for',
+    description: 'Deterministically wait for 1..8 window predicates (verify_state) on the bound browser window. Pass the expect array verbatim. Predicate results are satisfied/unsatisfied/unknown — unknown never implies success.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        expect: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'object' }, description: '1..8 predicates combined with logical AND (see verify_state for the predicate grammar)' },
+      },
+      required: ['expect'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_recording_start',
+    description: 'Start desktop recording (video-only h264 mp4 via spacesd start_recording) and bring audio capture up alongside it (ffmpeg records the sandbox pulse monitor to narration.m4a). Shows the agent-cursor overlay. Returns {id, outputDir, tabId, createdAt}. The recorded video is transient — stop it with browser_recording_stop.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        outputDir: { type: 'string', description: 'Directory for the recording + narration.m4a (default /tmp/browser-recording)' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_recording_stop',
+    description: 'Stop the recording and finalize the mp4. SIGINT the narration capture and mux the narration.m4a into the recorded video when present (recording-narrated.mp4). Returns {id, tabId, path, mimeType:"video/mp4", sizeBytes, createdAt, muxed}. Robust: if spacesd stop fails, the audio is still killed and the failure is reported honestly.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_list',
+    description: 'List the tabs of the bound browser: {tabs:[{tabId,url,title,active}]}.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_close',
+    description: 'Kill the driver-owned browser process and clear module browser state. Only the driver-owned browser is killed — tabs do NOT survive (unlike a human-quit browser).',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_fullscreen',
+    description: 'Toggle the browser window full-screen (xdotool windowactivate --sync <id> && xdotool key F11; fallback windowmaximize). Whole-window state, not tab state. Returns the window bounds afterwards plus {method:"f11"|"windowmaximize"}.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'browser_narrate',
+    description: 'Speak a text through the sandbox audio via the in-image voice client (/usr/local/bin/voice say [--voice V] <text>; env VOICE_TTS_URL is the client endpoint). Blocks until playback finishes — narration must be sequenced before the next action. When recording, the narration lands in the mp4.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Text to speak' },
+        voice: { type: 'string', description: 'Voice name override (default: the client default, e.g. lessac)' },
+      },
+      required: ['text'],
+      additionalProperties: false,
+    },
+  },
+];
+
+const BROWSER_TOOL_REGISTRY = {
+  browser_status: { validate: () => ({ args: {} }), run: (args) => enqueueBrowser(() => runBrowserStatus(args)) },
+  browser_open: { validate: validateBrowserOpenArgs, run: (args) => enqueueBrowser(() => runBrowserOpen(args)) },
+  browser_navigate: { validate: validateBrowserNavigateArgs, run: (args) => enqueueBrowser(() => runBrowserNavigate(args)) },
+  browser_dialog: { validate: validateBrowserDialogArgs, run: (args) => enqueueBrowser(() => runBrowserDialog(args)) },
+  browser_resize: { validate: validateBrowserResizeArgs, run: (args, trackChild) => enqueueBrowser(() => runBrowserResize(args, trackChild)) },
+  browser_snapshot: { validate: validateBrowserSnapshotArgs, run: (args) => enqueueBrowser(() => runBrowserSnapshot(args)) },
+  browser_act: { validate: validateBrowserActArgs, run: (args) => enqueueBrowser(() => runBrowserAct(args)) },
+  browser_evaluate: { validate: validateBrowserEvaluateArgs, run: (args) => enqueueBrowser(() => runBrowserEvaluate(args)) },
+  browser_wait_for: { validate: validateBrowserWaitForArgs, run: (args) => enqueueBrowser(() => runBrowserWaitFor(args)) },
+  browser_recording_start: { validate: validateBrowserRecordingStartArgs, run: (args, trackChild) => enqueueBrowser(() => runBrowserRecordingStart(args, trackChild)) },
+  browser_recording_stop: { validate: () => ({ args: {} }), run: (args, trackChild) => enqueueBrowser(() => runBrowserRecordingStop(args, trackChild)) },
+  browser_list: { validate: () => ({ args: {} }), run: (args) => enqueueBrowser(() => runBrowserList(args)) },
+  browser_close: { validate: () => ({ args: {} }), run: (args) => enqueueBrowser(() => runBrowserClose(args)) },
+  browser_fullscreen: { validate: () => ({ args: {} }), run: (args, trackChild) => enqueueBrowser(() => runBrowserFullscreen(args, trackChild)) },
+  browser_narrate: { validate: validateBrowserNarrateArgs, run: (args) => enqueueBrowser(() => runBrowserNarrate(args)) },
+};
+
+const TOOL_REGISTRY = {
+  ...BASE_TOOL_REGISTRY,
+  ...(BROWSER_ENABLED ? BROWSER_TOOL_REGISTRY : {}),
+};
+
+const BASE_TOOLS = [BASH_TOOL, READ_TOOL, WRITE_TOOL];
+
+
 // ── JSON-RPC dispatch ────────────────────────────────────────────────────────
 
 function handleInitialize() {
@@ -870,8 +2082,10 @@ function handleInitialize() {
     protocolVersion: PROTOCOL_VERSION,
     capabilities: { tools: { listChanged: false } },
     serverInfo: SERVER_INFO,
-    instructions: 'Three tools: bash, read, write — one-shot shell execution and file primitives '
-      + 'in the sandbox (pi-harness semantics). Stateless server: perform the initialize handshake per request.',
+    instructions: BROWSER_ENABLED
+      ? 'Eighteen tools: bash, read, write + 15 gated browser tools (CUA_BROWSER_TOOLS=1) — one-shot shell execution, file primitives and browser automation (pi-harness semantics). Stateless server: perform the initialize handshake per request.'
+      : 'Three tools: bash, read, write — one-shot shell execution and file primitives '
+        + 'in the sandbox (pi-harness semantics). Stateless server: perform the initialize handshake per request.',
   }).result;
 }
 
@@ -894,19 +2108,15 @@ async function dispatchRpc(message, trackChild) {
     case 'notifications/initialized':
       return { status: 202, body: null };
     case 'tools/list':
-      return { status: 200, body: rpcResult(id, { tools: [BASH_TOOL, READ_TOOL, WRITE_TOOL] }) };
+      return { status: 200, body: rpcResult(id, { tools: [...BASE_TOOLS, ...(BROWSER_ENABLED ? BROWSER_TOOLS : [])] }) };
     case 'tools/call': {
       const checked = validateToolCallParams(params);
       if (checked.unknownTool) {
         return { status: 200, body: rpcError(id, METHOD_NOT_FOUND, `Unknown tool: ${checked.unknownTool}`) };
       }
       if (checked.code) return { status: 200, body: rpcError(id, checked.code, checked.message) };
-      const out = checked.name === 'bash'
-        ? await runBash(checked.args, trackChild)
-        : checked.name === 'read'
-          ? await runRead(checked.args)
-          : await runWrite(checked.args);
-      return { status: 200, body: rpcResult(id, toolResult(out.text, out.structured ?? null, out.isError)) };
+      const out = await TOOL_REGISTRY[checked.name].run(checked.args, trackChild);
+      return { status: 200, body: rpcResult(id, toolResult(out.text ?? '', out.structured ?? null, out.isError ?? false, out.extraContent)) };
     }
     default:
       return { status: 200, body: rpcError(id, METHOD_NOT_FOUND, `Unknown method: ${method}`) };

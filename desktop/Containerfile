@@ -13,7 +13,11 @@
 
 FROM alpine:latest
 
-ENV TERM=xterm
+# LD_LIBRARY_PATH: the GPU passthrough (PLAN55 D8) binds the host driver
+# libs at /usr/local/lib; nothing looks there unless it is on the loader
+# path (the sbox-video image's same line — CUDA/libcuda users need it).
+ENV TERM=xterm \
+    LD_LIBRARY_PATH=/usr/local/lib
 
 # Local APK mirror for fast builds — OPT-IN via --build-arg APK_CACHE=<base-url>
 # (e.g. http://192.168.64.1:3142 on the Apple-Containers host, where that
@@ -79,7 +83,12 @@ RUN apk add --no-cache \
     opus
 
 # Chromium (browser driven by cua-driver over CDP when wired)
-RUN apk add --no-cache chromium
+# — plus the software-WebGL half: `chromium-swiftshader` ships ANGLE's
+# SwiftShader ICD (libvk_swiftshader.so) and `mesa-vulkan-swrast` a second
+# software Vulkan ICD. Without one, WebGL context creation fails outright —
+# THREE.js games (the arcade's darkmarch) die at boot with a flat WEBGL
+# error (verified: every flag set failed until the ICD existed).
+RUN apk add --no-cache chromium chromium-swiftshader mesa-vulkan-swrast
 
 # Chromium GPU+shm wrapper — two flags the cua-driver's browser launches omit:
 #   --disable-gpu            → ANGLE-Vulkan hard-aborts in the container (verified:
@@ -288,12 +297,24 @@ RUN chmod +x /usr/local/bin/cua-spacesd
 RUN printf '#!/bin/bash\n[ "$(id -u)" = 0 ] && exec su-exec desktop "$0" "$@"\nENV_FILE=/tmp/runtime-desktop/desktop.env\n[ -r "$ENV_FILE" ] && . "$ENV_FILE"\nexport HOME=/home/desktop\n[ "$#" -gt 0 ] || set -- bash -l\nexec "$@"\n' > /usr/local/bin/desktop-env && \
     chmod +x /usr/local/bin/desktop-env
 
-# ─── execd — guest exec MCP server (ONE bash tool, pi semantics; port 3213) ──
+# ─── execd — guest exec MCP server (bash/read/write + gated browser tools) ──
 # Bearer-tokened Streamable-HTTP JSON-RPC at POST /mcp (contract:
-# web/docs/execd-contract.md); started by the entrypoint as the desktop user
+# docs/execd-contract.md); started by the entrypoint as the desktop user
 # with the session env. Read-only image content — the desktop user only runs it.
+# The browser table (t3code-shaped wrappers over spacesd) registers only when
+# CUA_BROWSER_TOOLS=1 (the headed entrypoint sets it; the headless image keeps
+# exactly the three shell tools).
 COPY execd/index.mjs /opt/execd/index.mjs
 RUN chmod 0755 /opt/execd/index.mjs
+
+# ─── voice — thin TTS client (fetch from the host's voice server + play) ──
+# Static musl binary built on the host by build-voice.sh (from voice/voice.c);
+# the sandbox cannot reach the host's loopback, so it POSTs to the exposed
+# VOICE_TTS_URL (default host.containers.internal:3125/speak) and plays the
+# wav through the session's PipeWire sink — which is what the recording's
+# audio capture (browser_recording_start) picks up as narration.
+COPY dist/voice /usr/local/bin/voice
+RUN chmod 0755 /usr/local/bin/voice
 
 # ─── Entrypoint ───
 COPY entrypoint.sh /usr/local/bin/start-desktop

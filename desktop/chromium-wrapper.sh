@@ -57,7 +57,14 @@ for a in "$@"; do
 done
 
 # ── unconditional survival flags (both layers, every launch) ───────────────
-set -- --disable-gpu --disable-dev-shm-usage "$@"
+# --enable-unsafe-swiftshader: with --disable-gpu, Chromium 128+ refuses
+# software WebGL unless this flag opts back in — THREE.js games (the
+# arcade's darkmarch) drew a flat "WEBGL" error without it. Software GL is
+# the honest posture here: ANGLE-Vulkan hard-aborts in the container.
+# The debugging port stays DYNAMIC (`=0`): Chromium 158 writes its
+# DevToolsActivePort discovery file only for a dynamic port, and the
+# cua-driver's prepare discovers the endpoint from exactly that file.
+set -- --disable-gpu --enable-unsafe-swiftshader --disable-dev-shm-usage "$@"
 
 if [ "$seen_udd" = "0" ]; then
   # ── deferred warmup: plain launches (the baked profile) ──────────────────

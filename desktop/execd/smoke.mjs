@@ -14,6 +14,11 @@
  *   read+write round: write a uniquely-named file → read back (full +
  *   offset/limit window) → bash cat cross-check → bash rm (own file only)
  *
+ * The gated browser tool table is probed SELF-CONTAINED (no sandbox): a
+ * stdio-mode child with CUA_BROWSER_TOOLS=1 answers tools/list with exactly
+ * 18 tools (bash/read/write + the 15 browser tools) and a bogus browser_act is
+ * rejected with -32602.
+ *
  * When nothing is reachable: prints a skip line and exits 0. Teardown deletes
  * NOTHING (the sandbox is not ours; only the smoke's own probe file is
  * removed in-guest).
@@ -23,6 +28,13 @@ import { spawn } from 'node:child_process';
 const API = process.env.SMOKE_API || 'http://127.0.0.1:3000';
 const GUEST_MCP_PORT = 3213;
 const results = [];
+const INDEX_PATH = new URL('./index.mjs', import.meta.url).pathname;
+const BROWSER_TOOL_NAMES = [
+  'browser_status', 'browser_open', 'browser_navigate', 'browser_dialog', 'browser_resize',
+  'browser_snapshot', 'browser_act', 'browser_evaluate', 'browser_wait_for',
+  'browser_recording_start', 'browser_recording_stop', 'browser_list', 'browser_close',
+  'browser_fullscreen', 'browser_narrate',
+];
 
 function ok(name, condition, detail = '') {
   results.push({ name, pass: !!condition, detail });
@@ -85,7 +97,70 @@ function makeGuestDriver(detail) {
   });
 }
 
+/** One stdio-line pump over `bun index.mjs --stdio` (no sandbox needed). */
+function spawnStdio() {
+  const child = spawn(process.execPath, [INDEX_PATH, '--stdio'], {
+    env: { ...process.env, CUA_BROWSER_TOOLS: '1' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let carry = '';
+  const queue = [];
+  let waiter = null;
+  let stderr = '';
+  child.stdout.on('data', (d) => {
+    carry += d;
+    for (;;) {
+      const nl = carry.indexOf('\n');
+      if (nl === -1) break;
+      const line = carry.slice(0, nl);
+      carry = carry.slice(nl + 1);
+      if (waiter) { const w = waiter; waiter = null; w(line); }
+      else queue.push(line);
+    }
+  });
+  child.stderr.on('data', (d) => { if (stderr.length < 8000) stderr += d; });
+  function nextLine(timeoutMs = 20000) {
+    if (queue.length > 0) return Promise.resolve(queue.shift());
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`stdio line timed out after ${timeoutMs}ms (stderr: ${stderr.slice(0, 300)})`)), timeoutMs);
+      waiter = (line) => { clearTimeout(timer); resolve(line); };
+    });
+  }
+  const send = (line) => { child.stdin.write(line + '\n'); };
+  return { child, nextLine, send };
+}
+
+/** The gated browser table: CUA_BROWSER_TOOLS=1 → 18 tools + -32602 validation. */
+async function gatedStdioProbe() {
+  console.log('  gated probe: CUA_BROWSER_TOOLS=1 bun index.mjs --stdio');
+  let id = 1;
+  const { child, nextLine, send } = spawnStdio();
+  try {
+    send(JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'execd-smoke' } } }));
+    const init = JSON.parse(await nextLine());
+    ok('gated initialize → serverInfo execd', init?.result?.serverInfo?.name === 'execd',
+      `serverInfo ${JSON.stringify(init?.result?.serverInfo)}`);
+    send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
+    send(JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'tools/list' }));
+    const list = JSON.parse(await nextLine());
+    const names = list?.result?.tools?.map((t) => t.name) ?? [];
+    ok('GATED tools/list → 18 tools [bash, read, write] + 15 browser tools', names.length === 18
+      && names.slice(0, 3).join(',') === 'bash,read,write'
+      && names.slice(3).join(',') === BROWSER_TOOL_NAMES.join(','),
+      JSON.stringify(names));
+    send(JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name: 'browser_act', arguments: { action: 'teleport' } } }));
+    const err = JSON.parse(await nextLine());
+    ok('gated validation → -32602', err?.error?.code === -32602, JSON.stringify(err));
+  } finally {
+    child.stdin.end();
+    child.kill('SIGKILL');
+  }
+}
+
 async function main() {
+  // ── gated browser tool table (self-contained: no sandbox needed) ──────────
+  await gatedStdioProbe();
+
   // ── discovery: an existing ready sandbox with an exec surface ─────────────
   const list = await fetchJson(`${API}/api/orchestration/sandboxes`);
   const items = Array.isArray(list.body?.sandboxes) ? list.body.sandboxes : [];

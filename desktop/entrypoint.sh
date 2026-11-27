@@ -101,7 +101,7 @@ GNOME_ACCESSIBILITY=1
 EOF
 chown desktop:desktop "$XDG_RUNTIME_DIR/desktop.env"
 
-# ── 4b. execd — guest exec MCP server (ONE bash tool; 0.0.0.0:3213) ──────────
+# ── 4b. execd — guest exec MCP server (bash/read/write + CUA_BROWSER_TOOLS-gated browser tools; 0.0.0.0:3213) ──
 # Pre-provision the workspace the orchestration pipeline clones into: clones
 # run as the `desktop` user → /home/desktop/repos must exist desktop-owned
 # BEFORE the first clone. Git identity pre-provisioned so agents never juggle
@@ -125,7 +125,7 @@ chown "$DESKTOP_USER:$DESKTOP_USER" /home/desktop/.gitconfig
 # XDG_RUNTIME_DIR) naturally, plus the data-plane token (same materialization
 # the spacesd launch uses — CUA_ENV_TOKEN is unset above, /run/cua/env-token is
 # the source of truth). Log to the runtime dir (desktop-owned).
-su-exec "$DESKTOP_USER" bash -c 'set -a; . /tmp/runtime-desktop/desktop.env; set +a; export EXECD_DEFAULT_CWD=/home/desktop; export CUA_ENV_TOKEN="$(cat /run/cua/env-token)"; exec bun /opt/execd/index.mjs >>/tmp/runtime-desktop/execd.log 2>&1' &
+su-exec "$DESKTOP_USER" bash -c 'set -a; . /tmp/runtime-desktop/desktop.env; set +a; export EXECD_DEFAULT_CWD=/home/desktop; export CUA_ENV_TOKEN="$(cat /run/cua/env-token)"; export CUA_BROWSER_TOOLS=1; exec bun /opt/execd/index.mjs >>/tmp/runtime-desktop/execd.log 2>&1' &
 log "execd starting on 0.0.0.0:3213"
 
 # ── 5. session: openbox (+ autostart), wallpaper, AT-SPI enable ───────────
@@ -204,6 +204,9 @@ done
 #     "could not create the driver-owned profile root: Permission denied").
 #   CUA_DRIVER_BROWSER_NO_SANDBOX   → the driver's launches include --no-sandbox
 #     (chromium cannot sandbox under Apple Containers).
+#   CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS → allow the legacy page tool's
+#     mutating actions (execute_javascript → execd browser_evaluate); mutation
+#     is otherwise refused by the daemon.
 mkdir -p /home/desktop/.local/share/cua-driver-profiles
 chown "$DESKTOP_USER:$DESKTOP_USER" /home/desktop/.local/share/cua-driver-profiles
 su-exec "$DESKTOP_USER" env \
@@ -219,6 +222,7 @@ su-exec "$DESKTOP_USER" env \
   CUA_DRIVER_BROWSER_NO_SANDBOX=1 \
   CUA_DRIVER_PERMISSION_MODE=unrestricted \
   CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS=1 \
+  CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS=1 \
   /usr/local/bin/cua-spacesd serve &
 log "cua-spacesd starting on 0.0.0.0:$MCP_PORT (permission mode unrestricted — the deferred-warmup browser binds without a consent flow; the sandbox is the jail, the Jobfile is the policy)"
 

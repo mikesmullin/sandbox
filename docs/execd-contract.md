@@ -2,9 +2,13 @@
 
 A small MCP server **inside the sandbox image** exposing THREE tools — `bash`,
 `read`, `write` — with **pi-harness semantics** (pi-coding-agent
-`dist/core/tools/{bash,read,write}.js`).
-It is the agent's real hands; spacesd `/mcp` (59 GUI tools) remains the
-observation surface. Motivation: the smoke live-fire proved agents CANNOT
+`dist/core/tools/{bash,read,write}.js`), plus — when the guest is booted with
+`CUA_BROWSER_TOOLS=1` — a **gated table of 15 browser tools** (below) that
+wrap spacesd's raw GUI tools with t3code-shaped names/params. The gate is
+**OFF by default** (tools/list stays exactly `[bash, read, write]`).
+It is the agent's real hands; spacesd `/mcp` (GUI tools) remains the
+observation surface it can't drive. Motivation: the smoke live-fire proved
+agents CANNOT
 use the GUI terminal efficiently (no exec tool; AT-SPI exposes no terminal
 text; background keyboard delivery unavailable) — see
 `../psicom/MASTER_PLAN.md` journal 2026-10-11.
@@ -170,6 +174,211 @@ SAME resolved path (realpath key when it exists, resolved path when missing)
 serialize — each chains on the previous promise; DIFFERENT paths run in
 parallel. A failing write releases the queue (`finally`).
 
+## Browser tools — gated (`CUA_BROWSER_TOOLS=1`)
+
+The gated table is a **t3code-shaped** wrapper over spacesd's raw GUI tools.
+It is OFF by default: with the gate unset, `tools/list` is exactly
+`[bash, read, write]` (byte-identical to the 3-tool surface — same JSON
+descriptions, same instructions string). With `CUA_BROWSER_TOOLS=1` (accepts
+`1|true|yes|on`, case-insensitive), `tools/list` returns **18 tools** — the
+three shell tools plus **15 browser tools** (below), in this order:
+
+`browser_status`, `browser_open`, `browser_navigate`, `browser_dialog`,
+`browser_resize`, `browser_snapshot`, `browser_act`, `browser_evaluate`,
+`browser_wait_for`, `browser_recording_start`, `browser_recording_stop`,
+`browser_list`, `browser_close`, `browser_fullscreen`, `browser_narrate`.
+
+### Contract invariants (all gated tools)
+
+- Same dispatch/transport as the other tools: JSON-RPC `tools/call`, pi-style
+  `-32602` validation (missing/malformed params), `-32601` unknown tool,
+  result or error — every request answers.
+- All browser tools run through **ONE promise-queue mutex** — the harness can
+  call tools in parallel while spacesd state is shared.
+- Every spacesd call that accepts a `session` param passes `session:"agent"`:
+  execd keeps **ONE persistent spacesd lease** (initialize once, keep the
+  `mcp-session-id` response header on every later request — connections may
+  drop/reconnect, the header is what matters) and a **named lifecycle session
+  `agent`** created lazily on the first browser call. If a tool call answers a
+  refusal with `structuredContent.refusal.code == "session_ended"`, execd
+  re-issues `start_session` and **retries the call ONCE**.
+- Tools that need a bound browser auto-bind if a browser process is alive
+  (re-run of the browser_open steps 2-4); otherwise they error `no browser —
+  call browser_open`. A dead bound browser errors honestly: `browser is gone —
+  call browser_open again`.
+- All `target_id`/`tab_id` defaults come from execd module state (set by
+  `browser_open`/auto-bind); tools accept explicit `tabId` override.
+- **Input tools always pass `delivery_mode:"foreground"`** — on Linux the
+  background route refuses trusted input (clicks, keys, drags, scrolls,
+  dialog accept/dismiss).
+- spacesd is reached at `CUA_SPACESD_URL` (default
+  `http://127.0.0.1:3211/mcp`) with the SAME `CUA_ENV_TOKEN` execd auths with.
+
+### The 15 tools
+
+#### `browser_status` {}
+
+```
+result.structuredContent: { ready: true, browserPid, windowId, targetId, tabId,
+  viewport: { width, height, scaleFactor },
+  tabs: [{ tabId, url, title, active }] }
+error: "no browser — call browser_open" / "browser is gone — call browser_open again"
+```
+
+Bind-if-needed (steps 2-4) + `get_screen_size` + tab list.
+
+#### `browser_open` { url? }
+
+Browser flow: (1) `browser_prepare {allow_launch:true, profile:{mode:"isolated_new"}}`
+→ `prepared_pid`; (2) poll `list_windows` (~250ms, ≤15s) for a window whose
+title/app matches `chromium` → `window_id`, `pid`; (3)
+`browser_prepare {pid, window_id, strategy:{kind:"existing_profile"}}` → attach;
+(4) `get_browser_state {pid, window_id}` → `target_id` + `tabs[0].tab_id`;
+(5) if `url` was given: `browser_navigate {target_id, tab_id, url}`.
+
+```
+result.structuredContent: { targetId, tabId, url?, windowId, pid }
+```
+
+State (targetId/tabId/pid/windowId/url) is recorded module-wide for later
+tools. On launch failure the error is honest; a live launched browser's pid
+is still recorded so `browser_close` can kill it.
+
+#### `browser_navigate` { url, tabId? }
+
+`browser_navigate {target_id, tab_id, url}` on the bound browser (`tabId`
+overrides the bound tab). Result: `{ url, tabId, targetId }`. Refs are
+invalidated by navigation.
+
+#### `browser_dialog` { action: "inspect"|"accept"|"dismiss", dialogId?, promptText? }
+
+`browser_dialog {target_id, tab_id, action, dialog_id?, prompt_text?, delivery_mode:"foreground"}`.
+`action=inspect` returns the opaque `dialog_id`; accept/dismiss need that exact id.
+
+#### `browser_resize` { mode: "freeform"|"preset"|"reset", width?, height?, preset? }
+
+Guest bash `xrandr --fb WxH` — **the whole desktop** (the viewer and the
+recording follow). Freeform takes width/height (bounds 320..7680 / 200..4320);
+presets: `default`=1280x800 (also `reset`), `hd`=1280x720, `1080p`=1920x1080,
+`1440p`=2560x1440, `2160p`=3840x2160. Result: `{ mode, width, height, preset?, screen: {width, height, scaleFactor} }`.
+
+#### `browser_snapshot` { maxImageDimension? }
+
+`get_browser_state {target_id, tab_id, include_screenshot:true}`. The image
+block(s) pass **through verbatim** (`{type:"image", data:<base64>, mimeType:"image/png"}`),
+followed by the text summary; `structuredContent` carries the refs, viewport
+screenshot metadata, snapshot id and status. `maxImageDimension` skips the image
+block (no resizing is done) when either viewport dimension exceeds it and sets
+`imageSkipped` — the text summary and refs are always returned.
+
+#### `browser_act` { action, ref?, x?, y?, text?, replace?, mode?, label?, value?, key?, files?, deltaX?, deltaY?, destinationRef?, toX?, toY? }
+
+Fan-out over the typed browser tools:
+
+| action | spacesd tool | extra rules |
+|---|---|---|
+| `click` | `browser_click` | ref or both x and y (also moves the blue agent-cursor overlay) |
+| `double_click` | `browser_pointer {action:"double_click"}` | ref or both x and y |
+| `right_click` | `browser_pointer {action:"right_click"}` | ref or both x and y |
+| `type` | `browser_type` | ref + text (+ replace bool, + mode `insert_text`(default)|`keystrokes`) |
+| `select` | `browser_select` | ref + exactly one of label/value |
+| `hover` | `browser_pointer {action:"hover"}` | ref or both x and y |
+| `drag` | `browser_pointer {action:"drag"}` | origin ref or x/y AND destination ref or toX/toY |
+| `scroll` | `browser_pointer {action:"scroll"}` | deltaX or deltaY (+ origin ref or x/y, optional) |
+| `press_key` | `press_key` (desktop-level XSendEvent) | key; targets the bound browser window |
+| `set_input_files` | `browser_set_input_files` | ref + 1..32 absolute file paths |
+
+Validation errors are pi-style `-32602` messages. Result: `{ action, status:"ok" }`.
+
+#### `browser_evaluate` { expression, awaitPromise? }
+
+`page {action:"execute_javascript", javascript: expression, pid}` — requires
+the daemon operator to set `CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS=1` at
+startup (the entrypoint does this). `awaitPromise` is accepted for contract
+parity but has no spacesd-side effect in v1 — keep the expression
+self-contained. Result: the text summary + `{ expression, ...structuredContent }`.
+
+#### `browser_wait_for` { expect: array(1..8) }
+
+`verify_state {pid, window_id, expect: args.expect, session}` — the expect
+array is passed verbatim (predicate grammar is spacesd's — window/element
+predicates, 1..8 items, logical AND). Result: the raw `verify_state`
+text/structuredContent.
+
+#### `browser_recording_start` { outputDir? }
+
+Default `/tmp/browser-recording` (created with mkdir -p). Flow: show the agent
+cursor (`set_agent_cursor_enabled {enabled:true}`) → spacesd
+`start_recording {record_video:true, output_dir, include_accessibility_tree:false}`
+→ spawn `ffmpeg -y -hide_banner -loglevel error -f pulse -i cua_desktop.monitor
+-c:a aac <outputDir>/narration.m4a` (child_process, detached=false, pid
+recorded). Returns `{ id, outputDir, tabId, createdAt }`.
+
+#### `browser_recording_stop` {}
+
+spacesd `stop_recording` → `structuredContent.last_video_path`; SIGINT the
+ffmpeg capture, wait for exit (≤5s, then SIGKILL); if `narration.m4a` exists
+with a real audio stream (ffprobe), mux
+`ffmpeg -y -i <video> -i <narration.m4a> -map 0:v -map 1:a -c:v copy -c:a aac -shortest <outputDir>/recording-narrated.mp4`
+and use that as the result `path`. If spacesd's stop fails, the audio is still
+killed and the failure is reported honestly. Result:
+`{ id, tabId, path, mimeType:"video/mp4", sizeBytes, createdAt, muxed }`.
+
+#### `browser_list` {}
+
+`{ tabs: [{ tabId, url, title, active }] }` from the bind-mode state.
+
+#### `browser_close` {}
+
+`kill_app {pid}` on the driver-owned browser + clear module browser state.
+**Tab state does not survive** — the process is gone; open a new browser with
+`browser_open`. (Only the driver-owned browser is killed; it is the one
+`browser_open` launched. A recording in progress is not stopped by this —
+stop it explicitly first if you care.)
+
+#### `browser_fullscreen` {}
+
+Guest bash `xdotool windowactivate --sync <windowId> && xdotool key F11`; on
+failure fall back to `xdotool windowmaximize <windowId>` (and report the
+fallback). Whole-window state, not tab state. Returns the window bounds after
+(`list_windows` filtered to the id) + `{ method:"f11"|"windowmaximize", windowId, bounds }`.
+
+#### `browser_narrate` { text, voice? }
+
+Spawns the in-image thin client `/usr/local/bin/voice say [--voice <voice>] <text>`
+(env `VOICE_TTS_URL` is its endpoint) and **waits for it to exit** — the
+client blocks on playback, so narration is sequenced (text in, sound in,
+done). Returns `{ spoken:true, voice, text }`; on client failure (missing
+binary, fetch/playback error) returns `isError` with the client's stderr.
+When recording, narration is captured through the sandbox pulse monitor into
+the mp4 (see `browser_recording_start`).
+
+### Guest-path semantics
+
+- **Voice / narration**: `browser_narrate` uses the fixed guest path
+  `/usr/local/bin/voice` (see `desktop/voice/voice.c` — thin TTS client,
+  `VOICE_TTS_URL` is the endpoint). The mp4 capture path is:
+  `ffmpeg -f pulse -i cua_desktop.monitor` → `narration.m4a` → muxed into the
+  final mp4 by `browser_recording_stop`. Narration is played through the sandbox
+  speaker (`paplay`), never the host.
+- **Recording**: the transient video lives in spacesd's `last_video_path`
+  (default `<outputDir>/recording.mp4`); the ffmpeg audio capture is a plain
+  file at `<outputDir>/narration.m4a`; the narrated artifact is
+  `<outputDir>/recording-narrated.mp4`. `browser_recording_stop` is idempotent-
+  safe (a second stop reports `no recording in progress`).
+- **Fullscreen/resize** run through guest bash with execd's session env
+  (DISPLAY inherited from the entrypoint), so they operate on the guest's
+  X server, not the host's.
+
+### Session-lease note
+
+Named lifecycle sessions are lease-scoped: the named session `agent` is bound
+to the ONE spacesd lease this execd process initialized at first browser call.
+If a tool call answers a session refusal (`refusal.code == "session_ended"`),
+execd re-issues `start_session` **once** and retries. Note that the named
+session can therefore only be re-created as long as the lease survives — the
+lease is owned by this process's first browser call.
+
 ## Transport & auth
 
 - **Streamable-HTTP JSON-RPC at `POST /mcp`** — the same minimal subset our
@@ -191,8 +400,9 @@ parallel. A failing write releases the queue (`finally`).
 
 ## Transport: stdio (0.2)
 
-The same three-tool server (serverInfo **0.2.0**, same dispatch semantics,
-same tool registry — zero tool-semantics drift) also speaks
+The same tool set (serverInfo **0.2.0**, same dispatch semantics,
+same tool registry — zero tool-semantics drift; the gated browser tools are
+present iff `CUA_BROWSER_TOOLS=1` at boot) also speaks
 **newline-delimited JSON-RPC 2.0 over stdin/stdout** so the HOST can spawn it
 as its own child for HOST agent stages.
 
@@ -245,7 +455,8 @@ accepted for call-site symmetry and ignored (no auth; temp files honor
 `serverInfo: { name: 'execd', version: '0.2.0' }`; `instructions`:
 "Three tools: bash, read, write — one-shot shell execution and file
 primitives in the sandbox (pi-harness semantics). Stateless server: perform
-the initialize handshake per request."
+the initialize handshake per request." (gate off) /
+"Eighteen tools: bash, read, write + 15 gated browser tools (CUA_BROWSER_TOOLS=1) — one-shot shell execution, file primitives and browser automation (pi-harness semantics). Stateless server: perform the initialize handshake per request." (gate on)
 
 ## Orchestration API integration (batch 2.1 surface changes)
 
