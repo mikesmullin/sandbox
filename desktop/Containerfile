@@ -306,6 +306,9 @@ RUN printf '#!/bin/bash\n[ "$(id -u)" = 0 ] && exec su-exec desktop "$0" "$@"\nE
 # exactly the three shell tools).
 COPY execd/index.mjs /opt/execd/index.mjs
 RUN chmod 0755 /opt/execd/index.mjs
+# The build refuses a syntax-broken execd — a bad string once shipped as a
+# sandbox whose every tool answered "connection reset" at call time.
+RUN bun build /opt/execd/index.mjs --target=bun --outfile /dev/null
 
 # ─── voice — thin TTS client (fetch from the host's voice server + play) ──
 # Static musl binary built on the host by build-voice.sh (from voice/voice.c);

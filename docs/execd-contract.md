@@ -305,24 +305,29 @@ array is passed verbatim (predicate grammar is spacesd's — window/element
 predicates, 1..8 items, logical AND). Result: the raw `verify_state`
 text/structuredContent.
 
-#### `browser_recording_start` { outputDir? }
+#### `browser_recording_start` { path? }
 
-Default `/tmp/browser-recording` (created with mkdir -p). Flow: show the agent
-cursor (`set_agent_cursor_enabled {enabled:true}`) → spacesd
-`start_recording {record_video:true, output_dir, include_accessibility_tree:false}`
+`path` is where the **finished** mp4 will land — the final name is given up
+front and there is no copy step afterwards. It must be absolute and under
+`/work` (the mounted checkout is the only place a recording survives the
+sandbox); default `/work/demo-<timestamp>.mp4`. An existing file is never
+overwritten — `demo.mp4` becomes `demo-1.mp4`. Flow: show the agent cursor
+(`set_agent_cursor_enabled {enabled:true}`) → spacesd
+`start_recording {record_video:true, output_dir:<scratch>, include_accessibility_tree:false}`
 → spawn `ffmpeg -y -hide_banner -loglevel error -f pulse -i cua_desktop.monitor
--c:a aac <outputDir>/narration.m4a` (child_process, detached=false, pid
-recorded). Returns `{ id, outputDir, tabId, createdAt }`.
+-c:a aac <scratch>/narration.m4a` (child_process, detached=false, pid
+recorded). Returns `{ id, path, tabId, createdAt }`.
 
 #### `browser_recording_stop` {}
 
 spacesd `stop_recording` → `structuredContent.last_video_path`; SIGINT the
 ffmpeg capture, wait for exit (≤5s, then SIGKILL); if `narration.m4a` exists
 with a real audio stream (ffprobe), mux
-`ffmpeg -y -i <video> -i <narration.m4a> -map 0:v -map 1:a -c:v copy -c:a aac -shortest <outputDir>/recording-narrated.mp4`
-and use that as the result `path`. If spacesd's stop fails, the audio is still
-killed and the failure is reported honestly. Result:
-`{ id, tabId, path, mimeType:"video/mp4", sizeBytes, createdAt, muxed }`.
+`ffmpeg -y -i <video> -i <narration.m4a> -map 0:v -map 1:a -c:v copy -c:a aac -shortest <path>`
+straight to the reserved path (copy without audio otherwise). If spacesd's
+stop fails, the audio is still killed and the failure is reported honestly.
+Result: `{ id, tabId, path, mimeType:"video/mp4", sizeBytes, createdAt,
+muxed }` — `path` is the finished artifact, ready where it was asked for.
 
 #### `browser_list` {}
 
@@ -362,10 +367,11 @@ the mp4 (see `browser_recording_start`).
   final mp4 by `browser_recording_stop`. Narration is played through the sandbox
   speaker (`paplay`), never the host.
 - **Recording**: the transient video lives in spacesd's `last_video_path`
-  (default `<outputDir>/recording.mp4`); the ffmpeg audio capture is a plain
-  file at `<outputDir>/narration.m4a`; the narrated artifact is
-  `<outputDir>/recording-narrated.mp4`. `browser_recording_stop` is idempotent-
-  safe (a second stop reports `no recording in progress`).
+  (a scratch dir under `/tmp/browser-recording/`); the ffmpeg audio capture
+  is a plain file beside it (`narration.m4a`); the finished narrated mp4 is
+  written directly to the `path` reserved at `browser_recording_start`.
+  `browser_recording_stop` is idempotent-safe (a second stop reports
+  `no recording in progress`).
 - **Fullscreen/resize** run through guest bash with execd's session env
   (DISPLAY inherited from the entrypoint), so they operate on the guest's
   X server, not the host's.

@@ -2,7 +2,7 @@
  * voice — thin TTS client for the sandbox image.
  *
  * Exactly two things, in sequence:
- *   1. POST {"text":"...","voice":"...","mode":"download"} to a TTS HTTP
+ *   1. POST {"text":"...", ["voice":"...",] "mode":"download"} to a TTS HTTP
  *      endpoint on the host, and save the response body (wav bytes).
  *   2. Run `paplay <file>` so the narration plays inside the sandbox's
  *      PipeWire/PulseAudio stack.
@@ -36,7 +36,6 @@
 #include <unistd.h>
 
 #define DEFAULT_URL   "http://host.containers.internal:3125/speak"
-#define DEFAULT_VOICE "lessac"
 #define FETCH_TIMEOUT_SECS 60
 #define MAX_BODY (64 * 1024 * 1024)
 
@@ -58,7 +57,7 @@ static void usage(FILE *out)
         "TEXT args are joined with spaces.\n"
         "\n"
         "Options:\n"
-        "  --voice NAME   voice name (default: $VOICE_TTS_VOICE, else \"lessac\")\n"
+        "  --voice NAME   voice name (default: the server's own default preset)\n"
         "  --url URL      TTS endpoint (default: $VOICE_TTS_URL, else %s)\n"
         "  --dry-run      fetch and write the wav to voice-out.wav in the CWD\n"
         "                 and print its size; do NOT play it\n"
@@ -426,9 +425,12 @@ int main(int argc, char **argv)
     if (i < argc && strcmp(argv[i], "say") == 0) i++;
 
     const char *url = getenv("VOICE_TTS_URL");
+    /* Voice stays NULL when nobody named one: the request then carries no
+     * voice field at all and the SERVER's default preset speaks — hardcoding
+     * a fallback here would silently override the operator's choice. */
     const char *voice = getenv("VOICE_TTS_VOICE");
     if (!url || !*url) url = DEFAULT_URL;
-    if (!voice || !*voice) voice = DEFAULT_VOICE;
+    if (voice && !*voice) voice = NULL;
     int dry_run = 0;
 
     /* Collect TEXT args; parse flags anywhere (before, between, after text). */
@@ -478,12 +480,17 @@ int main(int argc, char **argv)
 
     /* Build the JSON request body (escaped). */
     char *esc_text = json_escape(text);
-    char *esc_voice = json_escape(voice);
-    size_t jcap = strlen(esc_text) + strlen(esc_voice) + 80;
+    char *esc_voice = voice ? json_escape(voice) : NULL;
+    size_t jcap = strlen(esc_text) + (esc_voice ? strlen(esc_voice) : 0) + 80;
     char *jbody = malloc(jcap);
     if (!jbody) die("out of memory");
-    snprintf(jbody, jcap, "{\"text\":\"%s\",\"voice\":\"%s\",\"mode\":\"download\"}",
-             esc_text, esc_voice);
+    if (esc_voice) {
+        snprintf(jbody, jcap, "{\"text\":\"%s\",\"voice\":\"%s\",\"mode\":\"download\"}",
+                 esc_text, esc_voice);
+    } else {
+        /* No voice field: the server's own default_preset speaks. */
+        snprintf(jbody, jcap, "{\"text\":\"%s\",\"mode\":\"download\"}", esc_text);
+    }
 
     uint8_t *wav = NULL;
     size_t wav_len = 0;

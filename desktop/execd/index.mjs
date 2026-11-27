@@ -893,7 +893,7 @@ const BROWSER_REQUEST_TIMEOUT_MS = 180000;
 // Also holds the recording bookkeeping (recordingPid/ffmpegPid/…).
 const browserState = {
   targetId: null, tabId: null, pid: null, windowId: null, url: null,
-  recording: null, // { id, outputDir, tabId, url, createdAt, ffmpegPid, ffmpegChild }
+  recording: null, // { id, outputDir, finalPath, tabId, url, createdAt, ffmpegPid, ffmpegChild }
 };
 
 async function ensureBrowserLease() {
@@ -1499,7 +1499,21 @@ async function runBrowserWaitFor(args, _trackChild) {
 async function runBrowserRecordingStart(args, trackChild) {
   // No bound browser needed — recording is the desktop via spacesd.
   try {
-    const outDir = args.outputDir ? resolveToCwd(args.outputDir, resolveCwd({})) : '/tmp/browser-recording';
+    // `path` is the FINAL destination: the finished mp4 lands exactly
+    // there (muxed at stop), so no follow-up copy exists. It must live
+    // under /work — the mounted checkout is the only place the recording
+    // survives the sandbox — and an existing file is never overwritten: a
+    // numeric suffix is added instead.
+    const ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+    let finalPath = (args.path ?? '').trim() || `/work/demo-${ts}.mp4`;
+    if (!finalPath.startsWith('/')) {
+      return browserError('path must be absolute and under /work (the mounted checkout)');
+    }
+    if (!finalPath.startsWith('/work/')) {
+      return browserError('path must live under /work — the mounted checkout is the only place a recording survives the sandbox');
+    }
+    finalPath = await uniquePath(finalPath);
+    const outDir = `/tmp/browser-recording/${randomBytes(4).toString('hex')}`;
     await mkdir(outDir, { recursive: true });
     if (browserState.recording) {
       return browserError(`a recording is already in progress (id ${browserState.recording.id})`);
@@ -1524,15 +1538,32 @@ async function runBrowserRecordingStart(args, trackChild) {
     ffmpegChild.once('error', () => {}); // async spawn failure is surfaced at stop; never crash
     const id = `rec-${randomBytes(6).toString('hex')}`;
     const recording = {
-      id, outputDir: outDir, tabId: browserState.tabId, url: browserState.url,
+      id, outputDir: outDir, finalPath, tabId: browserState.tabId, url: browserState.url,
       createdAt: new Date().toISOString(), ffmpegPid: ffmpegChild.pid, ffmpegChild,
     };
     browserState.recording = recording;
-    return browserResult(`recording started (id ${id})`, {
-      id, outputDir: outDir, tabId: recording.tabId, createdAt: recording.createdAt,
+    return browserResult(`recording started (id ${id}) — the finished video will be at ${finalPath}`, {
+      id, path: finalPath, outputDir: outDir, tabId: recording.tabId, createdAt: recording.createdAt,
     });
   } catch (err) {
     return browserError(`could not start the recording: ${String(err?.message ?? err)}`);
+  }
+}
+
+/// `demo.mp4` → `demo-1.mp4` → `demo-2.mp4` … — a recording never
+/// overwrites a previous one.
+async function uniquePath(p) {
+  const m = p.match(/^(.*?)(\.mp4)?$/);
+  const base = m[1];
+  const ext = m[2] ?? '.mp4';
+  let candidate = p;
+  for (let n = 1; ; n++) {
+    try {
+      await stat(candidate);
+    } catch {
+      return candidate;
+    }
+    candidate = `${base}-${n}${ext}`;
   }
 }
 
@@ -1577,14 +1608,24 @@ async function runBrowserRecordingStop(_args, trackChild) {
   } catch { audioOk = false; }
   let path = lastVideo;
   let muxed = false;
+  // The finished video goes straight to the path the caller reserved at
+  // start — muxed with narration when there is any, copied otherwise.
+  const finalPath = recording.finalPath ?? lastVideo;
+  await mkdir(dirname(finalPath), { recursive: true }).catch(() => {});
   if (audioOk) {
-    const narrated = join(recording.outputDir, 'recording-narrated.mp4');
     const mux = await runBash({
-      command: `ffmpeg -y -i ${shQuote(lastVideo)} -i ${shQuote(narrationPath)} -map 0:v -map 1:a -c:v copy -c:a aac -shortest ${shQuote(narrated)}`,
+      command: `ffmpeg -y -i ${shQuote(lastVideo)} -i ${shQuote(narrationPath)} -map 0:v -map 1:a -c:v copy -c:a aac -shortest ${shQuote(finalPath)}`,
       timeout: 120,
     }, trackChild);
-    if (mux.structured?.exit_code === 0) { path = narrated; muxed = true; }
+    if (mux.structured?.exit_code === 0) { path = finalPath; muxed = true; }
     else return browserError(`recording audio is present but the mux failed: ${(mux.structured?.output ?? '').trim() || mux.text} — video kept at ${lastVideo}`);
+  } else {
+    const copy = await runBash({
+      command: `cp ${shQuote(lastVideo)} ${shQuote(finalPath)}`,
+      timeout: 120,
+    }, trackChild);
+    if (copy.structured?.exit_code === 0) { path = finalPath; }
+    else return browserError(`could not write the video to ${finalPath}: ${(copy.structured?.output ?? '').trim() || copy.text} — video kept at ${lastVideo}`);
   }
   let sizeBytes = 0;
   try { sizeBytes = (await stat(path)).size; } catch { sizeBytes = 0; }
@@ -1845,10 +1886,10 @@ function validateBrowserWaitForArgs(args) {
 }
 
 function validateBrowserRecordingStartArgs(args) {
-  if (args.outputDir !== undefined && typeof args.outputDir !== 'string') {
-    return { code: INVALID_PARAMS, message: 'Invalid params: "outputDir" must be a string' };
+  if (args.path !== undefined && typeof args.path !== 'string') {
+    return { code: INVALID_PARAMS, message: 'Invalid params: "path" must be a string' };
   }
-  return { args: { outputDir: args.outputDir } };
+  return { args: { path: args.path } };
 }
 
 function validateBrowserNarrateArgs(args) {
@@ -1989,18 +2030,18 @@ const BROWSER_TOOLS = [
   },
   {
     name: 'browser_recording_start',
-    description: 'Start desktop recording (video-only h264 mp4 via spacesd start_recording) and bring audio capture up alongside it (ffmpeg records the sandbox pulse monitor to narration.m4a). Shows the agent-cursor overlay. Returns {id, outputDir, tabId, createdAt}. The recorded video is transient — stop it with browser_recording_stop.',
+    description: 'Start a narrated desktop recording. Audio played in the sandbox (browser_narrate) is captured alongside the video (the sandbox pulse monitor) and muxed into the finished mp4. Shows the agent-cursor overlay. `path` is where the FINISHED mp4 will land — give the final name up front; there is no copy step afterwards. Returns {id, path, tabId, createdAt}.',
     inputSchema: {
       type: 'object',
       properties: {
-        outputDir: { type: 'string', description: 'Directory for the recording + narration.m4a (default /tmp/browser-recording)' },
+        path: { type: 'string', description: 'Absolute final video path under /work (the mounted checkout — the only place a recording survives the sandbox). Default: /work/demo-<timestamp>.mp4. An existing file is never overwritten; a numeric suffix is added instead.' },
       },
       additionalProperties: false,
     },
   },
   {
     name: 'browser_recording_stop',
-    description: 'Stop the recording and finalize the mp4. SIGINT the narration capture and mux the narration.m4a into the recorded video when present (recording-narrated.mp4). Returns {id, tabId, path, mimeType:"video/mp4", sizeBytes, createdAt, muxed}. Robust: if spacesd stop fails, the audio is still killed and the failure is reported honestly.',
+    description: 'Stop the recording and finalize the mp4 at the path given to browser_recording_start: the narration audio is muxed in when present (copied without audio otherwise). Returns {id, tabId, path, mimeType:"video/mp4", sizeBytes, createdAt, muxed} — `path` is the finished artifact, ready where you asked for it. Robust: if spacesd stop fails, the audio is still killed and the failure is reported honestly.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -2041,7 +2082,7 @@ const BROWSER_TOOLS = [
       type: 'object',
       properties: {
         text: { type: 'string', description: 'Text to speak' },
-        voice: { type: 'string', description: 'Voice name override (default: the client default, e.g. lessac)' },
+        voice: { type: 'string', description: "Voice preset override (default: the voice server's own default preset — leave unspecified for that)" },
       },
       required: ['text'],
       additionalProperties: false,
